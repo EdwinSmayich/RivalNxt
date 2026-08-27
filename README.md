@@ -132,7 +132,7 @@ and never leaves your machine.
 ## Building from source
 
 ```bash
-git clone --recurse-submodules https://github.com/Edwin-Arb/RivalNxt.git
+git clone --recurse-submodules https://github.com/EdwinSmayich/RivalNxt.git
 cd RivalNxt
 build_local.bat
 ```

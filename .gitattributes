@@ -1,3 +1,12 @@
+# Store every file with the endings it was committed with.
+#
+# Upstream's blobs are mixed -- src/components/ModCard.tsx is CRLF,
+# core/api/server.py is LF -- and Git for Windows ships core.autocrlf=true in
+# its system config. Without this line, cloning and re-committing on Windows
+# normalises everything to LF, and 34 files this fork never touched show up in
+# the diff against upstream as complete rewrites.
+* -text
+
 # Windows batch files must keep CRLF endings.
 #
 # cmd.exe does not parse an LF-only .bat correctly: it splits lines in the wrong

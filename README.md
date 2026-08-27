@@ -29,13 +29,21 @@ Measured against upstream at the time of this fork:
 
 | | |
 |---|---|
-| Source files upstream | 233 |
-| Files this fork changes | 89 |
-| **Files left exactly as the author wrote them** | **144 (62%)** |
-| Diff | +18,975 / −13,695 across 132 files |
+| Files in the upstream tree | 338 |
+| Modified | 43 |
+| Deleted | 39 |
+| Moved | 20 |
+| **Left exactly as the author wrote them** | **236 (70%)** |
+| Files this fork adds | 46 |
+| Diff | +17,085 / −12,863 across 148 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
-rewrite, and it would not exist without the original.
+rewrite, and it would not exist without the original. Check the numbers rather
+than take them:
+
+```bash
+git remote add upstream https://github.com/Rounak77382/RivalNxt.git && git fetch upstream main && git diff --stat -M upstream/main..HEAD
+```
 
 ---
 

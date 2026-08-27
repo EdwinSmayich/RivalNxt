@@ -42,7 +42,14 @@ import {
   RefreshCw,
   AlertTriangle,
   Link,
-  AlertCircle
+  AlertCircle,
+  Loader2,
+  GripVertical,
+  Search,
+  ClipboardCopy,
+  EyeOff,
+  RotateCcw,
+  Image as ImageIcon
 } from "lucide-react";
 import type { Mod } from "./ModCard";
 import {
@@ -59,11 +66,27 @@ import {
   getModDetails,
   getPakAssets,
   fetchModImages,
+  fetchModImagesDetailed,
+  listArchiveImages,
+  importArchiveImages,
+  setNexusImageHidden,
+  getFileNotes,
+  setFileNote,
+  searchNexusImages,
+  type ArchiveImage,
+  type NexusImageResult,
   uploadModImages,
   uploadModImagesByPath,
+  uploadModImagesByUrl,
+  reorderModImages,
+  setModImagePreview,
+  removeDownloadFile,
   deleteModImage,
   updateModDetails,
   getModCustomTags,
+  getModHiddenTags,
+  hideModTag,
+  unhideModTag,
   addModCustomTag,
   removeModCustomTag,
   getAllCustomTags,
@@ -80,7 +103,9 @@ import {
   getLocalDownload,
   getPakVersionStatus,
   refreshConflicts,
+  restoreDownloadFile,
   deleteLocalDownloads,
+  deleteDownloadFile,
   type ApiPakVersionStatus,
 } from "../lib/api";
 import { toast } from "sonner";
@@ -90,6 +115,8 @@ type DownloadEntry = {
   id: number;
   path: string;
   contents: string[];
+  /** Files removed from this mod. Kept out of `contents`, shown on request. */
+  hidden_contents: string[];
   active_paks: string[];
   version: string | null;
   created_at?: string | null;
@@ -186,16 +213,16 @@ function collapseFileTree(node: FileTreeNode): FileTreeNode {
 }
 
 /** Recursive tree renderer for hierarchical pak file display */
-function FileTreeRenderer({
-  nodes,
-  depth,
-  entryId,
-  activeList,
-  switchDisabled,
-  handleToggle,
-}: {
-  nodes: FileTreeNode[];
-  depth: number;
+/**
+ * Props shared by every level of the file tree.
+ *
+ * Grouped into one type because the tree is mutually recursive and the removal
+ * callbacks previously stopped at the flat-list branch: an archive whose paks
+ * sat in a subfolder rendered through here instead, where no delete button had
+ * been threaded through. Most real mods ship exactly that layout, so per-file
+ * deletion looked missing to anyone who had one.
+ */
+interface FileTreeProps {
   entryId: number;
   activeList: string[];
   switchDisabled: boolean;
@@ -204,17 +231,94 @@ function FileTreeRenderer({
     files: string[],
     willCheck: boolean,
   ) => void;
+  /** Name of the pak currently being hidden, or null. */
+  removingFile: string | null;
+  onRemoveFile: (downloadId: number, pakName: string) => void;
+  /** Name of the pak currently being deleted from the archive, or null. */
+  deletingFile: string | null;
+  onDeleteFile: (downloadId: number, pakName: string) => void;
+  /** Notes keyed by pak basename. */
+  notes: Record<string, string>;
+  onEditNote: (downloadId: number, pakName: string) => void;
+}
+
+/**
+ * A one-liner the user runs in their own browser, on the gallery page they are
+ * already looking at, to collect every image address at once.
+ *
+ * This exists because the app cannot read that page itself: Nexus exposes no
+ * per-mod image list through either API, and the mod page answers automated
+ * requests with a Cloudflare challenge. A real browser passes that check by
+ * being a real browser — so the browser does the reading, and the user pastes
+ * the result back. Same as right-clicking each picture in turn, minus the nine
+ * right-clicks.
+ *
+ * Thumbnails are rewritten to their full-size path, and duplicates dropped,
+ * because the grid shows each image twice — once as a thumbnail, once as the
+ * link behind it.
+ */
+const GALLERY_URL_SNIPPET =
+  "copy([...document.querySelectorAll('img, a, [data-src]')]" +
+  ".flatMap(e => [e.src, e.href, e.dataset && e.dataset.src])" +
+  ".filter(u => typeof u === 'string' && /staticdelivery\\.nexusmods\\.com\\/mods\\/\\d+\\/images\\//.test(u))" +
+  ".map(u => u.split('?')[0].replace('/images/thumbnails/', '/images/'))" +
+  ".filter((u, i, a) => a.indexOf(u) === i).join('\\n'))";
+
+/**
+ * When the "delete a file from the archive" confirmation may be skipped until.
+ *
+ * A timestamp rather than a boolean: the mute is meant to last one day, so a
+ * habit formed today cannot quietly destroy something next month.
+ */
+const DELETE_PROMPT_MUTED_UNTIL = "rivalnxt.deleteFilePrompt.mutedUntil";
+
+/** Notes are keyed by basename so a path change cannot orphan them. */
+function noteKey(pakName: string): string {
+  const parts = pakName.replace(/\\/g, "/").split("/");
+  return parts[parts.length - 1];
+}
+
+/** The note row under a file, shown only when there is something to show. */
+function FileNote({ note }: { note?: string }) {
+  if (!note) return null;
+  return (
+    <p className="text-xs text-muted-foreground mt-1 pl-7 break-words whitespace-pre-wrap">
+      {note}
+    </p>
+  );
+}
+
+function FileTreeRenderer({
+  nodes,
+  depth,
+  ...shared
+}: FileTreeProps & {
+  nodes: FileTreeNode[];
+  depth: number;
 }) {
+  const {
+    entryId,
+    activeList,
+    switchDisabled,
+    handleToggle,
+    removingFile,
+    onRemoveFile,
+    deletingFile,
+    onDeleteFile,
+    notes,
+    onEditNote,
+  } = shared;
   return (
     <>
       {nodes.map((node) => {
         if (node.group) {
           // Leaf node — render file with toggle
-          const { files } = node.group;
+          const { files, primary } = node.group;
           const checked = files.some((file) => activeList.includes(file));
+          const note = notes[noteKey(primary)];
           return (
             <div
-              key={`${entryId}-${node.group.primary}`}
+              key={`${entryId}-${primary}`}
               className={`mod-file-item rounded-lg ${
                 checked ? "bg-green-100 dark:bg-green-900/60" : "bg-popover"
               }`}
@@ -225,14 +329,63 @@ function FileTreeRenderer({
                   <File className="w-4 h-4 text-muted-foreground shrink-0" />
                   <div className="font-medium truncate">{node.name}</div>
                 </div>
-                <Switch
-                  disabled={switchDisabled}
-                  checked={checked}
-                  onCheckedChange={(willCheck: boolean) =>
-                    handleToggle(entryId, files, willCheck)
-                  }
-                />
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => onEditNote(entryId, primary)}
+                    className={`p-1 rounded transition-colors ${
+                      note
+                        ? "text-amber-500 hover:bg-amber-500/10"
+                        : "text-muted-foreground/50 hover:text-foreground hover:bg-muted"
+                    }`}
+                    title={note ? `Note: ${note}` : "Add a note"}
+                    aria-label={note ? "Edit note" : "Add a note"}
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                  </button>
+                  <Switch
+                    disabled={switchDisabled}
+                    checked={checked}
+                    onCheckedChange={(willCheck: boolean) =>
+                      handleToggle(entryId, files, willCheck)
+                    }
+                  />
+                  {/* Two different things, so two different icons. The eye
+                      hides — reversible, the file stays in the archive. The bin
+                      deletes it out of the archive for good. They used to be the
+                      same bin, which made the safe action look like the
+                      dangerous one. */}
+                  <button
+                    type="button"
+                    disabled={removingFile === primary}
+                    onClick={() => onRemoveFile(entryId, primary)}
+                    className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-40"
+                    title={`Hide ${node.name} — stays in the archive`}
+                    aria-label={`Hide ${node.name}`}
+                  >
+                    {removingFile === primary ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <EyeOff className="w-4 h-4" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={deletingFile === primary}
+                    onClick={() => onDeleteFile(entryId, primary)}
+                    className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 disabled:opacity-40"
+                    title={`Delete ${node.name} from the archive — permanent`}
+                    aria-label={`Delete ${node.name} permanently`}
+                  >
+                    {deletingFile === primary ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="w-4 h-4" />
+                    )}
+                  </button>
+                </div>
               </div>
+              <FileNote note={note} />
             </div>
           );
         }
@@ -243,10 +396,7 @@ function FileTreeRenderer({
             key={`${entryId}-folder-${node.name}`}
             node={node}
             depth={depth}
-            entryId={entryId}
-            activeList={activeList}
-            switchDisabled={switchDisabled}
-            handleToggle={handleToggle}
+            {...shared}
           />
         );
       })}
@@ -258,21 +408,10 @@ function FileTreeRenderer({
 function FileTreeFolderNode({
   node,
   depth,
-  entryId,
-  activeList,
-  switchDisabled,
-  handleToggle,
-}: {
+  ...shared
+}: FileTreeProps & {
   node: FileTreeNode;
   depth: number;
-  entryId: number;
-  activeList: string[];
-  switchDisabled: boolean;
-  handleToggle: (
-    downloadId: number,
-    files: string[],
-    willCheck: boolean,
-  ) => void;
 }) {
   const [expanded, setExpanded] = useState(true);
   const ChevronIcon = expanded ? ChevronDown : ChevronRight;
@@ -295,10 +434,7 @@ function FileTreeFolderNode({
           <FileTreeRenderer
             nodes={node.children}
             depth={depth + 1}
-            entryId={entryId}
-            activeList={activeList}
-            switchDisabled={switchDisabled}
-            handleToggle={handleToggle}
+            {...shared}
           />
         </div>
       )}
@@ -437,6 +573,25 @@ export function ModModal({
 
   // Images state
   const [modImages, setModImages] = useState<ModImage[]>([]);
+  /** The mod has a Nexus picture, but the user removed it from the gallery. */
+  const [nexusImageIsHidden, setNexusImageIsHidden] = useState(false);
+  const [archivePickerOpen, setArchivePickerOpen] = useState(false);
+  const [archiveScanning, setArchiveScanning] = useState(false);
+  const [archiveImporting, setArchiveImporting] = useState(false);
+  const [archiveImages, setArchiveImages] = useState<ArchiveImage[]>([]);
+  const [archiveSelection, setArchiveSelection] = useState<Set<string>>(new Set());
+  const [nexusSearchOpen, setNexusSearchOpen] = useState(false);
+  const [nexusSearching, setNexusSearching] = useState(false);
+  const [nexusSearchInput, setNexusSearchInput] = useState("");
+  const [nexusResults, setNexusResults] = useState<NexusImageResult[]>([]);
+  const [nexusSelection, setNexusSelection] = useState<Set<string>>(new Set());
+  /** downloadId -> { pak basename -> note }. */
+  const [fileNotes, setFileNotes] = useState<Record<number, Record<string, string>>>({});
+  const [noteTarget, setNoteTarget] = useState<
+    { downloadId: number; pakName: string } | null
+  >(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [savingNote, setSavingNote] = useState(false);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
   const [isUploadingImages, setIsUploadingImages] = useState(false);
@@ -452,6 +607,24 @@ export function ModModal({
   // Custom tag state
   const [customTags, setCustomTags] = useState<CustomTag[]>([]);
   const [removedTagNames, setRemovedTagNames] = useState<Set<string>>(new Set());
+  /** Auto-detected tags suppressed for this mod, so they can be restored. */
+  const [hiddenTags, setHiddenTags] = useState<string[]>([]);
+  const [imageUrlInput, setImageUrlInput] = useState("");
+  const [isAddingImageUrls, setIsAddingImageUrls] = useState(false);
+  const [isReordering, setIsReordering] = useState(false);
+  const [draggingId, setDraggingId] = useState<number | null>(null);
+  const [dragOverId, setDragOverId] = useState<number | null>(null);
+  const [removingFile, setRemovingFile] = useState<string | null>(null);
+  const [restoringFile, setRestoringFile] = useState<string | null>(null);
+  const [deletingFile, setDeletingFile] = useState<string | null>(null);
+  const [deleteFileTarget, setDeleteFileTarget] = useState<
+    { downloadId: number; pakName: string } | null
+  >(null);
+  const [suppressDeletePrompt, setSuppressDeletePrompt] = useState(false);
+  /** The step-by-step for the gallery helper, expanded on first use. */
+  const [galleryStepsOpen, setGalleryStepsOpen] = useState(false);
+  /** Download ids whose Hidden list is expanded. */
+  const [hiddenOpenFor, setHiddenOpenFor] = useState<Set<number>>(new Set());
   const [allTagSuggestions, setAllTagSuggestions] = useState<string[]>([]);
   const [isTagDropdownOpen, setIsTagDropdownOpen] = useState(false);
   const [tagSearchValue, setTagSearchValue] = useState("");
@@ -516,8 +689,70 @@ export function ModModal({
     return names;
   }, [overviewTags, customTags]);
 
+  /**
+   * What to search Nexus with when looking for artwork of this character.
+   *
+   * Seeded from the mod's *name*, not its character tag. Authors name mods
+   * "<skin> <character>" — "Sexy Savage Land Rogue" — so the name carries the
+   * skin, which the tag does not. Searching the tag alone found the right hero
+   * wearing the wrong outfit every time.
+   *
+   * Stripped of the noise that never appears in another author's title:
+   * parenthetical asides like "(support+content)", version tags, and a short
+   * list of flavour adjectives.
+   */
+  const characterSearchSeed = useMemo(() => {
+    const noise = new Set([
+      "sexy", "hot", "nsfw", "18+", "adult", "hd", "4k", "8k", "uhd",
+      "remastered", "redux", "fix", "fixed", "update", "updated", "new",
+      "mod", "skin", "replacer", "replacement", "optional", "support",
+      "content", "free", "alt", "variant", "version",
+    ]);
+    const raw = String(mod?.name ?? "");
+    const cleaned = raw
+      .replace(/\([^)]*\)/g, " ") // "(support+content)"
+      .replace(/\[[^\]]*\]/g, " ")
+      .replace(/\bv?\d+(\.\d+)*\b/g, " ") // v1.2, 2099 stays only if wordy
+      .replace(/[_\-+]+/g, " ")
+      .split(/\s+/)
+      .map((word) => word.trim())
+      .filter((word) => word.length > 1 && !noise.has(word.toLowerCase()));
+
+    if (cleaned.length > 0) return cleaned.join(" ");
+
+    // Nothing left worth searching — fall back to the character tag.
+    const skip = new Set([
+      "characters", "ui", "audio", "animation", "misc", "miscellaneous",
+      "gameplay", "skins", "nsfw", "adult", "18+",
+    ]);
+    const candidates = [
+      ...customTags.map((t) => t?.tag).filter(Boolean),
+      ...overviewTags,
+    ];
+    const found = candidates.find(
+      (t) => t && !skip.has(String(t).toLowerCase().trim()),
+    );
+    return String(found ?? "").trim();
+  }, [customTags, overviewTags, mod?.name]);
+
+  // Seeded per mod, and only when untouched, so reopening does not wipe a term
+  // the user typed themselves.
+  useEffect(() => {
+    setNexusSearchInput(characterSearchSeed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveModId, characterSearchSeed]);
+
   useEffect(() => {
     let cancelled = false;
+    // Cleared up front, not just on success: these belong to whichever mod was
+    // open before, and a failed load would otherwise leave them on screen.
+    setArchivePickerOpen(false);
+    setArchiveImages([]);
+    setArchiveSelection(new Set());
+    setNexusSearchOpen(false);
+    setNexusResults([]);
+    setNexusSelection(new Set());
+
     async function loadDetails() {
       // Allow fetching images if we have an effective ID (even synthetic)
       if (!effectiveModId) {
@@ -536,7 +771,7 @@ export function ModModal({
           promises.push(Promise.resolve(null));
           promises.push(Promise.resolve(null));
         }
-        promises.push(fetchModImages(effectiveModId));
+        promises.push(fetchModImagesDetailed(effectiveModId));
 
         const [d, c, images] = await Promise.all(promises);
         const debugInfo = {
@@ -570,7 +805,8 @@ export function ModModal({
         if (!cancelled) {
           setDetails(d);
           setChangelogs(c);
-          setModImages(images || []);
+          setModImages(images?.images ?? []);
+          setNexusImageIsHidden(Boolean(images?.nexusHidden));
         }
       } catch (error) {
         console.error("[ModModal] Error loading details:", error);
@@ -578,6 +814,7 @@ export function ModModal({
           setDetails(null);
           setChangelogs(null);
           setModImages([]);
+          setNexusImageIsHidden(false);
         }
       }
     }
@@ -593,18 +830,23 @@ export function ModModal({
     async function loadCustomTags() {
       if (!isOpen || !effectiveModId) {
         setCustomTags([]);
+        setHiddenTags([]);
         setRemovedTagNames(new Set());
         return;
       }
       try {
         setRemovedTagNames(new Set());
-        const [tags, allTags] = await Promise.all([
+        const [tags, allTags, hidden] = await Promise.all([
           getModCustomTags(effectiveModId),
           getAllCustomTags(),
+          // Suppressed tags are already filtered out of the mod payload, so the
+          // modal has to ask for them explicitly to offer them back.
+          getModHiddenTags(effectiveModId).catch(() => [] as string[]),
         ]);
         if (!cancelled) {
           setCustomTags(tags);
           setAllTagSuggestions(allTags);
+          setHiddenTags(hidden);
         }
       } catch (err) {
         console.warn("[ModModal] Failed to load custom tags", err);
@@ -650,6 +892,9 @@ export function ModModal({
               id: dl.id,
               path: dl.path,
               contents: Array.isArray(dl.contents) ? dl.contents : [],
+              hidden_contents: Array.isArray(dl.hidden_contents)
+                ? dl.hidden_contents
+                : [],
               active_paks: Array.isArray(dl.active_paks) ? dl.active_paks : [],
               version:
                 dl.version ??
@@ -1124,7 +1369,14 @@ export function ModModal({
     [uploadFiles],
   );
 
+  /** True only for a drag carrying files from outside the app. */
+  const isFileDrag = (e: React.DragEvent) =>
+    Array.from(e.dataTransfer?.types ?? []).includes("Files");
+
   const handleDragEnter = useCallback((e: React.DragEvent) => {
+    // Reordering an image is also a drag over this container. Without this the
+    // "drop images here" overlay appeared while dragging a thumbnail around.
+    if (!isFileDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragCounterRef.current += 1;
@@ -1139,6 +1391,7 @@ export function ModModal({
   }, []);
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragCounterRef.current -= 1;
@@ -1404,6 +1657,563 @@ export function ModModal({
     [effectiveModId, customTags, isAddingTag, onRefresh],
   );
 
+  // Only custom images can be reordered — Nexus images are not ours to arrange,
+  // and the backend stores an order per mod for the custom rows only.
+  const customImageIds = useMemo(
+    () => modImages.filter((i) => i.source === "custom").map((i) => i.id),
+    [modImages],
+  );
+  const customImageCount = customImageIds.length;
+  const firstCustomIndex = useMemo(
+    () => modImages.findIndex((i) => i.source === "custom"),
+    [modImages],
+  );
+
+  /**
+   * The image this dialog's header should show.
+   *
+   * The header used details.mod.picture_url unconditionally, so on a mod linked
+   * to Nexus the star did nothing here: the cards in Downloads and Active Mods
+   * switched to the chosen image and the dialog kept showing the Nexus one, side
+   * by side with the "Preview" badge that claimed otherwise.
+   *
+   * Precedence is deliberately the same rule the cards use: only an explicit
+   * star outranks the Nexus artwork, because "first custom image" is a default
+   * rather than a decision. Falling back to the first custom image here would
+   * make the header disagree with the card again, just in the other direction.
+   */
+  const headerImageSrc = useMemo(() => {
+    const starred = modImages.find((i) => i.source === "custom" && i.isPreview);
+    if (starred?.data) {
+      return `data:${starred.mimeType || "image/jpeg"};base64,${starred.data}`;
+    }
+    // Skipped when hidden, or removing the picture would leave it on display
+    // right here — the one place it is largest.
+    if (!nexusImageIsHidden && details?.mod?.picture_url) {
+      return details.mod.picture_url;
+    }
+    const firstCustom = modImages.find((i) => i.source === "custom");
+    if (firstCustom?.data) {
+      return `data:${firstCustom.mimeType || "image/jpeg"};base64,${firstCustom.data}`;
+    }
+    return nexusImageIsHidden ? undefined : mod?.images?.[0];
+  }, [modImages, nexusImageIsHidden, details?.mod?.picture_url, mod?.images]);
+
+  const applyImageOrder = useCallback(
+    async (ids: number[]) => {
+      if (!effectiveModId) return;
+      setIsReordering(true);
+      try {
+        await reorderModImages(effectiveModId, ids);
+        setModImages(await fetchModImages(effectiveModId));
+        // The mod card reads the first image, so the list has to be refreshed
+        // for the new preview to show up outside this modal.
+        onRefresh?.({ skipScan: true });
+      } catch (err) {
+        toast.error((err as any)?.message || "Failed to reorder images");
+      } finally {
+        setIsReordering(false);
+      }
+    },
+    [effectiveModId, onRefresh],
+  );
+
+  const handleMoveImage = useCallback(
+    async (imageId: number, delta: -1 | 1) => {
+      const order = [...customImageIds];
+      const from = order.indexOf(imageId);
+      const to = from + delta;
+      if (from < 0 || to < 0 || to >= order.length) return;
+      [order[from], order[to]] = [order[to], order[from]];
+      await applyImageOrder(order);
+    },
+    [customImageIds, applyImageOrder],
+  );
+
+  // Notes live per download, so they load with the download list rather than
+  // with the mod: the same pak name under a different download is a different
+  // file and must not inherit someone else's note.
+  useEffect(() => {
+    let cancelled = false;
+    if (!isOpen || downloadIds.length === 0) {
+      setFileNotes({});
+      return;
+    }
+    (async () => {
+      const loaded: Record<number, Record<string, string>> = {};
+      await Promise.all(
+        downloadIds.map(async (id) => {
+          try {
+            const notes = await getFileNotes(id);
+            loaded[id] = Object.fromEntries(
+              Object.entries(notes).map(([pak, value]) => [noteKey(pak), value.note]),
+            );
+          } catch {
+            loaded[id] = {};
+          }
+        }),
+      );
+      if (!cancelled) setFileNotes(loaded);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, downloadIds]);
+
+  const openNoteEditor = useCallback(
+    (downloadId: number, pakName: string) => {
+      setNoteTarget({ downloadId, pakName });
+      setNoteDraft((fileNotes[downloadId] ?? {})[noteKey(pakName)] ?? "");
+    },
+    [fileNotes],
+  );
+
+  const handleSaveNote = useCallback(async () => {
+    if (!noteTarget) return;
+    const { downloadId, pakName } = noteTarget;
+    const key = noteKey(pakName);
+    setSavingNote(true);
+    try {
+      await setFileNote(downloadId, key, noteDraft);
+      setFileNotes((prev) => {
+        const forDownload = { ...(prev[downloadId] ?? {}) };
+        if (noteDraft.trim()) forDownload[key] = noteDraft.trim();
+        else delete forDownload[key];
+        return { ...prev, [downloadId]: forDownload };
+      });
+      setNoteTarget(null);
+    } catch (err) {
+      toast.error((err as any)?.message || "Could not save that note");
+    } finally {
+      setSavingNote(false);
+    }
+  }, [noteTarget, noteDraft]);
+
+  const handleRemoveFile = useCallback(
+    async (downloadId: number, pakName: string) => {
+      setRemovingFile(pakName);
+      try {
+        await removeDownloadFile(downloadId, pakName);
+        // No longer "Rebuild Local Downloads restores it": a rebuild now leaves
+        // the removal alone, and the file is listed under Hidden in this mod.
+        toast.success(`Removed ${noteKey(pakName)}`, {
+          description: "It moves to Hidden below — restore it there any time.",
+          duration: 5000,
+        });
+        setHiddenOpenFor((prev) => new Set(prev).add(downloadId));
+        const entries = await hydrateDownloads({ skipScan: true });
+        setDownloadEntries(entries);
+        onRefresh?.({ skipScan: true });
+        onConflictStateChanged?.();
+      } catch (err) {
+        toast.error((err as any)?.message || "Failed to remove file");
+      } finally {
+        setRemovingFile(null);
+      }
+    },
+    [onRefresh, onConflictStateChanged, hydrateDownloads],
+  );
+
+  /**
+   * Ask before deleting from the archive, unless the user muted the question.
+   *
+   * The mute expires after a day rather than for good: this is the one action
+   * in the app that destroys a file the user cannot get back, and a permanent
+   * "don't ask again" would turn a stray click months later into a silent loss.
+   */
+  const performDeleteFile = useCallback(
+    async (downloadId: number, pakName: string) => {
+      setDeletingFile(pakName);
+      try {
+        const result = await deleteDownloadFile(downloadId, pakName);
+        toast.success(`Deleted ${result.deleted}`, {
+          description:
+            result.members_removed > 1
+              ? `${result.members_removed} files removed from the archive`
+              : "Removed from the archive",
+        });
+        const entries = await hydrateDownloads({ skipScan: true });
+        setDownloadEntries(entries);
+        onRefresh?.({ skipScan: true });
+        onConflictStateChanged?.();
+      } catch (err) {
+        toast.error((err as any)?.message || "Could not delete that file");
+      } finally {
+        setDeletingFile(null);
+      }
+    },
+    [hydrateDownloads, onRefresh, onConflictStateChanged],
+  );
+
+  const requestDeleteFile = useCallback(
+    (downloadId: number, pakName: string) => {
+      let muted = false;
+      try {
+        const until = Number(localStorage.getItem(DELETE_PROMPT_MUTED_UNTIL) || 0);
+        muted = Number.isFinite(until) && Date.now() < until;
+      } catch {
+        muted = false;
+      }
+      if (muted) {
+        void performDeleteFile(downloadId, pakName);
+        return;
+      }
+      setSuppressDeletePrompt(false);
+      setDeleteFileTarget({ downloadId, pakName });
+    },
+    [performDeleteFile],
+  );
+
+  const confirmDeleteFile = useCallback(() => {
+    if (!deleteFileTarget) return;
+    if (suppressDeletePrompt) {
+      try {
+        localStorage.setItem(
+          DELETE_PROMPT_MUTED_UNTIL,
+          String(Date.now() + 24 * 60 * 60 * 1000),
+        );
+      } catch {
+        // Private mode or a full quota: asking every time is the safe fallback.
+      }
+    }
+    const { downloadId, pakName } = deleteFileTarget;
+    setDeleteFileTarget(null);
+    void performDeleteFile(downloadId, pakName);
+  }, [deleteFileTarget, suppressDeletePrompt, performDeleteFile]);
+
+  const handleRestoreFile = useCallback(
+    async (downloadId: number, pakName: string) => {
+      setRestoringFile(pakName);
+      try {
+        await restoreDownloadFile(downloadId, pakName);
+        // Takes effect at once: hiding is applied when the mod is read, so
+        // nothing has to be rebuilt for the file to come back.
+        const entries = await hydrateDownloads({ skipScan: true });
+        setDownloadEntries(entries);
+        onRefresh?.({ skipScan: true });
+        toast.success(`${noteKey(pakName)} is back`);
+      } catch (err) {
+        toast.error((err as any)?.message || "Could not restore that file");
+      } finally {
+        setRestoringFile(null);
+      }
+    },
+    [hydrateDownloads, onRefresh],
+  );
+
+  /** Move the dragged image to the position of the one it was dropped on. */
+  const handleDropOnImage = useCallback(
+    async (draggedId: number, targetId: number) => {
+      const order = [...customImageIds];
+      const from = order.indexOf(draggedId);
+      const to = order.indexOf(targetId);
+      if (from < 0 || to < 0 || from === to) return;
+      // Splice rather than swap: dragging an image across several others should
+      // slide them along, not exchange two distant positions.
+      order.splice(to, 0, order.splice(from, 1)[0]);
+      await applyImageOrder(order);
+    },
+    [customImageIds, applyImageOrder],
+  );
+
+  const handleMakePreview = useCallback(
+    async (imageId: number) => {
+      if (!effectiveModId) return;
+      setIsReordering(true);
+      try {
+        // One call: marks the image as the card preview AND moves it to the
+        // front. Ordering alone was not enough — the card preferred the Nexus
+        // picture_url, so on a linked mod the star did nothing visible.
+        await setModImagePreview(effectiveModId, imageId);
+        // Detailed, because starring the Nexus picture also un-hides it.
+        const detail = await fetchModImagesDetailed(effectiveModId);
+        setModImages(detail.images);
+        setNexusImageIsHidden(detail.nexusHidden);
+        onRefresh?.({ skipScan: true });
+        toast.success("Preview updated");
+      } catch (err) {
+        toast.error((err as any)?.message || "Failed to set preview");
+      } finally {
+        setIsReordering(false);
+      }
+    },
+    [effectiveModId, onRefresh],
+  );
+
+  /**
+   * Offer the images the mod's own archive already contains.
+   *
+   * Measured over a real library: 55 of 123 archives ship preview images next
+   * to the .pak files, median 9 each, and their names track the pak variants.
+   * That is where the "several variants" of a mod actually live — Nexus only
+   * ever publishes one picture, and its API has no gallery to ask for.
+   */
+  const handleFindArchiveImages = useCallback(async () => {
+    const downloadId = downloadIds[0];
+    if (downloadId == null) return;
+
+    setArchiveScanning(true);
+    setArchivePickerOpen(true);
+    setArchiveImages([]);
+    setArchiveSelection(new Set());
+    try {
+      const { images, reason } = await listArchiveImages(Number(downloadId));
+      setArchiveImages(images);
+      if (images.length === 0) {
+        setArchivePickerOpen(false);
+        toast.info(
+          reason === "folder"
+            ? "This mod is a folder, not an archive"
+            : "No images found inside this mod file",
+          {
+            description:
+              reason === "folder"
+                ? "Drag images straight in instead."
+                : "Not every author bundles previews. Drag your own in, or paste links below.",
+          },
+        );
+      }
+    } catch (err) {
+      setArchivePickerOpen(false);
+      toast.error((err as any)?.message || "Could not read the mod file");
+    } finally {
+      setArchiveScanning(false);
+    }
+  }, [downloadIds]);
+
+  const handleImportArchiveImages = useCallback(async () => {
+    const downloadId = downloadIds[0];
+    if (downloadId == null || archiveSelection.size === 0) return;
+
+    setArchiveImporting(true);
+    try {
+      const result = await importArchiveImages(
+        Number(downloadId),
+        Array.from(archiveSelection),
+      );
+      setArchivePickerOpen(false);
+      if (effectiveModId) {
+        const detail = await fetchModImagesDetailed(effectiveModId);
+        setModImages(detail.images);
+        setNexusImageIsHidden(detail.nexusHidden);
+      }
+      onRefresh?.({ skipScan: true });
+
+      const notes: string[] = [];
+      if (result.duplicates > 0) notes.push(`${result.duplicates} already added`);
+      if (result.failed > 0) notes.push(`${result.failed} could not be read`);
+      if (result.imported > 0) {
+        toast.success(
+          `Added ${result.imported} image${result.imported === 1 ? "" : "s"}`,
+          { description: notes.join(" · ") || undefined },
+        );
+      } else {
+        toast.info("Nothing new to add", {
+          description: notes.join(" · ") || undefined,
+        });
+      }
+    } catch (err) {
+      toast.error((err as any)?.message || "Could not import those images");
+    } finally {
+      setArchiveImporting(false);
+    }
+  }, [downloadIds, archiveSelection, effectiveModId, onRefresh]);
+
+  /**
+   * Look for artwork of the same character on Nexus.
+   *
+   * The last resort for a mod with no pictures at all. The seed is the mod's own
+   * character tag when there is one, because that is what actually identifies
+   * the subject — the file name is usually a variant code.
+   */
+  const handleSearchNexusImages = useCallback(
+    async (term?: string) => {
+      const seed = (term ?? nexusSearchInput).trim();
+      if (!seed) return;
+      setNexusSearching(true);
+      setNexusSearchOpen(true);
+      try {
+        // The backend puts this mod's own pictures first when it is linked.
+        const results = await searchNexusImages(seed, 24, mod?.backendModId ?? null);
+        setNexusResults(results);
+        setNexusSelection(new Set());
+        if (results.length === 0) {
+          toast.info(`Nothing on Nexus matches "${seed}"`, {
+            description: "Try the character name on its own.",
+          });
+        }
+      } catch (err) {
+        toast.error((err as any)?.message || "Could not reach Nexus");
+      } finally {
+        setNexusSearching(false);
+      }
+    },
+    [nexusSearchInput, mod?.backendModId],
+  );
+
+  const handleImportNexusImages = useCallback(async () => {
+    if (!effectiveModId || nexusSelection.size === 0) return;
+    setIsAddingImageUrls(true);
+    try {
+      const result = await uploadModImagesByUrl(
+        effectiveModId,
+        Array.from(nexusSelection),
+      );
+      setNexusSearchOpen(false);
+      const detail = await fetchModImagesDetailed(effectiveModId);
+      setModImages(detail.images);
+      setNexusImageIsHidden(detail.nexusHidden);
+      onRefresh?.({ skipScan: true });
+      if (result.uploaded_count > 0) {
+        toast.success(
+          `Added ${result.uploaded_count} image${result.uploaded_count === 1 ? "" : "s"}`,
+        );
+      } else {
+        toast.info("Nothing new to add");
+      }
+    } catch (err) {
+      toast.error((err as any)?.message || "Could not add those images");
+    } finally {
+      setIsAddingImageUrls(false);
+    }
+  }, [effectiveModId, nexusSelection, onRefresh]);
+
+  const setNexusHidden = useCallback(
+    async (hidden: boolean) => {
+      if (!effectiveModId) return;
+      setIsReordering(true);
+      try {
+        await setNexusImageHidden(effectiveModId, hidden);
+        const detail = await fetchModImagesDetailed(effectiveModId);
+        setModImages(detail.images);
+        setNexusImageIsHidden(detail.nexusHidden);
+        onRefresh?.({ skipScan: true });
+        toast.success(hidden ? "Nexus picture removed" : "Nexus picture restored", {
+          description: hidden
+            ? "It stays on the mod page — Show Nexus image brings it back."
+            : undefined,
+        });
+      } catch (err) {
+        toast.error((err as any)?.message || "Could not update the Nexus picture");
+      } finally {
+        setIsReordering(false);
+      }
+    },
+    [effectiveModId, onRefresh],
+  );
+
+  const handleHideNexusImage = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      void setNexusHidden(true);
+    },
+    [setNexusHidden],
+  );
+
+  const handleCopyGalleryHelper = useCallback(async () => {
+    try {
+      const { copyToClipboard } = await import("../lib/tauri-utils");
+      await copyToClipboard(GALLERY_URL_SNIPPET);
+      setGalleryStepsOpen(true);
+      toast.success("Copied — follow the steps below", { duration: 6000 });
+    } catch (err) {
+      toast.error((err as any)?.message || "Could not copy to the clipboard");
+    }
+  }, []);
+
+  const handleAddImagesByUrl = useCallback(async () => {
+    if (!effectiveModId) return;
+    const urls = imageUrlInput
+      .split(/[\r\n,\s]+/)
+      .map((u) => u.trim())
+      .filter(Boolean);
+    if (urls.length === 0) return;
+
+    setIsAddingImageUrls(true);
+    try {
+      const result = await uploadModImagesByUrl(effectiveModId, urls);
+
+      if (result.uploaded_count > 0) {
+        toast.success(
+          `Added ${result.uploaded_count} image${result.uploaded_count === 1 ? "" : "s"}`,
+        );
+        setImageUrlInput("");
+        setModImages(await fetchModImages(effectiveModId));
+        onRefresh?.({ skipScan: true });
+      }
+
+      // Reported individually: with several URLs pasted at once, "some failed"
+      // is useless without saying which.
+      if (result.failures.length > 0) {
+        toast.error(
+          `${result.failures.length} link${result.failures.length === 1 ? "" : "s"} could not be added`,
+          {
+            description: result.failures
+              .slice(0, 3)
+              .map((f) => `${f.url.slice(0, 40)}… — ${f.error}`)
+              .join("\n"),
+            duration: 10000,
+          },
+        );
+      }
+    } catch (err) {
+      toast.error((err as any)?.message || "Failed to add images");
+    } finally {
+      setIsAddingImageUrls(false);
+    }
+  }, [effectiveModId, imageUrlInput, onRefresh]);
+
+  // Auto-detected tags have no row to delete, so "removing" one records a
+  // suppression the backend honours on every read. Kept separate from
+  // handleRemoveCustomTag because the two are genuinely different operations:
+  // one destroys user data, the other is reversible.
+  const handleHideAutoTag = useCallback(
+    async (tag: string) => {
+      if (!effectiveModId) return;
+      const normalized = tag.toLowerCase().trim();
+      setRemovedTagNames((prev) => new Set(prev).add(normalized));
+      try {
+        await hideModTag(effectiveModId, tag);
+        setHiddenTags((prev) =>
+          prev.some((t) => t.toLowerCase() === normalized) ? prev : [...prev, tag],
+        );
+        onRefresh?.({ skipScan: true });
+        toast.success(`Tag "${tag}" hidden`, {
+          description: "It can be restored from Hidden tags below.",
+        });
+      } catch (err) {
+        setRemovedTagNames((prev) => {
+          const next = new Set(prev);
+          next.delete(normalized);
+          return next;
+        });
+        toast.error((err as any)?.message || "Failed to hide tag");
+      }
+    },
+    [effectiveModId, onRefresh],
+  );
+
+  const handleUnhideAutoTag = useCallback(
+    async (tag: string) => {
+      if (!effectiveModId) return;
+      const normalized = tag.toLowerCase().trim();
+      try {
+        await unhideModTag(effectiveModId, tag);
+        setHiddenTags((prev) => prev.filter((t) => t.toLowerCase() !== normalized));
+        setRemovedTagNames((prev) => {
+          const next = new Set(prev);
+          next.delete(normalized);
+          return next;
+        });
+        onRefresh?.({ skipScan: true });
+        toast.success(`Tag "${tag}" restored`);
+      } catch (err) {
+        toast.error((err as any)?.message || "Failed to restore tag");
+      }
+    },
+    [effectiveModId, onRefresh],
+  );
+
   const handleRemoveCustomTag = useCallback(
     async (tagId: number, tagName: string) => {
       if (!effectiveModId) return;
@@ -1643,7 +2453,7 @@ export function ModModal({
             <div className="flex items-start gap-4">
               <div className="w-24 h-24 bg-muted rounded-lg overflow-hidden flex-shrink-0">
                 <img
-                  src={details?.mod?.picture_url || mod.images[0]}
+                  src={headerImageSrc}
                   alt={mod.name}
                   className="w-full h-full object-cover"
                   onError={(e) => {
@@ -1842,13 +2652,27 @@ export function ModModal({
                   />
                   {mod.isFavorited ? "Favorited" : "Add to Favorites"}
                 </Button>
-                {(mod.needsManualModId || mod.backendModId == null) && (
+                {/* Always shown inside the mod, in both states.
+                    The main list still only nags when an id is missing, but in
+                    here the link is a fact worth seeing — and worth changing,
+                    since a wrong id quietly attaches another mod's artwork and
+                    changelog with no way to correct it. */}
+                {mod.needsManualModId || mod.backendModId == null ? (
                   <Button
                     variant="outline"
                     className="gap-2 text-amber-400 border-amber-400/40 hover:bg-amber-400/10"
                     onClick={(e) => { e.stopPropagation(); onAssignModId?.(mod.id); }}
                   >
                     <Link className="w-4 h-4" /> Assign Mod ID
+                  </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    className="gap-2 text-emerald-400 border-emerald-400/40 hover:bg-emerald-400/10"
+                    onClick={(e) => { e.stopPropagation(); onAssignModId?.(mod.id); }}
+                    title="Linked to this Nexus mod — click to change"
+                  >
+                    <Link className="w-4 h-4" /> Mod ID: {mod.backendModId}
                   </Button>
                 )}
                 {mod.renameStatus === "failed" && (
@@ -1888,14 +2712,27 @@ export function ModModal({
                         <div>
                           <h3 className="font-medium mb-3">Tags</h3>
                           <div className="flex flex-wrap gap-2 items-center">
-                             {/* Auto-detected tags from Nexus/extraction */}
+                             {/* Auto-detected tags from Nexus/extraction.
+                                 These have no row to delete, so the X records a
+                                 suppression instead — reversible, and it
+                                 survives re-extraction and Nexus syncs. */}
                              {overviewTags.map((tag) => (
                                <Badge
                                  key={`overview-tag-${tag}`}
                                  variant="secondary"
-                                 className="text-xs"
+                                 className="text-xs gap-1 pr-1"
                                >
                                  {tag.toLowerCase()}
+                                 {effectiveModId && (
+                                   <button
+                                     type="button"
+                                     onClick={() => handleHideAutoTag(tag)}
+                                     className="ml-0.5 rounded-full hover:bg-black/10 dark:hover:bg-white/10 p-0.5 transition-colors"
+                                     title={`Hide tag "${tag}"`}
+                                   >
+                                     <X className="w-2.5 h-2.5" />
+                                   </button>
+                                 )}
                                </Badge>
                              ))}
  
@@ -2058,6 +2895,34 @@ export function ModModal({
                                 </p>
                               )}
                           </div>
+
+                          {/* Hiding an auto tag must not be a one-way door. */}
+                          {hiddenTags.length > 0 && (
+                            <div className="mt-3 pt-3 border-t border-border/50">
+                              <p className="text-xs text-muted-foreground mb-2">
+                                Hidden tags — click to restore
+                              </p>
+                              <div className="flex flex-wrap gap-2">
+                                {hiddenTags.map((tag) => (
+                                  <Badge
+                                    key={`hidden-tag-${tag}`}
+                                    variant="outline"
+                                    className="text-xs gap-1 pr-1 opacity-60 hover:opacity-100 transition-opacity"
+                                  >
+                                    <span className="line-through">{tag.toLowerCase()}</span>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleUnhideAutoTag(tag)}
+                                      className="ml-0.5 rounded-full hover:bg-black/10 dark:hover:bg-white/10 p-0.5 transition-colors"
+                                      title={`Restore tag "${tag}"`}
+                                    >
+                                      <Plus className="w-2.5 h-2.5" />
+                                    </button>
+                                  </Badge>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                         </div>
 
                         {/* Description */}
@@ -2151,8 +3016,43 @@ export function ModModal({
                           <div
                             key={`img-${image.id}-${index}`}
                             style={{ height: "350px" }}
-                            className="bg-muted rounded-lg overflow-hidden cursor-pointer hover:opacity-80 transition-opacity relative group"
+                            className={`bg-muted rounded-lg overflow-hidden cursor-pointer hover:opacity-80 transition-opacity relative group ${
+                              dragOverId === image.id ? "ring-2 ring-primary" : ""
+                            } ${draggingId === image.id ? "opacity-40" : ""}`}
                             onClick={() => openLightbox(index)}
+                            // Only custom images participate: Nexus images are
+                            // not ours to arrange and have no stored order.
+                            draggable={image.source === "custom" && customImageCount > 1}
+                            onDragStart={(e) => {
+                              if (image.source !== "custom") return;
+                              setDraggingId(image.id);
+                              e.dataTransfer.effectAllowed = "move";
+                              // Firefox refuses to start a drag without data.
+                              e.dataTransfer.setData("text/plain", String(image.id));
+                            }}
+                            onDragEnd={() => {
+                              setDraggingId(null);
+                              setDragOverId(null);
+                            }}
+                            onDragOver={(e) => {
+                              if (draggingId === null || image.source !== "custom") return;
+                              e.preventDefault();
+                              e.dataTransfer.dropEffect = "move";
+                              if (dragOverId !== image.id) setDragOverId(image.id);
+                            }}
+                            onDragLeave={() => {
+                              if (dragOverId === image.id) setDragOverId(null);
+                            }}
+                            onDrop={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              const dragged = draggingId;
+                              setDraggingId(null);
+                              setDragOverId(null);
+                              if (dragged !== null && dragged !== image.id) {
+                                void handleDropOnImage(dragged, image.id);
+                              }
+                            }}
                           >
                             <img
                               src={
@@ -2165,15 +3065,114 @@ export function ModModal({
                               className="object-contain"
                             />
 
-                            {/* Delete button for custom images only */}
-                            {image.source === "custom" && (
-                              <button
-                                className="absolute top-2 right-2 bg-destructive text-destructive-foreground rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-destructive/90"
-                                onClick={(e) => handleDeleteImage(image.id, e)}
-                                aria-label="Delete image"
+                            {/* Every image can be removed from the list now. A
+                                custom row is deleted outright; the Nexus picture
+                                is only hidden, since it belongs to the mod page
+                                and "Show Nexus image" below puts it back. */}
+                            <button
+                              className="absolute top-2 right-2 bg-destructive text-destructive-foreground rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-destructive/90"
+                              onClick={(e) =>
+                                image.source === "custom"
+                                  ? handleDeleteImage(image.id, e)
+                                  : handleHideNexusImage(e)
+                              }
+                              aria-label={
+                                image.source === "custom"
+                                  ? "Delete image"
+                                  : "Remove the Nexus picture from this mod"
+                              }
+                              title={
+                                image.source === "custom"
+                                  ? "Delete image"
+                                  : "Remove the Nexus picture (reversible)"
+                              }
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+
+                            {/* Preview star, top-left and ALWAYS visible.
+                                It used to appear only on hover among two other
+                                icons, so there was no way to tell it existed or
+                                what it did. Filled = this is the card image.
+
+                                On every image including the Nexus one: the star
+                                was custom-only, so on a downloaded mod the image
+                                the app was actually showing had no star at all,
+                                and there was no way back to it after choosing
+                                your own. Starring it means "no custom override",
+                                which the backend handles as image id 0. */}
+                            <button
+                              className="absolute top-2 left-2 rounded-full p-1.5 transition-colors"
+                              style={{
+                                background: image.isPreview
+                                  ? "#a855f7"
+                                  : "rgba(0,0,0,0.6)",
+                                color: "white",
+                              }}
+                              disabled={isReordering}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (!image.isPreview) void handleMakePreview(image.id);
+                              }}
+                              title={
+                                image.isPreview
+                                  ? "This image is the mod preview"
+                                  : "Use as mod preview"
+                              }
+                              aria-label={
+                                image.isPreview
+                                  ? "Current mod preview"
+                                  : "Use as mod preview"
+                              }
+                            >
+                              <Star
+                                className="w-4 h-4"
+                                fill={image.isPreview ? "currentColor" : "none"}
+                              />
+                            </button>
+
+                            {image.isPreview && (
+                              <span
+                                className="absolute top-2 left-11 text-xs px-2 py-1 rounded-full pointer-events-none"
+                                style={{ background: "#a855f7", color: "white" }}
                               >
-                                <X className="w-4 h-4" />
-                              </button>
+                                Preview
+                              </span>
+                            )}
+
+                            {/* Keyboard-reachable fallback for the drag. */}
+                            {image.source === "custom" && customImageCount > 1 && (
+                              <div
+                                className="absolute bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1 rounded-full px-1 py-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity"
+                                style={{ background: "rgba(0,0,0,0.72)" }}
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <button
+                                  className="p-1 rounded-full text-white hover:bg-white/20 disabled:opacity-30"
+                                  disabled={isReordering || index === firstCustomIndex}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void handleMoveImage(image.id, -1);
+                                  }}
+                                  title="Move earlier"
+                                  aria-label="Move image earlier"
+                                >
+                                  <ChevronLeft className="w-4 h-4" />
+                                </button>
+                                <GripVertical className="w-4 h-4 text-white/50" />
+                                <button
+                                  className="p-1 rounded-full text-white hover:bg-white/20 disabled:opacity-30"
+                                  disabled={isReordering || index === modImages.length - 1}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void handleMoveImage(image.id, 1);
+                                  }}
+                                  title="Move later"
+                                  aria-label="Move image later"
+                                >
+                                  <ChevronRight className="w-4 h-4" />
+                                </button>
+                              </div>
                             )}
                           </div>
                         ))}
@@ -2209,6 +3208,453 @@ export function ModModal({
                           </p>
                         )}
                       </div>
+
+                      {/* Removing the Nexus picture only hides it, so say so and
+                          offer the way back. Otherwise the delete reads as
+                          permanent and nobody would risk it. */}
+                      {nexusImageIsHidden && (
+                        <div className="flex items-center gap-2 mt-4 text-sm text-muted-foreground">
+                          <span>The mod page picture is hidden.</span>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={isReordering}
+                            onClick={() => void setNexusHidden(false)}
+                            className="gap-1.5"
+                          >
+                            <ImageIcon className="w-3.5 h-3.5" />
+                            Show Nexus image
+                          </Button>
+                        </div>
+                      )}
+
+                      {/* Images the mod file itself ships.
+                          The only reliable source of a mod's other variants:
+                          Nexus publishes one picture per mod and its API has no
+                          gallery, while an archive is local and cannot change
+                          under us. Works for hand-made .pak drops too. */}
+                      {effectiveModId && (
+                        <div className="mt-6 pt-5 border-t border-border/50">
+                          <div className="flex items-start justify-between gap-4 mb-2">
+                            <div className="min-w-0">
+                              <p className="text-sm font-medium leading-none mb-1.5">
+                                From the mod file
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                Many mods bundle a screenshot per variant. Nothing
+                                is added until you pick.
+                              </p>
+                            </div>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={archiveScanning || archiveImporting}
+                              onClick={() => void handleFindArchiveImages()}
+                              className="gap-1.5 shrink-0"
+                            >
+                              {archiveScanning ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <ImageIcon className="w-3.5 h-3.5" />
+                              )}
+                              {archiveScanning ? "Looking…" : "Find images"}
+                            </Button>
+                          </div>
+
+                          {archivePickerOpen && archiveImages.length > 0 && (
+                            <div className="rounded-lg border border-border bg-muted/30 p-3">
+                              <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
+                                <p className="text-xs text-muted-foreground">
+                                  {archiveImages.length} found ·{" "}
+                                  {archiveSelection.size} selected
+                                </p>
+                                <div className="flex items-center gap-2">
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 text-xs"
+                                    onClick={() =>
+                                      setArchiveSelection(
+                                        archiveSelection.size === archiveImages.length
+                                          ? new Set()
+                                          : new Set(archiveImages.map((i) => i.entry)),
+                                      )
+                                    }
+                                  >
+                                    {archiveSelection.size === archiveImages.length
+                                      ? "Clear"
+                                      : "Select all"}
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    className="h-7 text-xs gap-1.5"
+                                    disabled={archiveSelection.size === 0 || archiveImporting}
+                                    onClick={() => void handleImportArchiveImages()}
+                                  >
+                                    {archiveImporting && (
+                                      <Loader2 className="w-3 h-3 animate-spin" />
+                                    )}
+                                    Add {archiveSelection.size || ""}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 w-7 p-0"
+                                    onClick={() => setArchivePickerOpen(false)}
+                                    aria-label="Close"
+                                  >
+                                    <X className="w-4 h-4" />
+                                  </Button>
+                                </div>
+                              </div>
+
+                              <div className="flex flex-wrap gap-2 max-h-[280px] overflow-y-auto">
+                                {archiveImages.map((img) => {
+                                  const picked = archiveSelection.has(img.entry);
+                                  return (
+                                    <button
+                                      key={img.entry}
+                                      type="button"
+                                      onClick={() =>
+                                        setArchiveSelection((prev) => {
+                                          const next = new Set(prev);
+                                          if (next.has(img.entry)) next.delete(img.entry);
+                                          else next.add(img.entry);
+                                          return next;
+                                        })
+                                      }
+                                      className="relative rounded-md overflow-hidden border-2 transition-colors"
+                                      style={{
+                                        height: "110px",
+                                        borderColor: picked
+                                          ? "#a855f7"
+                                          : "transparent",
+                                      }}
+                                      title={`${img.name} · ${img.width}×${img.height}`}
+                                    >
+                                      <img
+                                        src={img.thumbnail}
+                                        alt={img.name}
+                                        style={{ height: "100%", width: "auto" }}
+                                        className="object-contain"
+                                      />
+                                      {picked && (
+                                        <span
+                                          className="absolute top-1 right-1 rounded-full p-0.5"
+                                          style={{ background: "#a855f7", color: "white" }}
+                                        >
+                                          <Check className="w-3 h-3" />
+                                        </span>
+                                      )}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Artwork of the same character, from Nexus search.
+                          Not this mod's gallery — the mod page is behind a
+                          Cloudflare challenge that 403s automated requests, and
+                          the search API is the reachable part. Labelled honestly
+                          because it is someone else's picture of the same
+                          subject. */}
+                      {effectiveModId && (
+                        <div className="mt-5 pt-5 border-t border-border/50">
+                          <div className="flex items-start justify-between gap-4 mb-2">
+                            <div className="min-w-0">
+                              <p className="text-sm font-medium leading-none mb-1.5">
+                                From other mods of this character
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                Nexus cannot hand over a mod's own gallery, so
+                                this searches by name. These are other authors'
+                                cover images, not pictures of your files.
+                              </p>
+                            </div>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={nexusSearching || !nexusSearchInput.trim()}
+                              onClick={() => void handleSearchNexusImages()}
+                              className="gap-1.5 shrink-0"
+                            >
+                              {nexusSearching ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <Search className="w-3.5 h-3.5" />
+                              )}
+                              Search
+                            </Button>
+                          </div>
+                          <input
+                            value={nexusSearchInput}
+                            onChange={(e) => setNexusSearchInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") void handleSearchNexusImages();
+                            }}
+                            placeholder="Character or skin name — e.g. Luna Snow"
+                            className="w-full text-xs bg-background border border-border rounded-lg px-2.5 py-2"
+                          />
+
+                          {nexusSearchOpen && nexusResults.length > 0 && (
+                            <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3">
+                              <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
+                                <p className="text-xs text-muted-foreground">
+                                  {nexusResults.length} found ·{" "}
+                                  {nexusSelection.size} selected
+                                </p>
+                                <div className="flex items-center gap-2">
+                                  <Button
+                                    size="sm"
+                                    className="h-7 text-xs gap-1.5"
+                                    disabled={
+                                      nexusSelection.size === 0 || isAddingImageUrls
+                                    }
+                                    onClick={() => void handleImportNexusImages()}
+                                  >
+                                    {isAddingImageUrls && (
+                                      <Loader2 className="w-3 h-3 animate-spin" />
+                                    )}
+                                    Add {nexusSelection.size || ""}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 w-7 p-0"
+                                    onClick={() => setNexusSearchOpen(false)}
+                                    aria-label="Close"
+                                  >
+                                    <X className="w-4 h-4" />
+                                  </Button>
+                                </div>
+                              </div>
+                              <div className="flex flex-wrap gap-2 max-h-[280px] overflow-y-auto">
+                                {nexusResults.map((img) => {
+                                  const picked = nexusSelection.has(img.url);
+                                  return (
+                                    <button
+                                      key={img.url}
+                                      type="button"
+                                      onClick={() =>
+                                        setNexusSelection((prev) => {
+                                          const next = new Set(prev);
+                                          if (next.has(img.url)) next.delete(img.url);
+                                          else next.add(img.url);
+                                          return next;
+                                        })
+                                      }
+                                      className="relative rounded-md overflow-hidden border-2 transition-colors"
+                                      style={{
+                                        height: "110px",
+                                        borderColor: picked ? "#a855f7" : "transparent",
+                                      }}
+                                      title={`${img.modName} — by ${img.author}`}
+                                    >
+                                      <img
+                                        src={img.thumbnail}
+                                        alt={img.modName}
+                                        style={{ height: "100%", width: "auto" }}
+                                        className="object-contain"
+                                        loading="lazy"
+                                      />
+                                      {/* Three tiers, worth telling apart: this
+                                          mod's own picture, an exact skin match,
+                                          and anything found only by character. */}
+                                      {img.ownMod ? (
+                                        <span
+                                          className="absolute bottom-1 left-1 text-[10px] px-1.5 py-0.5 rounded font-medium"
+                                          style={{ background: "#22c55e", color: "#0b1f12" }}
+                                        >
+                                          this mod
+                                        </span>
+                                      ) : img.matchedTerm !== nexusSearchInput.trim() ? (
+                                        <span
+                                          className="absolute bottom-1 left-1 text-[10px] px-1.5 py-0.5 rounded"
+                                          style={{
+                                            background: "rgba(0,0,0,0.7)",
+                                            color: "rgba(255,255,255,0.75)",
+                                          }}
+                                        >
+                                          wider match
+                                        </span>
+                                      ) : null}
+                                      {picked && (
+                                        <span
+                                          className="absolute top-1 right-1 rounded-full p-0.5"
+                                          style={{ background: "#a855f7", color: "white" }}
+                                        >
+                                          <Check className="w-3 h-3" />
+                                        </span>
+                                      )}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Add images by URL.
+                          Nexus only ever gives this app one picture per mod:
+                          the Mod type carries a single image in several sizes,
+                          and the media query cannot be narrowed to a mod, so
+                          there is no gallery to fetch. Pasting addresses off the
+                          mod page is the way to attach the rest. */}
+                      {effectiveModId && (
+                        <div className="mt-5 pt-5 border-t border-border/50">
+                          <div className="flex items-start justify-between gap-4 mb-2">
+                            <div className="min-w-0">
+                              <p className="text-sm font-medium leading-none mb-1.5">
+                                From links
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                One address per line. To grab a whole gallery at
+                                once, use the two buttons on the right.
+                              </p>
+                              {/* Its own line and its own colour: buried in grey
+                                  body text at 12px, nobody found the one thing
+                                  that explains the whole flow. */}
+                              <button
+                                type="button"
+                                onClick={() => setGalleryStepsOpen((v) => !v)}
+                                className="mt-2 inline-flex items-center gap-1 text-sm font-medium transition-opacity hover:opacity-80"
+                                style={{ color: "#38bdf8" }}
+                              >
+                                {galleryStepsOpen ? (
+                                  <ChevronDown className="w-4 h-4" />
+                                ) : (
+                                  <ChevronRight className="w-4 h-4" />
+                                )}
+                                {galleryStepsOpen ? "Hide the steps" : "Show me how"}
+                              </button>
+                            </div>
+                            {/* Both buttons together on the right, in the order
+                                they get used: open the gallery, copy addresses,
+                                add them. */}
+                            <div className="flex items-center gap-2 shrink-0">
+                              {mod?.backendModId != null && mod.backendModId > 0 && (
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => {
+                                    void (async () => {
+                                      const { openInBrowser } = await import(
+                                        "../lib/tauri-utils"
+                                      );
+                                      await openInBrowser(
+                                        `https://www.nexusmods.com/marvelrivals/mods/${mod.backendModId}?tab=images`,
+                                      );
+                                    })();
+                                  }}
+                                  className="gap-1.5"
+                                  title="Open this mod's images on Nexus, then copy the addresses"
+                                >
+                                  <ExternalLink className="w-3.5 h-3.5" />
+                                  Open gallery
+                                </Button>
+                              )}
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => void handleCopyGalleryHelper()}
+                                className="gap-1.5"
+                                title="Copy a one-liner that collects every image address from the gallery page"
+                              >
+                                <ClipboardCopy className="w-3.5 h-3.5" />
+                                Copy helper
+                              </Button>
+                              <Button
+                                size="sm"
+                                onClick={handleAddImagesByUrl}
+                                disabled={isAddingImageUrls || !imageUrlInput.trim()}
+                                className="gap-1.5"
+                              >
+                                {isAddingImageUrls ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <Plus className="w-3.5 h-3.5" />
+                                )}
+                                Add images
+                              </Button>
+                            </div>
+                          </div>
+
+                          {/* Written out because the console is not somewhere
+                              most people go, and the browser adds a step of its
+                              own the first time: Chrome refuses a pasted script
+                              until you type "allow pasting". Someone who does
+                              not know that just sees paste silently do nothing. */}
+                          {galleryStepsOpen && (
+                            <div className="mb-3 rounded-lg border border-border bg-muted/30 p-3">
+                              <ol className="text-xs text-muted-foreground flex flex-col gap-1.5">
+                                <li>
+                                  <strong className="text-foreground">1.</strong>{" "}
+                                  Press <strong className="text-foreground">Open gallery</strong> —
+                                  the mod's images open in your browser.
+                                </li>
+                                <li>
+                                  <strong className="text-foreground">2.</strong>{" "}
+                                  Scroll to the bottom of that page, so every image
+                                  has loaded.
+                                </li>
+                                <li>
+                                  <strong className="text-foreground">3.</strong>{" "}
+                                  Press <strong className="text-foreground">Copy helper</strong> —
+                                  a short line is now on your clipboard.
+                                </li>
+                                <li>
+                                  <strong className="text-foreground">4.</strong>{" "}
+                                  In the browser press{" "}
+                                  <kbd className="px-1 py-0.5 rounded bg-background border border-border font-mono">
+                                    F12
+                                  </kbd>{" "}
+                                  and pick the{" "}
+                                  <strong className="text-foreground">Console</strong> tab.
+                                </li>
+                                <li>
+                                  <strong className="text-foreground">5.</strong>{" "}
+                                  The first time, the browser asks you to type{" "}
+                                  <code className="px-1 py-0.5 rounded bg-background border border-border font-mono">
+                                    allow pasting
+                                  </code>{" "}
+                                  and press Enter. It only asks once.
+                                </li>
+                                <li>
+                                  <strong className="text-foreground">6.</strong>{" "}
+                                  Paste (
+                                  <kbd className="px-1 py-0.5 rounded bg-background border border-border font-mono">
+                                    Ctrl+V
+                                  </kbd>
+                                  ) and press Enter. Nothing appears to happen — that
+                                  is correct, the addresses went to your clipboard.
+                                </li>
+                                <li>
+                                  <strong className="text-foreground">7.</strong>{" "}
+                                  Come back here, paste into the box below and press{" "}
+                                  <strong className="text-foreground">Add images</strong>.
+                                </li>
+                              </ol>
+                              <p className="text-xs text-muted-foreground/70 mt-2">
+                                The app cannot read that page itself — Nexus answers
+                                automated requests with a bot check. Your browser is
+                                allowed to read it, so it does the reading.
+                              </p>
+                            </div>
+                          )}
+
+                          <textarea
+                            value={imageUrlInput}
+                            onChange={(e) => setImageUrlInput(e.target.value)}
+                            placeholder={"https://staticdelivery.nexusmods.com/mods/…/1.png\nhttps://…/2.jpg"}
+                            rows={3}
+                            className="w-full text-xs font-mono bg-background border border-border rounded-lg px-2.5 py-2 resize-y"
+                          />
+                        </div>
+                      )}
                     </div>
                   </TabsContent>
 
@@ -2571,6 +4017,8 @@ export function ModModal({
                                           const checked = files.some((file) =>
                                             activeList.includes(file),
                                           );
+                                          const note =
+                                            (fileNotes[entry.id] ?? {})[noteKey(primary)];
                                           return (
                                             <div
                                               key={`${entry.id}-${primary}`}
@@ -2588,20 +4036,75 @@ export function ModModal({
                                                     {primary}
                                                   </div>
                                                 </div>
-                                                <Switch
-                                                  disabled={switchDisabled}
-                                                  checked={checked}
-                                                  onCheckedChange={(
-                                                    willCheck: boolean,
-                                                  ) =>
-                                                    handleToggle(
-                                                      entry.id,
-                                                      files,
-                                                      willCheck,
-                                                    )
-                                                  }
-                                                />
+                                                <div className="flex items-center gap-2 shrink-0">
+                                                  <button
+                                                    type="button"
+                                                    onClick={() =>
+                                                      openNoteEditor(entry.id, primary)
+                                                    }
+                                                    className={`p-1 rounded transition-colors ${
+                                                      note
+                                                        ? "text-amber-500 hover:bg-amber-500/10"
+                                                        : "text-muted-foreground/50 hover:text-foreground hover:bg-muted"
+                                                    }`}
+                                                    title={note ? `Note: ${note}` : "Add a note"}
+                                                    aria-label={note ? "Edit note" : "Add a note"}
+                                                  >
+                                                    <Pencil className="w-3.5 h-3.5" />
+                                                  </button>
+                                                  <Switch
+                                                    disabled={switchDisabled}
+                                                    checked={checked}
+                                                    onCheckedChange={(
+                                                      willCheck: boolean,
+                                                    ) =>
+                                                      handleToggle(
+                                                        entry.id,
+                                                        files,
+                                                        willCheck,
+                                                      )
+                                                    }
+                                                  />
+                                                  {/* Eye hides, bin deletes —
+                                                      see the tree renderer. */}
+                                                  <button
+                                                    type="button"
+                                                    disabled={removingFile === primary}
+                                                    onClick={() =>
+                                                      void handleRemoveFile(
+                                                        entry.id,
+                                                        primary,
+                                                      )
+                                                    }
+                                                    className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-40"
+                                                    title={`Hide ${primary} — stays in the archive`}
+                                                    aria-label={`Hide ${primary}`}
+                                                  >
+                                                    {removingFile === primary ? (
+                                                      <Loader2 className="w-4 h-4 animate-spin" />
+                                                    ) : (
+                                                      <EyeOff className="w-4 h-4" />
+                                                    )}
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    disabled={deletingFile === primary}
+                                                    onClick={() =>
+                                                      requestDeleteFile(entry.id, primary)
+                                                    }
+                                                    className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 disabled:opacity-40"
+                                                    title={`Delete ${primary} from the archive — permanent`}
+                                                    aria-label={`Delete ${primary} permanently`}
+                                                  >
+                                                    {deletingFile === primary ? (
+                                                      <Loader2 className="w-4 h-4 animate-spin" />
+                                                    ) : (
+                                                      <Trash2 className="w-4 h-4" />
+                                                    )}
+                                                  </button>
+                                                </div>
                                               </div>
+                                              <FileNote note={note} />
                                             </div>
                                           );
                                         },
@@ -2616,9 +4119,80 @@ export function ModModal({
                                         activeList={activeList}
                                         switchDisabled={switchDisabled}
                                         handleToggle={handleToggle}
+                                        removingFile={removingFile}
+                                        onRemoveFile={(downloadId, pakName) =>
+                                          void handleRemoveFile(downloadId, pakName)
+                                        }
+                                        deletingFile={deletingFile}
+                                        onDeleteFile={requestDeleteFile}
+                                        notes={fileNotes[entry.id] ?? {}}
+                                        onEditNote={openNoteEditor}
                                       />
                                     );
                                   })()}
+
+                                  {/* Files removed from this mod.
+                                      Kept with the mod rather than in a global
+                                      list in Settings: this is where you removed
+                                      them and where you would look for them. */}
+                                  {entry.hidden_contents.length > 0 && (
+                                    <div className="mt-3 pt-3 border-t border-border/50">
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          setHiddenOpenFor((prev) => {
+                                            const next = new Set(prev);
+                                            if (next.has(entry.id)) next.delete(entry.id);
+                                            else next.add(entry.id);
+                                            return next;
+                                          })
+                                        }
+                                        className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
+                                      >
+                                        {hiddenOpenFor.has(entry.id) ? (
+                                          <ChevronDown className="w-3.5 h-3.5" />
+                                        ) : (
+                                          <ChevronRight className="w-3.5 h-3.5" />
+                                        )}
+                                        <EyeOff className="w-3.5 h-3.5" />
+                                        Hidden ({entry.hidden_contents.length})
+                                      </button>
+
+                                      {hiddenOpenFor.has(entry.id) && (
+                                        <div className="space-y-1.5 mt-2">
+                                          {entry.hidden_contents.map((pak) => (
+                                            <div
+                                              key={`${entry.id}-hidden-${pak}`}
+                                              className="flex items-center justify-between gap-3 rounded-lg bg-muted/40 px-2.5 py-1.5"
+                                            >
+                                              <div className="flex items-center gap-2.5 min-w-0">
+                                                <File className="w-3.5 h-3.5 text-muted-foreground/60 shrink-0" />
+                                                <span className="text-sm text-muted-foreground truncate">
+                                                  {noteKey(pak)}
+                                                </span>
+                                              </div>
+                                              <Button
+                                                variant="ghost"
+                                                size="sm"
+                                                className="h-7 px-2 text-xs gap-1 shrink-0"
+                                                disabled={restoringFile === pak}
+                                                onClick={() =>
+                                                  void handleRestoreFile(entry.id, pak)
+                                                }
+                                              >
+                                                {restoringFile === pak ? (
+                                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                                ) : (
+                                                  <RotateCcw className="w-3 h-3" />
+                                                )}
+                                                Restore
+                                              </Button>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
                                 </div>
                               </div>
                             );
@@ -2763,6 +4337,107 @@ export function ModModal({
                 disabled={isDeletingSelectedEntry}
               >
                 {isDeletingSelectedEntry ? "Deleting..." : "Delete"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        {/* Deleting a file out of the archive. The one action here that
+            destroys something the user cannot get back, so it asks — and the
+            mute it offers lasts a day, not forever. */}
+        <AlertDialog
+          open={deleteFileTarget != null}
+          onOpenChange={(open) => {
+            if (!open) setDeleteFileTarget(null);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                Delete {deleteFileTarget ? noteKey(deleteFileTarget.pakName) : ""}?
+              </AlertDialogTitle>
+              <AlertDialogDescription asChild>
+                <div className="space-y-2 text-sm">
+                  <p>
+                    This removes the file from the mod's archive on disk. It
+                    cannot be undone, and a rebuild will not bring it back.
+                  </p>
+                  <p className="text-muted-foreground">
+                    To take it out of the list but keep the file, use the eye
+                    icon instead.
+                  </p>
+                </div>
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+
+            <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={suppressDeletePrompt}
+                onChange={(e) => setSuppressDeletePrompt(e.target.checked)}
+              />
+              Don't ask again for a day
+            </label>
+
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={(e) => {
+                  e.preventDefault();
+                  confirmDeleteFile();
+                }}
+              >
+                Delete permanently
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        {/* Per-pak note. Variants are named A_rogueVA / A_rogueVB / A_rogueVC
+            and nothing in the app said what any of them changed, so telling
+            them apart meant enabling one at a time. */}
+        <AlertDialog
+          open={noteTarget != null}
+          onOpenChange={(open) => {
+            if (!open && !savingNote) setNoteTarget(null);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Note</AlertDialogTitle>
+              <AlertDialogDescription asChild>
+                <p className="text-xs text-muted-foreground break-all font-mono">
+                  {noteTarget ? noteKey(noteTarget.pakName) : ""}
+                </p>
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <Textarea
+              value={noteDraft}
+              onChange={(e) => setNoteDraft(e.target.value)}
+              placeholder="What does this variant change? e.g. no gloves, alt colours"
+              rows={4}
+              maxLength={500}
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                  e.preventDefault();
+                  void handleSaveNote();
+                }
+              }}
+            />
+            <p className="text-xs text-muted-foreground">
+              Leave it empty to remove the note. Ctrl+Enter saves.
+            </p>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={savingNote}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={(e) => {
+                  e.preventDefault();
+                  void handleSaveNote();
+                }}
+                disabled={savingNote}
+              >
+                {savingNote ? "Saving…" : "Save"}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>

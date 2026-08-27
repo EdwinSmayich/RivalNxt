@@ -23,7 +23,8 @@ import {
   CheckCircle,
   Link,
   AlertCircle,
-  Pencil
+  Pencil,
+  Check
 } from "lucide-react";
 import type { Mod } from "./ModCard";
 import { computeTagDisplay } from "../lib/tagDisplay";
@@ -42,6 +43,10 @@ interface InstalledModCardProps {
   onOpenFilesTab: (modId: string) => void;
   onAssignModId?: (modId: string) => void;
   onRefresh?: (opts?: { skipScan?: boolean }) => void;
+  /** True while the list is in selection mode. */
+  selectable?: boolean;
+  selected?: boolean;
+  onToggleSelect?: (mod: Mod) => void;
 }
 
 function InstalledModCardInner({
@@ -54,6 +59,9 @@ function InstalledModCardInner({
   onOpenFilesTab,
   onAssignModId,
   onRefresh,
+  selectable = false,
+  selected = false,
+  onToggleSelect,
 }: InstalledModCardProps) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [isUninstalling, setIsUninstalling] = useState(false);
@@ -173,8 +181,42 @@ function InstalledModCardInner({
           }
           className="card-list-item border-b border-border/20 last:border-b-0 py-1"
         >
-          <div className="p-2">
-            <div className="flex gap-3 flex-wrap sm:flex-nowrap">
+          <div
+            className="p-2 relative"
+            style={selected ? { background: "hsl(var(--primary) / 0.10)" } : undefined}
+          >
+            {/* Same overlay as the grid card. List view had no selection at all
+                — the checkbox was only ever added to the grid branch. */}
+            {selectable && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onToggleSelect?.(mod);
+                }}
+                aria-pressed={selected}
+                aria-label={selected ? `Deselect ${mod.name}` : `Select ${mod.name}`}
+                className="absolute inset-0 z-20 flex items-center"
+              >
+                <span
+                  className="ml-1 flex items-center justify-center rounded-md border-2 transition-colors"
+                  style={{
+                    width: "22px",
+                    height: "22px",
+                    background: selected ? "#22c55e" : "rgba(15,15,17,0.92)",
+                    borderColor: selected ? "#22c55e" : "rgba(255,255,255,0.55)",
+                    boxShadow: "0 1px 3px rgba(0,0,0,0.55)",
+                  }}
+                >
+                  {selected && <Check className="w-3.5 h-3.5" style={{ color: "#0b1f12" }} />}
+                </span>
+              </button>
+            )}
+            <div
+              className="flex gap-3 flex-wrap sm:flex-nowrap"
+              style={selectable ? { paddingLeft: "28px" } : undefined}
+            >
               <div className="p-1">
                 <div
                   className="w-8 h-8 bg-muted rounded-lg overflow-hidden flex-shrink-0 relative cursor-pointer"
@@ -316,7 +358,48 @@ function InstalledModCardInner({
 
   return (
     <>
-      <Card className="h-full flex flex-col group relative overflow-hidden">
+      <Card
+        className="h-full flex flex-col group relative overflow-hidden"
+        style={
+          selected
+            ? { outline: "2px solid hsl(var(--primary))", outlineOffset: "-2px" }
+            : undefined
+        }
+      >
+        {/* Selection sits above the card's own click targets: in selection mode
+            the whole card is a checkbox, and clicking it must not also open the
+            mod. */}
+        {selectable && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onToggleSelect?.(mod);
+            }}
+            aria-pressed={selected}
+            aria-label={selected ? `Deselect ${mod.name}` : `Select ${mod.name}`}
+            className="absolute inset-0 z-20"
+            style={{ background: selected ? "hsl(var(--primary) / 0.10)" : "transparent" }}
+          >
+            {/* Opaque, and green when ticked. The previous version used the
+                theme's primary colour at 85% opacity over mod artwork, which on
+                a busy screenshot was invisible — there was no way to tell what
+                you had selected. */}
+            <span
+              className="absolute top-3 left-3 flex items-center justify-center rounded-md border-2 transition-colors"
+              style={{
+                width: "24px",
+                height: "24px",
+                background: selected ? "#22c55e" : "rgba(15,15,17,0.92)",
+                borderColor: selected ? "#22c55e" : "rgba(255,255,255,0.55)",
+                boxShadow: "0 1px 3px rgba(0,0,0,0.55)",
+              }}
+            >
+              {selected && <Check className="w-4 h-4" style={{ color: "#0b1f12" }} />}
+            </span>
+          </button>
+        )}
         <LazyLoad
           className="h-full flex flex-col flex-1"
           placeholder={
@@ -678,6 +761,12 @@ function installedModPropsAreEqual(
   if (a.images?.[0] !== b.images?.[0]) return false;
   if ((a.tags || []).join(",") !== (b.tags || []).join(",")) return false;
   if (prev.viewMode !== next.viewMode) return false;
+  // Selection is a prop, not part of the mod, so it has to be compared
+  // explicitly. Without this, turning Select mode on re-rendered nothing and
+  // the checkboxes only appeared on cards that happened to change for another
+  // reason — favouriting one made that one, and only that one, selectable.
+  if (prev.selectable !== next.selectable) return false;
+  if (prev.selected !== next.selected) return false;
   return true;
 }
 

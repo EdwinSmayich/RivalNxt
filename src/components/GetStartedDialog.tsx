@@ -1356,6 +1356,11 @@ export function GetStartedDialog({
                           value={formValues.aes_key_hex}
                           onChange={handleInputChange("aes_key_hex")}
                         />
+                        <p className="text-xs text-muted-foreground">
+                          Already filled in. Lets the app read the asset list
+                          inside a mod's .pak files, which powers tags and
+                          conflict detection. Not a personal key — leave as is.
+                        </p>
                       </div>
 
                       <div className="space-y-2">
@@ -1520,6 +1525,7 @@ export function GetStartedDialog({
                   task={job?.task ?? "bootstrap_rebuild"}
                   output={jobOutput}
                   isRunning={jobRunning}
+                  startedAt={job?.started_at ?? null}
                   style={{ minHeight: "200px" }}
                 />
               </div>

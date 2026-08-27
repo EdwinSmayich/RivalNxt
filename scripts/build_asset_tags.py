@@ -2,7 +2,6 @@ from __future__ import annotations
 import argparse
 import logging
 import sqlite3
-from typing import Optional, Tuple
 from pathlib import Path
 import sys
 
@@ -34,15 +33,6 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     # Make sure base schema and migrations are applied (to get asset_tags table)
     init_schema(conn)
     run_migrations(conn)
-
-
-def split_tag(tag: str) -> Tuple[Optional[str], str]:
-    # tag is either 'category' or 'entity,category'
-    if ',' in tag:
-        ent, cat = tag.split(',', 1)
-        return ent.strip() or None, cat.strip()
-    return None, tag.strip()
-
 
 def main(argv=None) -> int:
     args = parse_args(argv)

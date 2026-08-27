@@ -13,8 +13,6 @@ import { lookupTags, type TagLookupResponse } from "../lib/api";
 interface ActiveModsViewProps {
   mods: Mod[];
   onToggleMod: (modId: string) => void;
-  onDisableAll: () => void;
-  onEnableAll: () => void;
   onUpdate: (modId: string) => void | Promise<void>;
   onCheckUpdate: (modId: string) => void | Promise<void>;
   onUninstall: (modId: string) => void | Promise<void>;

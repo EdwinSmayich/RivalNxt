@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronUp, Check, Loader2, Circle } from "lucide-react";
 
 import type { SettingsTask } from "../lib/api";
@@ -14,6 +14,72 @@ interface TaskOutputSummaryProps {
   fallbackMinHeight?: string;
   showRawToggle?: boolean;
   style?: React.CSSProperties;
+  /** ISO timestamp the run started, used only to estimate what is left. */
+  startedAt?: string | null;
+}
+
+/**
+ * Steps summarizeBootstrap can emit, in order.
+ *
+ * A fixed denominator matters: the step list only grows as the log reveals each
+ * stage, so measuring progress against the steps seen *so far* would sit at
+ * 100% from the first line and lurch backwards as new ones appeared.
+ */
+const BOOTSTRAP_STEP_IDS = [
+  "database",
+  "ue_extraction",
+  "downloads",
+  "sync",
+  "extract",
+  "tags",
+  "conflicts",
+] as const;
+
+/**
+ * Fraction of the whole task that is done, 0..1, or null when unknowable.
+ *
+ * A step counts as its own completion fraction when it reports counts, so the
+ * long extraction stage moves the bar rather than jumping from 0 to 1.
+ */
+function computeProgress(
+  steps: { id: string; status: string; current?: number; total?: number }[],
+  task?: SettingsTask,
+): number | null {
+  if (steps.length === 0) return null;
+
+  const denominator =
+    task === "bootstrap_rebuild" || steps.some((s) => s.id === "ue_extraction")
+      ? BOOTSTRAP_STEP_IDS.length
+      : steps.length;
+
+  let completed = 0;
+  for (const step of steps) {
+    if (step.status === "done") {
+      completed += 1;
+    } else if (step.status === "active") {
+      const { current, total } = step;
+      if (typeof current === "number" && typeof total === "number" && total > 0) {
+        completed += Math.min(current / total, 1);
+      } else {
+        // In flight with nothing to measure by. Half is the least wrong guess.
+        completed += 0.5;
+      }
+    }
+  }
+  return Math.max(0, Math.min(completed / denominator, 1));
+}
+
+/** "about 2 min left" — deliberately vague, because it is a linear guess. */
+function formatRemaining(elapsedMs: number, fraction: number): string | null {
+  // Below a few percent the extrapolation is noise; above 99.5% it reads as
+  // stuck. Neither is worth showing.
+  if (fraction <= 0.03 || fraction >= 0.995) return null;
+  const totalMs = elapsedMs / fraction;
+  const remaining = Math.max(0, totalMs - elapsedMs);
+  if (remaining < 10_000) return "a few seconds left";
+  if (remaining < 90_000) return `about ${Math.round(remaining / 10_000) * 10}s left`;
+  const minutes = Math.round(remaining / 60_000);
+  return `about ${minutes} min left`;
 }
 
 export function TaskOutputSummary({
@@ -23,9 +89,18 @@ export function TaskOutputSummary({
   fallbackMinHeight = "h-40",
   showRawToggle = true,
   style,
+  startedAt,
 }: TaskOutputSummaryProps) {
   const trimmed = output?.trim() ?? "";
   const [showRaw, setShowRaw] = useState(false);
+
+  // Ticks only while running, and only so the estimate ages between log lines.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!isRunning) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [isRunning]);
 
   const summary = useMemo(() => {
     // Try primary task first, then fall back to other known task types when
@@ -156,9 +231,44 @@ export function TaskOutputSummary({
     );
   });
 
+  const fraction = computeProgress(summary.steps, task);
+  const percent = fraction === null ? null : Math.round(fraction * 100);
+  const startedMs = startedAt ? new Date(startedAt).getTime() : NaN;
+  const remaining =
+    isRunning && fraction !== null && Number.isFinite(startedMs)
+      ? formatRemaining(Math.max(0, now - startedMs), fraction)
+      : null;
+
   return (
     <div className="space-y-3" style={style}>
       <div className="rounded-lg border border-border/40 bg-muted/5 p-4">
+        {/* "190/200 mods" said nothing about the checks still to run after it,
+            so a run that was nearly over looked identical to one that was not. */}
+        {percent !== null ? (
+          <div className="mb-3">
+            <div className="flex items-baseline justify-between gap-3 mb-1.5">
+              <span className="text-sm font-medium tabular-nums">{percent}%</span>
+              {remaining ? (
+                <span className="text-xs text-muted-foreground">{remaining}</span>
+              ) : null}
+            </div>
+            <div
+              className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+              role="progressbar"
+              aria-valuenow={percent}
+              aria-valuemin={0}
+              aria-valuemax={100}
+            >
+              <div
+                className={cn(
+                  "h-full rounded-full transition-all duration-500",
+                  percent >= 100 ? "bg-emerald-500" : "bg-primary",
+                )}
+                style={{ width: `${percent}%` }}
+              />
+            </div>
+          </div>
+        ) : null}
         <div className="flex flex-col gap-2">{progressRows}</div>
       </div>
 

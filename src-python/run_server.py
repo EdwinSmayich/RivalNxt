@@ -89,6 +89,12 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # SETTINGS is the module-level binding imported above and is reassigned below
+    # from configure(). Without this declaration the assignment makes SETTINGS
+    # local to main(), so the reads that feed configure() its own defaults raise
+    # UnboundLocalError and the server cannot start at all.
+    global SETTINGS
+
     repo_root = _ensure_repo_on_path()
     os.environ.setdefault("PROJECT_MODMANAGER_ROOT", str(repo_root))
 

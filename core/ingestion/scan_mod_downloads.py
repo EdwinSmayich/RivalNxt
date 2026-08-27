@@ -17,7 +17,20 @@ from core.db import get_connection, init_schema, replace_local_downloads
 from core.utils.mod_filename import parse_mod_filename_to_row
 from core.utils.download_paths import normalize_download_path
 from core.utils.archive import list_entries
-from scripts.sync_nexus_to_db import sync_mods
+
+
+def sync_mods(*args, **kwargs):
+    """Lazy shim for scripts.sync_nexus_to_db.sync_mods.
+
+    That module imports core.db, and core.ingestion importing it back at module
+    load closed a cycle: importing scripts.sync_nexus_to_db first raised
+    "partially initialized module", so it only worked when something had already
+    imported core. Deferring the import to call time breaks the cycle and keeps
+    core from depending on scripts at load.
+    """
+    from scripts.sync_nexus_to_db import sync_mods as _sync_mods
+
+    return _sync_mods(*args, **kwargs)
 
 DEFAULT_DOWNLOADS_ROOT_FALLBACK = Path(
     r"C:\Users\rouna\OneDrive\Documents\Marvel_Rivals_Mods\downloads"

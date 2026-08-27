@@ -17,13 +17,19 @@ def test_custom_data_backup_restore_endpoints(client):
     # 1. Setup synthetic mod_id for local download placeholder
     # First we need a local download to exist so the API can generate a placeholder mod
     # For testing, we'll manually insert a dummy local_download directly into the db
+    mod_id = -9999
+
     conn = get_db()
     cur = conn.cursor()
     cur.execute("INSERT INTO local_downloads (id, name, path, contents, active_paks) VALUES (9999, 'Test Local Mod', '/tmp/test', '[]', '[]') ON CONFLICT DO NOTHING")
+    # Start from a known state. The suite's database persists between runs and
+    # this test asserts that the upload created a row — which stopped being true
+    # once uploads became idempotent, because the image was already there from
+    # the previous run. The test always depended on a clean slate; now it says so.
+    cur.execute("DELETE FROM mod_custom_images WHERE mod_id = ?", (mod_id,))
+    cur.execute("DELETE FROM mod_custom_tags WHERE mod_id = ?", (mod_id,))
     conn.commit()
     conn.close()
-
-    mod_id = -9999
 
     # 2. Update custom description (Simulating restore of description)
     test_desc = "This is a custom backup description"

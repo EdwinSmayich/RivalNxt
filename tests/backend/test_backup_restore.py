@@ -33,7 +33,13 @@ def env(monkeypatch, tmp_path):
     game_root.mkdir()
 
     import core.config.settings as settings_mod
+    from core.api.dependencies import invalidate_connection_pool
     from core.db.db import init_schema, run_migrations
+
+    # get_db() caches one connection per thread. Repointing the data dir does
+    # not invalidate it, so without this a test picks up the previous test's
+    # tmp_path database and reads rows that belong to nobody.
+    invalidate_connection_pool()
 
     monkeypatch.setattr(
         settings_mod,
@@ -79,12 +85,15 @@ def env(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
-    return {
+    yield {
         "data_dir": data_dir,
         "downloads": downloads,
         "game_root": game_root,
         "db_path": db_path,
     }
+
+    # Leave no handle pointing at a tmp_path that is about to be deleted.
+    invalidate_connection_pool()
 
 
 def _snapshot_state(db_path: Path) -> dict:
@@ -181,6 +190,98 @@ def test_backup_snapshot_is_wal_safe(env):
         "the backup missed a committed-but-uncheckpointed write; the snapshot is "
         "not WAL-safe"
     )
+
+
+class TestRestoreWhileTheAppIsRunning:
+    """Restore must work with the app's own connections still open.
+
+    Every real restore happens with the backend serving requests, so worker
+    threads hold connections opened by core/db/db.py -- which sets
+    ``PRAGMA mmap_size = 268435456``. SQLite therefore keeps mods.db
+    memory-mapped, and the old ``shutil.copyfile`` onto the live file hit
+    Windows' ERROR_USER_MAPPED_FILE. CPython has no errno for that code, so it
+    arrived as ``OSError: [Errno 22] Invalid argument`` and every restore the
+    user attempted failed with "Failed to fetch".
+
+    None of the tests above caught it: they all close their connection before
+    restoring, which is the one condition under which the file copy worked.
+    """
+
+    @staticmethod
+    def _open_like_the_app(db_path: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA mmap_size = 268435456")
+        # Read a page so the mapping is actually established.
+        conn.execute("SELECT COUNT(*) FROM mods").fetchone()
+        return conn
+
+    def test_restore_succeeds_with_a_mapped_connection_open(self, env):
+        result = create_backup(timestamp="2026-01-01T00:00:00+00:00")
+        conn = sqlite3.connect(str(env["db_path"]))
+        conn.execute("DELETE FROM mods")
+        conn.commit()
+        conn.close()
+
+        held = self._open_like_the_app(env["db_path"])
+        try:
+            restore_backup(path=result["path"], timestamp="2026-01-02T00:00:00+00:00")
+        finally:
+            held.close()
+
+        assert [r[1] for r in _snapshot_state(env["db_path"])["mods"]] == ["Alpha", "Beta"]
+
+    def test_a_connection_opened_before_the_restore_sees_the_restored_rows(self, env):
+        """Writing through SQLite means live handles are updated, not orphaned."""
+        result = create_backup(timestamp="2026-01-01T00:00:00+00:00")
+        conn = sqlite3.connect(str(env["db_path"]))
+        conn.execute("DELETE FROM mods")
+        conn.commit()
+        conn.close()
+
+        held = self._open_like_the_app(env["db_path"])
+        try:
+            assert held.execute("SELECT COUNT(*) FROM mods").fetchone()[0] == 0
+            restore_backup(path=result["path"], timestamp="2026-01-02T00:00:00+00:00")
+            assert held.execute("SELECT COUNT(*) FROM mods").fetchone()[0] == 2
+        finally:
+            held.close()
+
+    def test_the_wal_is_not_discarded_after_the_restore(self, env):
+        """The restore writes through the WAL, so deleting the sidecars loses it.
+
+        The previous implementation unlinked mods.db-wal/-shm straight after
+        replacing the file. That was correct for a file copy and destructive for
+        a write through SQLite.
+        """
+        result = create_backup(timestamp="2026-01-01T00:00:00+00:00")
+        conn = sqlite3.connect(str(env["db_path"]))
+        conn.execute("DELETE FROM mods")
+        conn.execute("DELETE FROM local_downloads")
+        conn.commit()
+        conn.close()
+
+        held = self._open_like_the_app(env["db_path"])
+        try:
+            restore_backup(path=result["path"], timestamp="2026-01-02T00:00:00+00:00")
+        finally:
+            held.close()
+
+        # Read with a brand-new connection: whatever is on disk after every
+        # handle is gone is what the user gets on next launch.
+        assert len(_snapshot_state(env["db_path"])["local_downloads"]) == 2
+
+    def test_the_safety_snapshot_is_still_written(self, env):
+        result = create_backup(timestamp="2026-01-01T00:00:00+00:00")
+        held = self._open_like_the_app(env["db_path"])
+        try:
+            res = restore_backup(
+                path=result["path"], timestamp="2026-01-02T00:00:00+00:00"
+            )
+        finally:
+            held.close()
+        assert res["safety_snapshot"], "restoring must leave an undo point"
+        assert Path(res["safety_snapshot"]).exists()
 
 
 def test_archive_contains_manifest_db_and_settings(env):
@@ -485,6 +586,121 @@ def test_restore_endpoint_returns_400_for_a_bad_archive(env, monkeypatch):
             server.BackupRestorePayload(path=str(bogus), remap_paths=True)
         )
     assert e.value.status_code == 400
+
+
+class TestRestorePutsTheModsBackOn:
+    """A restore has to move .pak files, not just rewrite a column.
+
+    A mod is active because its .pak sits in the game's ~mods folder. Restoring
+    only replaced mods.db, so the archive's active_paks landed in the database
+    and nothing else happened -- and list_downloads then pruned active_paks down
+    to the files it could actually find, erasing the restored state on the next
+    refresh. The toast said "Database restored from snapshot" and every mod
+    stayed off.
+    """
+
+    @staticmethod
+    def _route(server, path):
+        return server.restore_backup_route(
+            server.BackupRestorePayload(path=path, remap_paths=True)
+        )
+
+    def test_it_reactivates_what_the_archive_had_on(self, env, monkeypatch):
+        import core.api.server as server
+
+        calls: list = []
+        monkeypatch.setattr(
+            server, "set_active_paks", lambda dl_id, payload: calls.append((dl_id, payload))
+        )
+        monkeypatch.setattr(server, "refresh_conflicts", lambda: None)
+
+        # The archive is taken while download 1 is active.
+        result = create_backup(timestamp="2026-01-01T00:00:00+00:00")
+        # ...then everything is switched off, as "Turn all mods off" would.
+        conn = sqlite3.connect(str(env["db_path"]))
+        conn.execute("UPDATE local_downloads SET active_paks = '[]'")
+        conn.commit()
+        conn.close()
+
+        res = self._route(server, result["path"])
+
+        assert res["reactivated"]["activated"] == 1, calls
+        assert (1, {"active_paks": ["a.pak"], "rebuild_conflicts": False}) in calls
+
+    def test_it_turns_off_what_the_archive_did_not_have_on(self, env, monkeypatch):
+        import core.api.server as server
+
+        calls: list = []
+        monkeypatch.setattr(
+            server, "set_active_paks", lambda dl_id, payload: calls.append((dl_id, payload))
+        )
+        monkeypatch.setattr(server, "refresh_conflicts", lambda: None)
+
+        # Archive has only download 1 active; download 2 is switched on after.
+        result = create_backup(timestamp="2026-01-01T00:00:00+00:00")
+        conn = sqlite3.connect(str(env["db_path"]))
+        conn.execute("UPDATE local_downloads SET active_paks = '[\"b.pak\"]' WHERE id = 2")
+        conn.commit()
+        conn.close()
+
+        res = self._route(server, result["path"])
+
+        assert res["reactivated"]["deactivated"] == 1, calls
+        assert (2, {"active_paks": [], "rebuild_conflicts": False}) in calls
+
+    def test_mods_already_in_the_right_state_are_left_alone(self, env, monkeypatch):
+        import core.api.server as server
+
+        calls: list = []
+        monkeypatch.setattr(
+            server, "set_active_paks", lambda dl_id, payload: calls.append((dl_id, payload))
+        )
+        monkeypatch.setattr(server, "refresh_conflicts", lambda: None)
+
+        # Nothing changed between the backup and the restore.
+        result = create_backup(timestamp="2026-01-01T00:00:00+00:00")
+        res = self._route(server, result["path"])
+
+        assert calls == []
+        assert res["reactivated"] == {"activated": 0, "deactivated": 0, "failed": 0}
+
+    def test_a_mod_that_is_gone_from_disk_does_not_abort_the_restore(self, env, monkeypatch):
+        import core.api.server as server
+        from fastapi import HTTPException
+
+        def boom(dl_id, payload):
+            raise HTTPException(status_code=404, detail="local_downloads row not found")
+
+        monkeypatch.setattr(server, "set_active_paks", boom)
+        monkeypatch.setattr(server, "refresh_conflicts", lambda: None)
+
+        result = create_backup(timestamp="2026-01-01T00:00:00+00:00")
+        conn = sqlite3.connect(str(env["db_path"]))
+        conn.execute("UPDATE local_downloads SET active_paks = '[]'")
+        conn.commit()
+        conn.close()
+
+        res = self._route(server, result["path"])
+
+        # The database restore itself succeeded and is reported as such.
+        assert res["ok"] is True
+        assert res["reactivated"]["failed"] == 1
+        assert res["reactivated"]["activated"] == 0
+
+    def test_reactivation_failing_outright_still_reports_the_restore(self, env, monkeypatch):
+        import core.api.server as server
+
+        def explode(_previous):
+            raise RuntimeError("filesystem unavailable")
+
+        monkeypatch.setattr(server, "_materialise_active_paks", explode)
+        monkeypatch.setattr(server, "refresh_conflicts", lambda: None)
+
+        result = create_backup(timestamp="2026-01-01T00:00:00+00:00")
+        res = self._route(server, result["path"])
+
+        assert res["ok"] is True
+        assert res["reactivated"]["failed"] == -1
 
 
 def test_list_endpoint_shape(env):

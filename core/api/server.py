@@ -86,6 +86,7 @@ from core.db import (
 )
 from core.ingestion.scan_active_mods import main as scan_active_main
 from core.nexus import DEFAULT_GAME, collect_all_for_mod, get_api_key, get_mod_file_download_link
+from core.version import APP_VERSION, USER_AGENT
 from core.nexus.nxm import NXMParseError, parse_nxm_uri
 from core.utils.archive import build_entry_lookup, extract_archive, extract_member, list_entries, resolve_entry
 from core.utils.download_paths import normalize_download_path, resolve_absolute_download_path
@@ -101,7 +102,7 @@ from field_prefs import filter_aggregate_payload, load_prefs
 # Global cache for Nexus preferences
 _NEXUS_PREFS_CACHE = None
 
-app = FastAPI(title="Mod Manager Backend", version="0.8.0")
+app = FastAPI(title="Mod Manager Backend", version=APP_VERSION)
 
 # Register character API routes
 from core.api.characters import router as characters_router
@@ -799,6 +800,9 @@ SettingsTaskName = Literal[
 	"bootstrap_rebuild",
 	"rebuild_character_data",
 	"delete_outdated_versions",
+	"compact_images",
+	"dedupe_images",
+	"reorganize_mods",
 ]
 
 
@@ -1586,6 +1590,12 @@ def _run_settings_task(
 			return _task_rebuild_character_data()
 		if task == "delete_outdated_versions":
 			return _task_delete_outdated_versions()
+		if task == "compact_images":
+			return _task_compact_images()
+		if task == "dedupe_images":
+			return _task_dedupe_images()
+		if task == "reorganize_mods":
+			return _task_reorganize_mods()
 		raise HTTPException(status_code=400, detail=f"Unknown task: {task}")
 
 	metadata: Optional[Any] = None
@@ -1672,25 +1682,6 @@ def _author_avatar_url(member_id: Optional[int], profile_url: Optional[str]) -> 
 	if resolved is None:
 		return None
 	return f"https://avatars.nexusmods.com/{resolved}/100"
-
-
-def _normalize_download_name(value: Optional[str]) -> str:
-	return str(value or "").strip().lower()
-
-
-def _normalize_download_version(value: Optional[str]) -> str:
-	return str(value or "").strip().lower()
-
-
-def _normalize_contents_for_compare(values: Iterable[Any]) -> List[str]:
-	items: Set[str] = set()
-	for raw in values:
-		if not isinstance(raw, str):
-			continue
-		normalized = raw.replace("\\", "/").strip().lower()
-		if normalized:
-			items.add(normalized)
-	return sorted(items)
 
 
 _CREATED_AT_KEYS = (
@@ -4845,6 +4836,74 @@ def get_pak_version_status_endpoint(
 			pass
 
 
+def _image_content_hash(base64_data: str) -> str:
+	"""Stable identity for a stored image."""
+	import hashlib
+
+	return hashlib.sha256((base64_data or "").encode("utf-8")).hexdigest()
+
+
+def _insert_mod_image(
+	cur, mod_id: int, data: str, filename: Optional[str], mime_type: Optional[str]
+) -> Optional[int]:
+	"""Store one image, unless this mod already has it. Returns the new row id.
+
+	The single place any image enters mod_custom_images. There is no uniqueness
+	constraint on that table and five call sites INSERT into it — two upload
+	endpoints, upload-by-URL, and two restore modals — so every restore used to
+	re-add every image. Deduplicating in the callers is what allowed the drift;
+	doing it here means a new caller cannot reintroduce it.
+
+	Identity is the hash of the stored bytes, which is what makes this work
+	across paths: normalisation is deterministic, so the same source file always
+	produces the same stored bytes and therefore the same hash.
+	"""
+	if not data:
+		return None
+
+	digest = _image_content_hash(data)
+	existing = cur.execute(
+		"SELECT id FROM mod_custom_images WHERE mod_id = ? AND content_hash = ? LIMIT 1",
+		(mod_id, digest),
+	).fetchone()
+	if existing:
+		return None
+
+	cur.execute(
+		"""
+		INSERT INTO mod_custom_images (mod_id, image_data, filename, mime_type, content_hash)
+		VALUES (?, ?, ?, ?, ?)
+		""",
+		(mod_id, data, filename, mime_type, digest),
+	)
+	return cur.lastrowid
+
+
+def _without_hidden_tags(cur, effective_mod_id: int, tags: List[str]) -> List[str]:
+	"""Remove tags the user suppressed for this mod.
+
+	Auto-detected tags have no row to delete — extraction recomputes them and a
+	Nexus sync overwrites them — so suppression is recorded separately and
+	applied on read. Comparison is case-insensitive because the stored tag and
+	the derived one differ in casing more often than not.
+
+	Never raises: a failure here must not take down the mod list, so the
+	unfiltered list is returned instead.
+	"""
+	if not tags:
+		return tags
+	try:
+		rows = cur.execute(
+			"SELECT tag FROM mod_hidden_tags WHERE mod_id = ?", (effective_mod_id,)
+		).fetchall()
+	except Exception:
+		return tags
+	hidden = {str(r[0]).strip().lower() for r in rows if r[0]}
+	if not hidden:
+		return tags
+	return [t for t in tags if str(t).strip().lower() not in hidden]
+
+
 def _downscale_base64_image(base64_str: str, max_size: int = 400) -> str:
 	"""Downscale a base64 encoded image to reduce transfer size."""
 	if not base64_str:
@@ -4878,6 +4937,406 @@ def _downscale_base64_image(base64_str: str, max_size: int = 400) -> str:
 		return base64_str
 
 
+# Longest edge kept for stored artwork. The lightbox renders at max-height 80vh
+# and the grid at 350px, so 1920 covers a 4K display with room to spare.
+_STORAGE_IMAGE_MAX_EDGE = 1920
+_STORAGE_IMAGE_QUALITY = 90
+
+
+def _normalize_image_for_storage(
+	base64_str: str, mime_type: str = "", min_gain: float = 0.0
+) -> tuple[str, str]:
+	"""Re-encode an uploaded image to a display-sized JPEG before it is stored.
+
+	``min_gain`` is the fraction of the payload the re-encode must save to be
+	worth keeping. Zero (the upload default) accepts any shrink, because the
+	source there is the user's original and the conversion happens once. The
+	compaction paths pass a real margin: they run over rows that may ALREADY be
+	normalized JPEGs, and re-encoding those trades visible generation loss for a
+	percent or two of disk. Without it, running compaction repeatedly slowly
+	destroys the artwork it is meant to preserve.
+
+	Returns ``(base64_data, mime_type)`` — the mime type travels with the data
+	because the frontend renders these as ``data:{mimeType};base64,{data}``, so
+	storing JPEG bytes under the original ``image/png`` would mislabel them.
+
+	Unlike :func:`_downscale_base64_image` this re-encodes even when the image is
+	already within ``max_edge``. That early-return is the whole reason artwork
+	grew to gigabytes: the uploads in the wild are mostly *already* under 1920px
+	but are stored as 16-bit/uncompressed PNG at 3.5-4.8 bytes per pixel, which
+	is worse than raw. Skipping those leaves ~79% of the bytes in place; always
+	re-encoding takes the same set to ~4%.
+
+	Any failure returns the input unchanged: a mod's artwork is worth more than
+	the disk space, so a bad encode must never lose the upload.
+	"""
+	if not base64_str:
+		return base64_str, mime_type
+	try:
+		from PIL import Image, ImageOps
+		import io
+		import base64
+
+		img = Image.open(io.BytesIO(base64.b64decode(base64_str)))
+
+		# Honour EXIF orientation before it is stripped by the re-encode.
+		# Browsers auto-orient JPEGs from the tag, so dropping it silently
+		# would rotate images that currently display upright.
+		img = ImageOps.exif_transpose(img)
+
+		if max(img.width, img.height) > _STORAGE_IMAGE_MAX_EDGE:
+			img.thumbnail(
+				(_STORAGE_IMAGE_MAX_EDGE, _STORAGE_IMAGE_MAX_EDGE),
+				Image.Resampling.LANCZOS,
+			)
+
+		# JPEG has no alpha. Flatten onto white rather than letting convert()
+		# composite against black, which turns transparent corners into ink.
+		if img.mode in ("RGBA", "LA", "P"):
+			img = img.convert("RGBA")
+			flat = Image.new("RGB", img.size, (255, 255, 255))
+			flat.paste(img, mask=img.getchannel("A"))
+			img = flat
+		elif img.mode != "RGB":
+			img = img.convert("RGB")
+
+		output = io.BytesIO()
+		img.save(output, format="JPEG", quality=_STORAGE_IMAGE_QUALITY, optimize=True)
+		encoded = base64.b64encode(output.getvalue()).decode("utf-8")
+
+		# Guard against JPEG coming out larger than an already-efficient source
+		# (small icons, flat-colour art), and against re-encoding for a trivial
+		# win when min_gain asks for a real one.
+		if len(encoded) >= len(base64_str) * (1.0 - min_gain):
+			return base64_str, mime_type
+		return encoded, "image/jpeg"
+	except Exception as e:
+		import logging
+		# ERROR, not WARNING: Pillow missing here is what let full-resolution
+		# uploads accumulate unnoticed in the first place.
+		logging.getLogger("modmanager.api").error(
+			f"Failed to normalize image for storage, storing original: {e}"
+		)
+		return base64_str, mime_type
+
+
+# Rows at or below this are already display-sized; re-encoding them buys nothing
+# and would only accumulate generational JPEG loss on repeated runs. Using size
+# as the marker is what makes this task naturally idempotent and resumable
+# without needing a schema column to track progress.
+_COMPACT_MIN_BYTES = 512 * 1024
+
+# A rewrite must save at least this fraction to be worth the generation loss.
+# Compaction runs over rows that may already be normalized JPEGs, where a second
+# pass buys ~1% of disk and costs real image quality every time.
+_COMPACT_MIN_GAIN = 0.15
+
+# Commit cadence. Frequent commits keep the transaction (and its rollback
+# journal) small on a multi-gigabyte table and make an interrupted run resumable
+# rather than all-or-nothing.
+_COMPACT_COMMIT_EVERY = 20
+
+
+def _task_reorganize_mods() -> Tuple[int, Dict[str, Any]]:
+    """Re-file already-active mods into their character folders.
+
+    Folder placement happens when a mod is activated, so improving the
+    inference does nothing for files activated earlier — they stay loose at the
+    root of ~mods until someone toggles them. This re-activates each mod with
+    the selection it already has, which runs the normal placement path: no new
+    logic to keep in step with the real one, and files that are already in the
+    right folder are left alone by it.
+    """
+    logger = logging.getLogger("modmanager.api")
+    conn = get_db()
+    moved = unchanged = failed = 0
+    try:
+        rows = conn.execute(
+            "SELECT id, name, active_paks FROM local_downloads "
+            "WHERE active_paks IS NOT NULL AND active_paks NOT IN ('', '[]') ORDER BY id"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    print(f"{len(rows)} active download(s) to re-file.")
+
+    for dl_id, name, active_json in rows:
+        try:
+            active = json.loads(active_json) if active_json else []
+        except Exception:
+            active = []
+        if not isinstance(active, list) or not active:
+            continue
+        try:
+            # The same call the UI makes; it recomputes the target folder and
+            # relocates the files if it differs from where they sit now.
+            set_active_paks(int(dl_id), {"active_paks": active})
+            moved += 1
+        except HTTPException as exc:
+            failed += 1
+            logger.warning("[reorganize_mods] id=%s (%s): %s", dl_id, name, exc.detail)
+        except Exception as exc:
+            failed += 1
+            logger.warning("[reorganize_mods] id=%s (%s) failed: %s", dl_id, name, exc)
+
+    print(f"Re-filed {moved} mod(s); {failed} could not be processed.")
+    logger.info("[reorganize_mods] processed=%s failed=%s", moved, failed)
+    return 0, {"processed": moved, "unchanged": unchanged, "failed": failed}
+
+
+def _task_dedupe_images() -> Tuple[int, Dict[str, Any]]:
+    """Remove duplicate copies of a mod's images, keeping the first of each.
+
+    mod_custom_images had no uniqueness and five code paths inserted into it, so
+    every backup restore re-added every image. Installs that had been restored a
+    few times held each picture 4-8 times over.
+
+    New writes are deduplicated at insert time now; this cleans up what is
+    already stored and backfills content_hash so those rows participate too.
+
+    Keeps the earliest row of each duplicate group by (sort_order, id), so a
+    preview the user chose survives the cleanup.
+    """
+    import hashlib
+
+    logger = logging.getLogger("modmanager.api")
+    conn = get_db()
+    scanned = hashed = removed = 0
+
+    try:
+        cur = conn.cursor()
+        rows = cur.execute(
+            "SELECT id, mod_id, image_data, content_hash FROM mod_custom_images "
+            "ORDER BY mod_id, COALESCE(sort_order, id), id"
+        ).fetchall()
+        print(f"{len(rows)} stored image(s) to examine.")
+
+        # (mod_id, hash) -> id of the row being kept
+        keep: Dict[Tuple[int, str], int] = {}
+        doomed: List[int] = []
+
+        for image_id, mod_id, data, stored_hash in rows:
+            scanned += 1
+            if not data:
+                continue
+            digest = stored_hash
+            if not digest:
+                digest = hashlib.sha256(data.encode("utf-8")).hexdigest()
+                cur.execute(
+                    "UPDATE mod_custom_images SET content_hash = ? WHERE id = ?",
+                    (digest, image_id),
+                )
+                hashed += 1
+
+            key = (int(mod_id), digest)
+            if key in keep:
+                doomed.append(image_id)
+            else:
+                keep[key] = image_id
+
+        if doomed:
+            # Chunked: SQLite caps the number of bound parameters per statement.
+            for start in range(0, len(doomed), 500):
+                chunk = doomed[start : start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                cur.execute(
+                    f"DELETE FROM mod_custom_images WHERE id IN ({placeholders})", chunk
+                )
+                removed += len(chunk)
+
+        conn.commit()
+        print(f"Backfilled {hashed} hash(es); removed {removed} duplicate(s).")
+        print(f"{len(keep)} unique image(s) remain.")
+        logger.info("[dedupe_images] scanned=%s removed=%s", scanned, removed)
+        return 0, {"scanned": scanned, "hashed": hashed, "removed": removed, "unique": len(keep)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _task_compact_images() -> Tuple[int, Dict[str, Any]]:
+    """Re-encode oversized artwork already sitting in the database.
+
+    Normalising on upload only helps new images; a library built before that
+    existed keeps every original. This walks the stored rows and applies the
+    same normalization, then VACUUMs so the freed pages are actually returned to
+    the filesystem — SQLite does not shrink the file on UPDATE alone, so without
+    the VACUUM the database stays exactly as large as it was.
+
+    A full backup is taken first. This rewrites the user's only copy of their
+    mod library, so it must be undoable.
+    """
+    import sqlite3
+
+    # Re-imported rather than using the module-level binding: configure() rebinds
+    # SETTINGS in core.config.settings, so the name captured at import time here
+    # can be stale (same reason as the re-imports at the settings endpoints).
+    from core.config.settings import SETTINGS as _CURRENT
+
+    logger = logging.getLogger("modmanager.api")
+    db_file = Path(_CURRENT.data_dir) / "mods.db"
+
+    def _on_disk() -> int:
+        """Database plus its -wal/-shm sidecars.
+
+        Counting mods.db alone reports a shrink that has not happened: in WAL
+        mode the rewritten pages live in the -wal until a checkpoint folds them
+        back, so the main file can look unchanged (or smaller) while total usage
+        has grown.
+        """
+        total = db_file.stat().st_size if db_file.exists() else 0
+        for suffix in ("-wal", "-shm"):
+            side = Path(str(db_file) + suffix)
+            if side.exists():
+                total += side.stat().st_size
+        return total
+
+    size_before = _on_disk()
+
+    try:
+        from core.backup import create_backup
+
+        snapshot = create_backup(
+            name="Before shrinking artwork",
+            kind="pre-compact",
+            description=(
+                "Automatic snapshot taken before mod artwork was re-encoded to save "
+                "space. Restore this to get the original full-size images back."
+            ),
+        )
+        print(f"Safety backup written to {snapshot.get('path')}")
+    except Exception as exc:
+        # Refuse rather than proceed unprotected: an unrecoverable mistake here
+        # costs the user their entire mod library.
+        print(f"ABORTED: could not create a safety backup first ({exc})")
+        return 1, {"aborted": "backup_failed", "error": str(exc)}
+
+    conn = get_db()
+    scanned = rewritten = failed = 0
+    bytes_before_rows = bytes_after_rows = 0
+
+    try:
+        targets = conn.execute(
+            "SELECT id, LENGTH(image_data) FROM mod_custom_images "
+            "WHERE image_data IS NOT NULL AND LENGTH(image_data) > ? ORDER BY id",
+            (_COMPACT_MIN_BYTES,),
+        ).fetchall()
+        print(f"{len(targets)} image(s) above {_COMPACT_MIN_BYTES // 1024} KB to examine.")
+
+        for index, (image_id, _length) in enumerate(targets, start=1):
+            # Fetched one at a time on purpose: selecting every payload up front
+            # would pull the whole multi-gigabyte column into memory.
+            row = conn.execute(
+                "SELECT image_data, mime_type FROM mod_custom_images WHERE id = ?",
+                (image_id,),
+            ).fetchone()
+            if not row or not row[0]:
+                continue
+
+            original, mime = row[0], row[1] or ""
+            scanned += 1
+            try:
+                compacted, new_mime = _normalize_image_for_storage(
+                    original, mime, min_gain=_COMPACT_MIN_GAIN
+                )
+            except Exception as exc:
+                failed += 1
+                logger.warning("[compact_images] id=%s failed: %s", image_id, exc)
+                continue
+
+            if len(compacted) >= len(original):
+                continue
+
+            conn.execute(
+                "UPDATE mod_custom_images SET image_data = ?, mime_type = ? WHERE id = ?",
+                (compacted, new_mime, image_id),
+            )
+            rewritten += 1
+            bytes_before_rows += len(original)
+            bytes_after_rows += len(compacted)
+
+            if rewritten % _COMPACT_COMMIT_EVERY == 0:
+                conn.commit()
+                print(f"  {index}/{len(targets)} examined, {rewritten} rewritten…")
+
+        conn.commit()
+        print(f"Rewrote {rewritten} of {scanned} image(s); {failed} could not be processed.")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # VACUUM rebuilds the file and needs room for a full second copy alongside
+    # the original, so it is skipped rather than risking a full disk.
+    vacuumed = False
+    try:
+        free = shutil.disk_usage(db_file.parent).free
+        if free < size_before * 1.2:
+            print(
+                f"Skipping VACUUM: needs ~{int(size_before * 1.2) // 1048576} MB free, "
+                f"only {free // 1048576} MB available. Space will be reused, not returned."
+            )
+        else:
+            # get_db() hands out pooled connections whose close() only returns
+            # them to a thread-local cache, so the sqlite handles stay open. A
+            # TRUNCATE checkpoint refuses to run while any other connection is
+            # attached — and it signals that by RETURNING busy, not by raising,
+            # so skipping this step fails silently. Same release the backup
+            # restore performs before it swaps the file.
+            from core.api.dependencies import invalidate_connection_pool
+
+            invalidate_connection_pool()
+
+            vac = sqlite3.connect(str(db_file))
+            try:
+                vac.isolation_level = None  # VACUUM cannot run inside a transaction
+                # In WAL mode neither checkpoint is optional. Without the first,
+                # VACUUM rebuilds from a state that excludes rewrites still in
+                # the -wal; without the second, the rebuilt database stays in the
+                # -wal and mods.db keeps every original page.
+                busy, _, _ = vac.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if busy:
+                    print("Could not checkpoint the WAL (database still in use); skipping VACUUM.")
+                else:
+                    vac.execute("VACUUM")
+                    busy_after, _, _ = vac.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()
+                    vacuumed = not busy_after
+                    if busy_after:
+                        print("VACUUM ran but the WAL could not be folded back in.")
+            finally:
+                vac.close()
+    except Exception as exc:
+        print(f"VACUUM failed ({exc}); rows are compacted but the file was not shrunk.")
+
+    size_after = _on_disk()
+    print(
+        f"Database: {size_before / 1048576:.0f} MB -> {size_after / 1048576:.0f} MB"
+        + ("" if vacuumed else " (not vacuumed)")
+    )
+
+    return 0, {
+        "scanned": scanned,
+        "rewritten": rewritten,
+        "failed": failed,
+        "row_bytes_before": bytes_before_rows,
+        "row_bytes_after": bytes_after_rows,
+        "db_bytes_before": size_before,
+        "db_bytes_after": size_after,
+        "vacuumed": vacuumed,
+    }
+
+
 @app.get("/api/mods/custom-images-preview")
 
 def get_custom_images_preview(mod_ids: str = Query(..., description="Comma-separated mod IDs")) -> Dict[str, Any]:
@@ -4903,28 +5362,59 @@ def get_custom_images_preview(mod_ids: str = Query(..., description="Comma-separ
 		# Fetch first custom image for each mod_id
 		# Use a placeholder string repeated for each ID
 		placeholders = ",".join("?" * len(parsed_ids))
+		# The preview is whichever image the user put first, not whichever was
+		# uploaded first. This selected `HAVING id = MIN(id)`, so promoting a
+		# better screenshot to the front was impossible.
+		# is_preview first: a starred image is an explicit decision and outranks
+		# the ordering, which is only a default.
 		query = f"""
-			SELECT mod_id, image_data, mime_type
-			FROM mod_custom_images
-			WHERE mod_id IN ({placeholders})
-			  AND image_data IS NOT NULL
-			GROUP BY mod_id
-			HAVING id = MIN(id)
+			SELECT mod_id, image_data, mime_type, is_preview FROM (
+				SELECT mod_id, image_data, mime_type, is_preview,
+				       ROW_NUMBER() OVER (
+				           PARTITION BY mod_id
+				           ORDER BY is_preview DESC, COALESCE(sort_order, id) ASC, id ASC
+				       ) AS rn
+				FROM mod_custom_images
+				WHERE mod_id IN ({placeholders})
+				  AND image_data IS NOT NULL
+			) WHERE rn = 1
 		"""
-		
+
 		rows = cur.execute(query, parsed_ids).fetchall()
-		
+
+		# Hiding the Nexus picture is itself a decision about which image to
+		# show. Without this the card would keep displaying the picture the user
+		# just removed from the gallery.
+		try:
+			hidden = {
+				int(r[0])
+				for r in cur.execute(
+					f"SELECT mod_id FROM mod_hidden_nexus_image WHERE mod_id IN ({placeholders})",
+					parsed_ids,
+				).fetchall()
+			}
+		except Exception:
+			hidden = set()
+
 		# Build result map
 		result = {}
-		for mod_id, image_data, mime_type in rows:
+		explicit: List[str] = []
+		for mod_id, image_data, mime_type, is_preview in rows:
 			if image_data:
 				# Downscale for preview to save bandwidth
 				downscaled = _downscale_base64_image(image_data, max_size=400)
 				# Return as data URL (Force image/jpeg as we convert during downscale)
 				result[str(mod_id)] = f"data:image/jpeg;base64,{downscaled}"
-		
-		logger.info(f"[get_custom_images_preview] Fetched {len(result)} custom images for {len(parsed_ids)} mods")
-		return {"ok": True, "images": result}
+				# Reported separately so the mod list knows when the user chose
+				# this image and it should beat the Nexus picture_url.
+				if is_preview or int(mod_id) in hidden:
+					explicit.append(str(mod_id))
+
+		logger.info(
+			f"[get_custom_images_preview] Fetched {len(result)} custom images for "
+			f"{len(parsed_ids)} mods ({len(explicit)} explicitly chosen)"
+		)
+		return {"ok": True, "images": result, "explicit": explicit}
 		
 	except HTTPException:
 		raise
@@ -5052,8 +5542,12 @@ def get_mod_details(mod_id: int, response: Response) -> Dict[str, Any]:
 							tags_tokens.add(tok)
 			except Exception:
 				continue
-		# Canonicalize tokens (categories + canonical characters only)
-		data["tags"] = _canonicalize_tokens(tags_tokens)
+		# Canonicalize tokens (categories + canonical characters only).
+		# Suppressed tags are filtered here too: the modal reads this endpoint,
+		# and a tag hidden in the list must not reappear when the mod is opened.
+		data["tags"] = _without_hidden_tags(
+			cur, mod_id, _canonicalize_tokens(tags_tokens)
+		)
 	except Exception:
 		data["tags"] = []
 	try:
@@ -5151,6 +5645,729 @@ def get_mod_changelogs_endpoint(mod_id: int, response: Response) -> List[Dict[st
 	return logs
 
 
+def _nexus_image_hidden(cur, mod_id: int) -> bool:
+	"""Has the user removed this mod's Nexus picture from its gallery?
+
+	Kept out of ``mods`` on purpose: that row is rewritten wholesale by the Nexus
+	metadata sync, so a flag there would be undone by the next refresh.
+	"""
+	try:
+		return (
+			cur.execute(
+				"SELECT 1 FROM mod_hidden_nexus_image WHERE mod_id = ?", (mod_id,)
+			).fetchone()
+			is not None
+		)
+	except Exception:
+		# Un-migrated database: showing the picture is the safe default.
+		return False
+
+
+                                                                                # noqa: E501
+# ─── Images shipped inside the mod archive ───────────────────────────────────
+# Nexus publishes exactly one picture per mod and its API exposes no gallery
+# (verified against the live schema: Mod has no images/media/screenshots/gallery
+# field, and the root media query cannot be narrowed to a mod). Scraping the
+# website would be the only way to get the rest, and it would break silently
+# whenever their markup changed.
+#
+# Mod archives are a better source and a local one. Measured over this library:
+# 55 of 123 zips carry loose images next to the .pak files, median 9 per
+# archive, and the filenames track the pak variants — FUTAVA1.png alongside
+# A_SexyAceSpadesFutaVA_9999999_P.pak. That covers hand-made .pak drops that
+# were never on Nexus at all, which no online source ever could.
+#
+# They are full-resolution: median 6MB, largest seen 27MB. Importing them as-is
+# is what produced a 2.2GB database and the "Invalid string length" backup crash
+# before, so everything here goes through the same downscale the rest of the app
+# uses, and nothing is imported without being asked for.
+
+_ARCHIVE_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+# Enough to cover the p90 of 51 images per archive without letting a pathological
+# one hang the request.
+_ARCHIVE_IMAGE_LIMIT = 80
+
+# Thumbnails for the picker. Small on purpose: this response carries every
+# candidate at once and is thrown away as soon as the dialog closes.
+_ARCHIVE_THUMB_SIZE = 220
+
+# What actually gets stored. Large enough to be worth looking at full-screen,
+# small enough that importing a dozen does not cost hundreds of megabytes.
+_ARCHIVE_IMPORT_SIZE = 1400
+
+
+def _archive_image_entries(archive_path: str) -> List[str]:
+	"""Image files sitting loose in a mod archive, newest-looking first."""
+	from core.utils.archive import list_entries
+
+	entries = [
+		e
+		for e in list_entries(archive_path)
+		if e.lower().endswith(_ARCHIVE_IMAGE_EXTS)
+	]
+	entries.sort(key=lambda e: (os.path.dirname(e).lower(), os.path.basename(e).lower()))
+	return entries[:_ARCHIVE_IMAGE_LIMIT]
+
+
+def _read_archive_member(archive_path: str, member: str) -> Optional[bytes]:
+	"""Read one member into memory via a temp file, or None if unreadable."""
+	import tempfile
+
+	from core.utils.archive import extract_member
+
+	tmpdir = tempfile.mkdtemp(prefix="rivalnxt_img_")
+	try:
+		dest = os.path.join(tmpdir, os.path.basename(member) or "image")
+		extract_member(archive_path, member, dest)
+		with open(dest, "rb") as fh:
+			return fh.read()
+	except Exception:
+		return None
+	finally:
+		shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _encode_scaled(raw: bytes, max_size: int) -> Optional[Tuple[str, int, int]]:
+	"""Downscale to JPEG base64. Returns (data, width, height) of the original."""
+	import base64
+	import io
+
+	try:
+		from PIL import Image
+
+		img = Image.open(io.BytesIO(raw))
+		width, height = img.size
+		img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+		if img.mode in ("RGBA", "P", "LA"):
+			img = img.convert("RGB")
+		out = io.BytesIO()
+		img.save(out, format="JPEG", quality=85, optimize=True)
+		return base64.b64encode(out.getvalue()).decode("utf-8"), width, height
+	except Exception:
+		return None
+
+
+def _ensure_mod_row(conn, cur, mod_id: int, fallback_name: str) -> None:
+	"""Make sure a mods row exists so mod_custom_images' foreign key holds.
+
+	Mods that were never on Nexus are keyed by the negated download id, and that
+	synthetic id has no row of its own, so inserting an image for one fails with
+	a FOREIGN KEY error. The upload-by-path and upload-by-URL endpoints each
+	create a placeholder inline; this is the same thing, factored out so a fourth
+	copy did not have to be written.
+	"""
+	if cur.execute("SELECT 1 FROM mods WHERE mod_id = ?", (mod_id,)).fetchone():
+		return
+	if mod_id >= 0:
+		raise HTTPException(status_code=404, detail=f"Mod {mod_id} not found")
+	upsert_mod_info(
+		conn,
+		game=DEFAULT_GAME,
+		mod_id=mod_id,
+		mod_info_status=0,
+		mod_info={
+			"name": fallback_name or f"Local Mod {-mod_id}",
+			"summary": "Local mod (auto-generated)",
+			"description": "Auto-generated placeholder for local mod images.",
+			"author": "Local",
+			"status": "plaintext",
+			"category_id": 1,
+		},
+	)
+
+
+def _download_archive_path(download_id: int) -> Tuple[str, Optional[int], str]:
+	"""(archive path, mod_id, name) for a download, or 404."""
+	conn = get_db()
+	try:
+		row = conn.execute(
+			"SELECT path, mod_id, name FROM local_downloads WHERE id = ?", (download_id,)
+		).fetchone()
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+	if not row:
+		raise HTTPException(status_code=404, detail=f"Download {download_id} not found")
+	path = _resolve_download_source_path(row[0] or row[2] or "")
+	if not path or not os.path.exists(path):
+		raise HTTPException(status_code=404, detail="The mod file is no longer on disk")
+	return path, row[1], row[2]
+
+
+@app.get("/api/local_downloads/{download_id}/archive-images")
+def list_archive_images(download_id: int) -> Dict[str, Any]:
+	"""Preview images the mod's own archive contains, as thumbnails.
+
+	Read-only: nothing is stored until the user picks. Folders are not supported
+	as a source because there is nothing to unpack — those files are already on
+	disk and can be dragged in.
+	"""
+	logger = logging.getLogger("modmanager.api")
+	path, _, _ = _download_archive_path(download_id)
+
+	if os.path.isdir(path):
+		return {"ok": True, "images": [], "reason": "folder"}
+
+	try:
+		entries = _archive_image_entries(path)
+	except Exception as exc:
+		logger.info("[archive_images] could not list %s: %s", path, exc)
+		raise HTTPException(status_code=400, detail=f"Could not read the mod file: {exc}")
+
+	images: List[Dict[str, Any]] = []
+	for entry in entries:
+		raw = _read_archive_member(path, entry)
+		if not raw:
+			continue
+		scaled = _encode_scaled(raw, _ARCHIVE_THUMB_SIZE)
+		if not scaled:
+			continue
+		thumb, width, height = scaled
+		images.append(
+			{
+				"entry": entry,
+				"name": os.path.basename(entry),
+				"width": width,
+				"height": height,
+				"bytes": len(raw),
+				"thumbnail": f"data:image/jpeg;base64,{thumb}",
+			}
+		)
+
+	logger.info("[archive_images] download=%s found=%s", download_id, len(images))
+	return {"ok": True, "images": images}
+
+
+def _migrate_local_mod_data(cur, from_mod_id: int, to_mod_id: int) -> Dict[str, int]:
+	"""Carry a download's own images and tags over when it gains a Nexus id.
+
+	While a download is unlinked, anything the user attaches is stored against
+	the negated download id. Linking makes the app read a different key, so the
+	rows are still there but nothing looks for them — the images vanish from the
+	Images tab the moment the mod is linked.
+
+	Duplicates are dropped rather than merged: the same picture may already exist
+	under the real mod id if it was synced from Nexus first.
+	"""
+	moved = {"images": 0, "tags": 0}
+	if from_mod_id == to_mod_id:
+		return moved
+
+	# mod_custom_images.mod_id is a foreign key onto mods. The Nexus metadata
+	# sync that creates that row runs *after* this, so moving the images first
+	# failed with "FOREIGN KEY constraint failed" — and the broad except below
+	# turned that into a silent no-op, which is exactly how the images kept
+	# disappearing after a link with nothing in the log to show for it.
+	try:
+		cur.execute(
+			"INSERT OR IGNORE INTO mods (mod_id, game, name) VALUES (?, ?, ?)",
+			(to_mod_id, DEFAULT_GAME, f"Mod {to_mod_id}"),
+		)
+	except Exception as exc:
+		logging.getLogger("modmanager.api").warning(
+			"[link] could not prepare mods row %s: %s", to_mod_id, exc
+		)
+		return moved
+
+	try:
+		existing_hashes = {
+			r[0]
+			for r in cur.execute(
+				"SELECT content_hash FROM mod_custom_images WHERE mod_id = ?", (to_mod_id,)
+			).fetchall()
+			if r[0]
+		}
+		for image_id, digest in cur.execute(
+			"SELECT id, content_hash FROM mod_custom_images WHERE mod_id = ?", (from_mod_id,)
+		).fetchall():
+			if digest and digest in existing_hashes:
+				cur.execute("DELETE FROM mod_custom_images WHERE id = ?", (image_id,))
+				continue
+			cur.execute(
+				"UPDATE mod_custom_images SET mod_id = ? WHERE id = ?", (to_mod_id, image_id)
+			)
+			if digest:
+				existing_hashes.add(digest)
+			moved["images"] += 1
+	except Exception as exc:
+		# Warning, not debug. This failing means the user's pictures vanish from
+		# the mod they just linked; a debug line meant nobody ever saw why.
+		logging.getLogger("modmanager.api").warning(
+			"[link] could not move images from %s to %s: %s", from_mod_id, to_mod_id, exc
+		)
+
+	try:
+		for (tag,) in cur.execute(
+			"SELECT tag FROM mod_custom_tags WHERE mod_id = ?", (from_mod_id,)
+		).fetchall():
+			already = cur.execute(
+				"SELECT 1 FROM mod_custom_tags WHERE mod_id = ? AND tag = ? COLLATE NOCASE",
+				(to_mod_id, tag),
+			).fetchone()
+			if not already:
+				cur.execute(
+					"UPDATE mod_custom_tags SET mod_id = ? WHERE mod_id = ? AND tag = ?",
+					(to_mod_id, from_mod_id, tag),
+				)
+				moved["tags"] += 1
+		cur.execute("DELETE FROM mod_custom_tags WHERE mod_id = ?", (from_mod_id,))
+	except Exception as exc:
+		logging.getLogger("modmanager.api").warning(
+			"[link] could not move tags from %s to %s: %s", from_mod_id, to_mod_id, exc
+		)
+
+	# The rule the user asked for: a mod with no artwork of its own takes the
+	# Nexus picture as its preview, and one that already has artwork keeps
+	# showing what it was showing.
+	try:
+		starred = cur.execute(
+			"SELECT 1 FROM mod_custom_images WHERE mod_id = ? AND is_preview = 1 LIMIT 1",
+			(to_mod_id,),
+		).fetchone()
+		if not starred:
+			first = cur.execute(
+				"SELECT id FROM mod_custom_images WHERE mod_id = ? "
+				"ORDER BY COALESCE(sort_order, id) ASC, id ASC LIMIT 1",
+				(to_mod_id,),
+			).fetchone()
+			if first:
+				cur.execute(
+					"UPDATE mod_custom_images SET is_preview = 1 WHERE id = ?", (first[0],)
+				)
+	except Exception:
+		pass
+
+	return moved
+
+
+def _title_words(name: str, path: str = "") -> str:
+	"""Recover something searchable from a download's name.
+
+	Downloads the app has renamed look like
+	``BodyReshape_JubileeMidnightMutant_Base_11019_1_2026-07-17T20-04Z_e3jCYfIEI``:
+	a CamelCase title welded to an id, a version, a timestamp and a random token.
+	Searching that verbatim matches nothing.
+
+	CamelCase is split back into words, and any token carrying digits is dropped
+	— that removes ids, versions, ``17T20``, ``04Z`` and hashes in one rule,
+	while keeping short year-like numbers that appear in real skin names
+	("Mirae 2099").
+	"""
+	noise = {
+		"sexy", "hot", "nsfw", "adult", "hd", "4k", "uhd", "remastered", "redux",
+		"fix", "fixed", "update", "updated", "new", "mod", "skin", "replacer",
+		"replacement", "optional", "support", "content", "free", "alt", "variant",
+		"version", "base", "addon", "addons", "bodyreshape",
+	}
+	raw = name.strip() or os.path.splitext(os.path.basename(path))[0]
+	raw = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", raw)
+	raw = re.sub(r"[_\-+.]+", " ", raw)
+
+	words: List[str] = []
+	for token in raw.split():
+		# Filtered BEFORE splitting CamelCase, not after. Splitting first turns
+		# the random suffix "e3jCYfIEI" into "e3j CYf IEI", and the two halves
+		# without digits then survive the filter and poison the search.
+		if any(ch.isdigit() for ch in token):
+			continue  # id, version, timestamp fragment or hash
+		for word in re.sub(r"(?<=[a-z])(?=[A-Z])", " ", token).split():
+			if len(word) < 2 or word.lower() in noise:
+				continue
+			words.append(word)
+	return " ".join(words)
+
+
+@app.get("/api/local_downloads/{download_id}/mod-id-suggestions")
+def suggest_mod_ids(download_id: int, count: int = 8) -> Dict[str, Any]:
+	"""Nexus mods this download is plausibly a copy of.
+
+	Assigning a mod id meant reading the id off the website and typing it in.
+	The download already carries the two things needed to guess: its own file
+	name, which authors derive from the mod title, and whatever character tags
+	have been worked out for it.
+
+	These are suggestions, not answers — the endpoint ranks them and the user
+	picks, because a wrong id silently attaches the wrong artwork and changelog.
+	"""
+	from core.nexus.graphql import NexusGraphQLError, normalise_mod, search_mods
+	from core.nexus.nexus_api import get_api_key
+
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		row = cur.execute(
+			"SELECT name, path, mod_id FROM local_downloads WHERE id = ?", (download_id,)
+		).fetchone()
+		if not row:
+			raise HTTPException(status_code=404, detail=f"Download {download_id} not found")
+		name, path, current = row
+		# Tags live under the real mod id once a download is linked, and under the
+		# negated download id while it is not. Looking at only one of the two
+		# found nothing for exactly the downloads that already had an id.
+		tag_keys = [-download_id] + ([int(current)] if current is not None else [])
+		tags: List[str] = []
+		try:
+			tags = [
+				r[0]
+				for r in cur.execute(
+					"SELECT DISTINCT tag FROM mod_custom_tags WHERE mod_id IN "
+					f"({','.join('?' * len(tag_keys))})",
+					tag_keys,
+				).fetchall()
+			]
+		except Exception:
+			tags = []
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+	seed = _title_words(str(name or ""), str(path or ""))
+	# Tags first when the name yields nothing usable: a renamed download can be
+	# almost entirely timestamp, while "jubilee" + "midnight mutant" is exactly
+	# what the author called it.
+	tag_seed = " ".join(tags[:3])
+	attempts = [t for t in (seed, tag_seed, " ".join(seed.split()[-3:])) if t.strip()]
+
+	suggestions: List[Dict[str, Any]] = []
+	seen: Set[int] = set()
+	try:
+		for attempt in dict.fromkeys(attempts):
+			if len(suggestions) >= count:
+				break
+			nodes, _ = search_mods(
+				query=attempt,
+				sort_by="endorsements",
+				descending=True,
+				include_adult=True,
+				offset=0,
+				count=count,
+				api_key=get_api_key(),
+			)
+			for node in nodes:
+				mod = normalise_mod(node)
+				mid = mod.get("modId")
+				if not mid or mid in seen or len(suggestions) >= count:
+					continue
+				seen.add(mid)
+				suggestions.append(
+					{
+						"modId": mid,
+						"name": mod.get("name"),
+						"author": mod.get("author"),
+						"thumbnail": mod.get("thumbnailUrl") or mod.get("pictureUrl"),
+						"modPageUrl": mod.get("modPageUrl"),
+						"adult": bool(mod.get("adult")),
+						"matchedTerm": attempt,
+					}
+				)
+	except NexusGraphQLError as exc:
+		raise HTTPException(status_code=502, detail=str(exc))
+
+	return {
+		"ok": True,
+		"suggestions": suggestions,
+		"currentModId": current,
+		"searchedFor": attempts[:1],
+	}
+
+
+def _own_mod_images(mod_id: int) -> List[Dict[str, Any]]:
+	"""Images that belong to this exact mod, as far as Nexus will admit to.
+
+	Two sources, both cheap and both authoritative:
+
+	* ``picture_url`` — the mod's cover. One image, always.
+	* Any staticdelivery links the author wrote into the description. Some
+	  authors paste their whole gallery there; most paste none.
+
+	That is the ceiling. Verified against the live API with a key: the GraphQL
+	Mod type has no images/media/gallery/screenshots field, the v1 REST record
+	carries exactly one picture_url, and the mod page itself sits behind a
+	Cloudflare JavaScript challenge that 403s automated requests. Anything
+	claiming to pull "all the screenshots" would have to defeat that check.
+	"""
+	import re
+
+	from core.nexus.nexus_api import DEFAULT_GAME, get_api_key, get_mod_info
+
+	out: List[Dict[str, Any]] = []
+	key = get_api_key()
+	if not key:
+		return out
+	try:
+		status, info = get_mod_info(key, DEFAULT_GAME, int(mod_id))
+	except Exception:
+		return out
+	if status != 200 or not isinstance(info, dict):
+		return out
+
+	name = str(info.get("name") or f"mod {mod_id}")
+	seen: Set[str] = set()
+
+	cover = info.get("picture_url")
+	if isinstance(cover, str) and cover:
+		seen.add(cover)
+		out.append(
+			{
+				"url": cover,
+				"thumbnail": cover,
+				"modName": name,
+				"modId": mod_id,
+				"author": str(info.get("author") or ""),
+				"adult": bool(info.get("contains_adult_content")),
+				"matchedTerm": "",
+				"ownMod": True,
+			}
+		)
+
+	description = str(info.get("description") or "")
+	for url in re.findall(
+		r"https?://staticdelivery\.nexusmods\.com/mods/\d+/images/[^\s\"'\[\]<>)]+",
+		description,
+	):
+		if url in seen:
+			continue
+		seen.add(url)
+		out.append(
+			{
+				"url": url,
+				"thumbnail": url,
+				"modName": name,
+				"modId": mod_id,
+				"author": str(info.get("author") or ""),
+				"adult": bool(info.get("contains_adult_content")),
+				"matchedTerm": "",
+				"ownMod": True,
+			}
+		)
+	return out
+
+
+@app.get("/api/nexus/image-search")
+def nexus_image_search(
+	query: str, count: int = 24, mod_id: Optional[int] = None
+) -> Dict[str, Any]:
+	"""Cover images of Nexus mods matching a character or skin name.
+
+	For a mod that ships no artwork of its own — a hand-made .pak, or an archive
+	with no screenshots — this is the one remaining honest source. The mod page
+	itself is unreachable: it sits behind a Cloudflare JavaScript challenge that
+	returns 403 to any automated request, and getting past that means defeating
+	bot detection rather than reading a public API.
+
+	The search API has no such gate, which is why Browse Nexus works. So instead
+	of *this* mod's gallery, this offers the cover pictures of other mods for the
+	same character. They are labelled as such in the UI, because they are someone
+	else's artwork of the same subject, not a picture of what you installed.
+	"""
+	from core.nexus.graphql import NexusGraphQLError, normalise_mod, search_mods
+	from core.nexus.nexus_api import get_api_key
+
+	term = (query or "").strip()
+	if not term:
+		raise HTTPException(status_code=400, detail="query is required")
+
+	limit = max(1, min(int(count), 50))
+	api_key = get_api_key()
+
+	# Search the whole phrase first, then broaden a word at a time.
+	#
+	# "Savage Land Rogue" is a skin AND a character, and the exact phrase is what
+	# finds mods of that specific outfit. Searching only the character tag found
+	# the right hero in the wrong costume every time, which is what made the
+	# results feel almost-but-not-quite right. Dropping the leading word rather
+	# than the trailing one is deliberate: the character name comes last in
+	# almost every title, so it is the part worth keeping longest.
+	words = term.split()
+	attempts: List[str] = []
+	for start in range(len(words)):
+		candidate = " ".join(words[start:])
+		if candidate and candidate not in attempts:
+			attempts.append(candidate)
+		if len(attempts) >= 3:
+			break
+
+	images: List[Dict[str, Any]] = []
+	seen: set = set()
+	matched_terms: List[str] = []
+
+	# A linked mod's own pictures come first and are marked as such, so the one
+	# image that is definitely of this mod is not buried among other authors'
+	# covers of the same character.
+	own_count = 0
+	if mod_id is not None and mod_id > 0:
+		for image in _own_mod_images(int(mod_id)):
+			if image["url"] in seen:
+				continue
+			seen.add(image["url"])
+			images.append(image)
+			own_count += 1
+
+	for attempt in attempts:
+		if len(images) >= limit:
+			break
+		try:
+			nodes, _total = search_mods(
+				query=attempt,
+				sort_by="endorsements",
+				descending=True,
+				include_adult=True,
+				offset=0,
+				count=limit,
+				api_key=api_key,
+			)
+		except NexusGraphQLError as exc:
+			# Only fatal if nothing has been collected yet; a later broadening
+			# pass failing should not throw away the precise hits.
+			if not images:
+				raise HTTPException(status_code=502, detail=str(exc))
+			break
+
+		added = 0
+		for node in nodes:
+			if len(images) >= limit:
+				break
+			mod = normalise_mod(node)
+			full = mod.get("pictureUrl")
+			if not full or full in seen:
+				continue
+			seen.add(full)
+			added += 1
+			images.append(
+				{
+					"url": full,
+					"thumbnail": mod.get("thumbnailUrl") or full,
+					"modName": mod.get("name"),
+					"modId": mod.get("modId"),
+					"author": mod.get("author"),
+					"adult": bool(mod.get("adult")),
+					# Which phrase found it, so the UI can say the exact-skin
+					# matches came first and the rest are the wider net.
+					"matchedTerm": attempt,
+				}
+			)
+		if added:
+			matched_terms.append(attempt)
+
+	return {
+		"ok": True,
+		"images": images,
+		"count": len(images),
+		"terms": matched_terms,
+		"ownCount": own_count,
+	}
+
+
+class ArchiveImageImportPayload(BaseModel):
+	entries: List[str]
+
+
+@app.post("/api/local_downloads/{download_id}/archive-images/import")
+def import_archive_images(
+	download_id: int, payload: ArchiveImageImportPayload
+) -> Dict[str, Any]:
+	"""Store the chosen archive images against the mod.
+
+	Goes through _insert_mod_image, so re-importing the same picture is a no-op
+	rather than a duplicate — the same guarantee every other image path has.
+	"""
+	logger = logging.getLogger("modmanager.api")
+	path, mod_id, download_name = _download_archive_path(download_id)
+	if mod_id is None:
+		# Unlinked downloads are keyed by the negative download id everywhere
+		# else in this file; keep that convention rather than inventing another.
+		mod_id = -download_id
+
+	wanted = [e for e in (payload.entries or []) if isinstance(e, str) and e.strip()]
+	if not wanted:
+		raise HTTPException(status_code=400, detail="No images selected")
+
+	imported = skipped = failed = 0
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		_ensure_mod_row(conn, cur, mod_id, download_name)
+		for entry in wanted[:_ARCHIVE_IMAGE_LIMIT]:
+			raw = _read_archive_member(path, entry)
+			if not raw:
+				failed += 1
+				continue
+			scaled = _encode_scaled(raw, _ARCHIVE_IMPORT_SIZE)
+			if not scaled:
+				failed += 1
+				continue
+			data, _, _ = scaled
+			new_id = _insert_mod_image(
+				cur, mod_id, data, os.path.basename(entry), "image/jpeg"
+			)
+			if new_id is None:
+				skipped += 1
+			else:
+				imported += 1
+		conn.commit()
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+	logger.info(
+		"[archive_images] download=%s imported=%s duplicate=%s failed=%s",
+		download_id, imported, skipped, failed,
+	)
+	return {
+		"ok": True,
+		"mod_id": mod_id,
+		"imported": imported,
+		"duplicates": skipped,
+		"failed": failed,
+	}
+
+
+@app.post("/api/mods/{mod_id}/images/nexus/hide")
+def hide_nexus_image(mod_id: int) -> Dict[str, Any]:
+	"""Drop the Nexus picture from a mod's gallery.
+
+	Nothing is deleted upstream and mods.picture_url is left intact — this only
+	stops the app offering it, so "Show again" can put it back.
+	"""
+	from datetime import datetime, timezone
+
+	conn = get_db()
+	try:
+		conn.execute(
+			"INSERT OR REPLACE INTO mod_hidden_nexus_image (mod_id, hidden_at) VALUES (?, ?)",
+			(mod_id, datetime.now(timezone.utc).isoformat()),
+		)
+		conn.commit()
+		return {"ok": True, "mod_id": mod_id, "hidden": True}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+@app.post("/api/mods/{mod_id}/images/nexus/show")
+def show_nexus_image(mod_id: int) -> Dict[str, Any]:
+	"""Put a hidden Nexus picture back in the gallery."""
+	conn = get_db()
+	try:
+		conn.execute("DELETE FROM mod_hidden_nexus_image WHERE mod_id = ?", (mod_id,))
+		conn.commit()
+		return {"ok": True, "mod_id": mod_id, "hidden": False}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
 @app.get("/api/mods/{mod_id}/images")
 def get_mod_images(mod_id: int) -> Dict[str, Any]:
 	"""Get all images for a mod (Nexus images + custom uploaded images)."""
@@ -5162,21 +6379,35 @@ def get_mod_images(mod_id: int) -> Dict[str, Any]:
 		cur = conn.cursor()
 		nexus_images = []
 		mod_row = cur.execute("SELECT picture_url FROM mods WHERE mod_id = ?", (mod_id,)).fetchone()
-		if mod_row and mod_row[0]:
+		starred = cur.execute(
+			"SELECT 1 FROM mod_custom_images WHERE mod_id = ? AND is_preview = 1 LIMIT 1",
+			(mod_id,),
+		).fetchone()
+		if mod_row and mod_row[0] and not _nexus_image_hidden(cur, mod_id):
 			nexus_images.append({
 				"id": 0,
 				"source": "nexus",
 				"url": mod_row[0],
+				# With no custom image starred, the picture is what the card and
+				# the dialog header actually show, so its star has to be lit.
+				# Leaving it dark made the mod look as though it had no preview
+				# at all.
+				"isPreview": not starred,
 			})
 		
 		# Get custom uploaded images
+		# sort_order first, id as the tie-break. Ordering by uploaded_at alone
+		# could not express a user-chosen order, and the first row here is what
+		# becomes the card preview.
 		custom_rows = cur.execute(
-			"SELECT id, image_data, filename, mime_type, uploaded_at FROM mod_custom_images WHERE mod_id = ? ORDER BY uploaded_at ASC",
+			"SELECT id, image_data, filename, mime_type, uploaded_at, is_preview "
+			"FROM mod_custom_images "
+			"WHERE mod_id = ? ORDER BY COALESCE(sort_order, id) ASC, id ASC",
 			(mod_id,)
 		).fetchall()
 		
 		custom_images = []
-		for img_id, image_data, filename, mime_type, uploaded_at in custom_rows:
+		for img_id, image_data, filename, mime_type, uploaded_at, is_preview in custom_rows:
 			custom_images.append({
 				"id": img_id,
 				"source": "custom",
@@ -5184,6 +6415,7 @@ def get_mod_images(mod_id: int) -> Dict[str, Any]:
 				"filename": filename,
 				"mimeType": mime_type,
 				"uploadedAt": uploaded_at,
+				"isPreview": bool(is_preview),
 			})
 		
 		logger.info(f"[get_mod_images] mod_id={mod_id}, nexus_images={len(nexus_images)}, custom_images={len(custom_images)}")
@@ -5191,6 +6423,9 @@ def get_mod_images(mod_id: int) -> Dict[str, Any]:
 			"ok": True,
 			"nexus_images": nexus_images,
 			"custom_images": custom_images,
+			# So the UI can offer "Show again" instead of pretending the picture
+			# never existed.
+			"nexus_image_hidden": bool(mod_row and mod_row[0] and not nexus_images),
 		}
 	finally:
 		try:
@@ -5199,6 +6434,148 @@ def get_mod_images(mod_id: int) -> Dict[str, Any]:
 			pass
 
 
+
+
+@app.post("/api/mods/{mod_id}/images/{image_id}/preview")
+def set_mod_image_preview(mod_id: int, image_id: int) -> Dict[str, Any]:
+	"""Mark one image as the mod's card preview, and move it to the front.
+
+	Both, because the star means one thing to the user. The flag is what lets a
+	chosen image outrank a Nexus picture_url; the ordering is what makes the
+	images tab agree with the card.
+
+	``image_id`` 0 means the mod page picture, which is the id get_mod_images
+	gives it. It has no row to flag, so choosing it means clearing whichever
+	custom image was starred — with nothing starred, picture_url is already what
+	both the card and the dialog header fall back to. It also un-hides the
+	picture, since starring an image you cannot see would do nothing.
+	"""
+	import logging
+
+	logger = logging.getLogger("modmanager.api")
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+
+		if image_id == 0:
+			has_picture = cur.execute(
+				"SELECT picture_url FROM mods WHERE mod_id = ?", (mod_id,)
+			).fetchone()
+			if not has_picture or not has_picture[0]:
+				raise HTTPException(
+					status_code=404, detail=f"Mod {mod_id} has no Nexus picture"
+				)
+			cur.execute(
+				"UPDATE mod_custom_images SET is_preview = 0 WHERE mod_id = ?", (mod_id,)
+			)
+			cur.execute("DELETE FROM mod_hidden_nexus_image WHERE mod_id = ?", (mod_id,))
+			conn.commit()
+			logger.info("[set_mod_image_preview] mod_id=%s -> nexus picture", mod_id)
+			return {"ok": True, "mod_id": mod_id, "image_id": 0}
+
+		owned = cur.execute(
+			"SELECT id FROM mod_custom_images WHERE mod_id = ? AND id = ?",
+			(mod_id, image_id),
+		).fetchone()
+		if not owned:
+			raise HTTPException(
+				status_code=404, detail=f"Image {image_id} does not belong to mod {mod_id}"
+			)
+
+		# Exactly one preview per mod.
+		cur.execute("UPDATE mod_custom_images SET is_preview = 0 WHERE mod_id = ?", (mod_id,))
+		cur.execute(
+			"UPDATE mod_custom_images SET is_preview = 1, sort_order = -1 WHERE id = ?",
+			(image_id,),
+		)
+		# Renumber from the front so sort_order stays a dense, total order.
+		rows = cur.execute(
+			"SELECT id FROM mod_custom_images WHERE mod_id = ? "
+			"ORDER BY COALESCE(sort_order, id) ASC, id ASC",
+			(mod_id,),
+		).fetchall()
+		for position, (row_id,) in enumerate(rows):
+			cur.execute(
+				"UPDATE mod_custom_images SET sort_order = ? WHERE id = ?", (position, row_id)
+			)
+		conn.commit()
+
+		logger.info("[set_mod_image_preview] mod_id=%s image_id=%s", mod_id, image_id)
+		return {"ok": True, "mod_id": mod_id, "image_id": image_id}
+	except HTTPException:
+		raise
+	except Exception:
+		conn.rollback()
+		raise
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+class ReorderImagesPayload(BaseModel):
+	"""Image ids in the order the user wants them, first one becomes the preview."""
+
+	image_ids: List[int]
+
+
+@app.post("/api/mods/{mod_id}/images/reorder")
+def reorder_mod_images(mod_id: int, payload: ReorderImagesPayload) -> Dict[str, Any]:
+	"""Persist a user-chosen order for a mod's custom images.
+
+	The first id becomes the card preview. Ids are written as 0..n-1 rather than
+	shuffled relative to each other, so the stored order is total and a later
+	insert (which defaults to its row id, a large number) lands at the end.
+	"""
+	import logging
+
+	logger = logging.getLogger("modmanager.api")
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		owned = {
+			int(r[0])
+			for r in cur.execute(
+				"SELECT id FROM mod_custom_images WHERE mod_id = ?", (mod_id,)
+			).fetchall()
+		}
+		if not owned:
+			raise HTTPException(status_code=404, detail=f"No custom images for mod {mod_id}")
+
+		# Only ids belonging to this mod may be reordered — the list arrives from
+		# the client and must not be able to touch another mod's rows.
+		unknown = [i for i in payload.image_ids if int(i) not in owned]
+		if unknown:
+			raise HTTPException(
+				status_code=400,
+				detail=f"image(s) {unknown} do not belong to mod {mod_id}",
+			)
+
+		ordered = [int(i) for i in payload.image_ids]
+		# Anything the client omitted keeps its relative position after the ones
+		# it did send, so a partial list cannot silently drop images.
+		remaining = [i for i in sorted(owned) if i not in set(ordered)]
+
+		for position, image_id in enumerate(ordered + remaining):
+			cur.execute(
+				"UPDATE mod_custom_images SET sort_order = ? WHERE id = ? AND mod_id = ?",
+				(position, image_id, mod_id),
+			)
+		conn.commit()
+
+		logger.info("[reorder_mod_images] mod_id=%s reordered %s image(s)", mod_id, len(ordered))
+		return {"ok": True, "order": ordered + remaining}
+	except HTTPException:
+		raise
+	except Exception:
+		conn.rollback()
+		raise
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
 
 
 class UpdateModDetailsPayload(BaseModel):
@@ -5374,6 +6751,7 @@ def upload_mod_images(mod_id: int, payload: UploadImagePayload) -> Dict[str, Any
 					raise HTTPException(status_code=404, detail=f"Mod {real_mod_id} not found")
 		
 		uploaded_ids = []
+		skipped_duplicates = 0
 		for img in payload.images:
 			image_data = img.get("data", "")
 			filename = img.get("filename", "")
@@ -5381,28 +6759,174 @@ def upload_mod_images(mod_id: int, payload: UploadImagePayload) -> Dict[str, Any
 			
 			if not image_data:
 				continue
-			
-			cur.execute(
-				"""
-				INSERT INTO mod_custom_images (mod_id, image_data, filename, mime_type)
-				VALUES (?, ?, ?, ?)
-				""",
-				(real_mod_id, image_data, filename, mime_type)
+
+			original_len = len(image_data)
+			image_data, mime_type = _normalize_image_for_storage(image_data, mime_type)
+			logger.info(
+				f"[upload_mod_images] {filename or '<unnamed>'}: "
+				f"{original_len / 1048576:.2f} MB -> {len(image_data) / 1048576:.2f} MB"
 			)
-			uploaded_ids.append(cur.lastrowid)
-		
+
+			new_id = _insert_mod_image(cur, real_mod_id, image_data, filename, mime_type)
+			if new_id is None:
+				skipped_duplicates += 1
+			else:
+				uploaded_ids.append(new_id)
+
 		conn.commit()
-		logger.info(f"[upload_mod_images] mod_id={real_mod_id}, uploaded {len(uploaded_ids)} images")
+		logger.info(
+			f"[upload_mod_images] mod_id={real_mod_id}, uploaded {len(uploaded_ids)} images, "
+			f"skipped {skipped_duplicates} duplicate(s)"
+		)
 		return {
 			"ok": True,
 			"uploaded_count": len(uploaded_ids),
 			"image_ids": uploaded_ids,
+			"skipped_duplicates": skipped_duplicates,
 		}
 	except HTTPException:
 		raise
 	except Exception:
 		# Roll back, then let the global handler log the traceback
 		# against a correlation id.
+		conn.rollback()
+		raise
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+class UploadImageByUrlPayload(BaseModel):
+	urls: List[str]
+
+
+@app.post("/api/mods/{mod_id}/images/by-url")
+def upload_mod_images_by_url(mod_id: int, payload: UploadImageByUrlPayload) -> Dict[str, Any]:
+	"""Download images from URLs the user supplies and store them on a mod.
+
+	Neither Nexus API exposes a mod's image gallery — the Mod type carries one
+	picture in several sizes, and the media() query cannot be narrowed to a mod
+	— so "fetch every screenshot" is not something this app can do on its own.
+	This is the user-driven equivalent: copy image addresses off the mod page and
+	paste them here.
+
+	Fetched images go through the same normalizer as file uploads, so they are
+	stored display-sized rather than at full resolution.
+	"""
+	import base64
+	import logging
+	import ssl
+	import urllib.error
+	import urllib.request
+	from urllib.parse import unquote, urlparse
+
+	logger = logging.getLogger("modmanager.api")
+
+	# Cap per image: artwork is artwork, not an archive. Guards against a typo'd
+	# URL pointing at something enormous.
+	max_bytes = 32 * 1024 * 1024
+
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		real_mod_id = mod_id
+		if not cur.execute("SELECT 1 FROM mods WHERE mod_id = ?", (real_mod_id,)).fetchone():
+			if real_mod_id >= 0:
+				raise HTTPException(status_code=404, detail=f"Mod {real_mod_id} not found")
+			local_download_id = -real_mod_id
+			dl_row = cur.execute(
+				"SELECT name FROM local_downloads WHERE id = ?", (local_download_id,)
+			).fetchone()
+			if not dl_row:
+				raise HTTPException(
+					status_code=404,
+					detail=f"Local download {local_download_id} not found for synthetic mod ID {real_mod_id}",
+				)
+			upsert_mod_info(
+				conn,
+				game=DEFAULT_GAME,
+				mod_id=real_mod_id,
+				mod_info_status=0,
+				mod_info={
+					"name": dl_row[0] or f"Local Mod {local_download_id}",
+					"summary": "Local mod (auto-generated)",
+					"description": "Auto-generated placeholder for local mod images.",
+					"author": "Local",
+					"status": "plaintext",
+					"category_id": 1,
+				},
+			)
+
+		try:
+			ctx = ssl._create_unverified_context()
+		except AttributeError:
+			ctx = ssl.create_default_context()
+
+		uploaded_ids: List[int] = []
+		failures: List[Dict[str, str]] = []
+		skipped_duplicates = 0
+
+		for raw_url in payload.urls:
+			url = (raw_url or "").strip()
+			if not url:
+				continue
+
+			parsed = urlparse(url)
+			if parsed.scheme not in ("http", "https"):
+				failures.append({"url": url, "error": "only http and https URLs are accepted"})
+				continue
+
+			try:
+				req = urllib.request.Request(
+					url,
+					headers={"User-Agent": USER_AGENT},
+				)
+				with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+					content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+					if content_type and not content_type.startswith("image/"):
+						failures.append({"url": url, "error": f"not an image ({content_type})"})
+						continue
+					# read one byte past the cap so an oversized body is detected
+					# rather than silently truncated.
+					blob = resp.read(max_bytes + 1)
+			except urllib.error.HTTPError as exc:
+				failures.append({"url": url, "error": f"HTTP {exc.code}"})
+				continue
+			except Exception as exc:
+				failures.append({"url": url, "error": str(exc)})
+				continue
+
+			if len(blob) > max_bytes:
+				failures.append({"url": url, "error": "image is larger than 32 MB"})
+				continue
+
+			filename = os.path.basename(unquote(parsed.path)) or "image"
+			data = base64.b64encode(blob).decode("utf-8")
+			data, mime_type = _normalize_image_for_storage(data, content_type or "image/png")
+
+			new_id = _insert_mod_image(cur, real_mod_id, data, filename, mime_type)
+			if new_id is None:
+				skipped_duplicates += 1
+				logger.info("[upload_mod_images_by_url] %s already stored, skipped", filename)
+				continue
+			uploaded_ids.append(new_id)
+			logger.info(
+				"[upload_mod_images_by_url] %s -> %.2f MB stored", filename, len(data) / 1048576
+			)
+
+		conn.commit()
+		return {
+			"ok": True,
+			"uploaded_count": len(uploaded_ids),
+			"image_ids": uploaded_ids,
+			"skipped_duplicates": skipped_duplicates,
+			"failures": failures,
+		}
+	except HTTPException:
+		raise
+	except Exception:
 		conn.rollback()
 		raise
 	finally:
@@ -5459,6 +6983,7 @@ def upload_mod_images_by_path(mod_id: int, payload: UploadImageByPathPayload) ->
 					raise HTTPException(status_code=404, detail=f"Mod {real_mod_id} not found")
 		
 		uploaded_ids = []
+		skipped_duplicates = 0
 		for path_str in payload.paths:
 			if not path_str:
 				continue
@@ -5475,22 +7000,30 @@ def upload_mod_images_by_path(mod_id: int, payload: UploadImageByPathPayload) ->
 			# Read file and encode to base64
 			with open(p, "rb") as f:
 				image_data = base64.b64encode(f.read()).decode("utf-8")
-			
-			cur.execute(
-				"""
-				INSERT INTO mod_custom_images (mod_id, image_data, filename, mime_type)
-				VALUES (?, ?, ?, ?)
-				""",
-				(real_mod_id, image_data, filename, mime_type)
+
+			original_len = len(image_data)
+			image_data, mime_type = _normalize_image_for_storage(image_data, mime_type)
+			logger.info(
+				f"[upload_mod_images_by_path] {filename}: "
+				f"{original_len / 1048576:.2f} MB -> {len(image_data) / 1048576:.2f} MB"
 			)
-			uploaded_ids.append(cur.lastrowid)
+
+			new_id = _insert_mod_image(cur, real_mod_id, image_data, filename, mime_type)
+			if new_id is None:
+				skipped_duplicates += 1
+			else:
+				uploaded_ids.append(new_id)
 		
 		conn.commit()
-		logger.info(f"[upload_mod_images_by_path] mod_id={real_mod_id}, uploaded {len(uploaded_ids)} images")
+		logger.info(
+			f"[upload_mod_images_by_path] mod_id={real_mod_id}, uploaded {len(uploaded_ids)} images, "
+			f"skipped {skipped_duplicates} duplicate(s)"
+		)
 		return {
 			"ok": True,
 			"uploaded_count": len(uploaded_ids),
 			"image_ids": uploaded_ids,
+			"skipped_duplicates": skipped_duplicates,
 		}
 	except HTTPException:
 		raise
@@ -5595,8 +7128,9 @@ def list_downloads() -> List[Dict[str, Any]]:
 	logger.info(f"[list_downloads] Query returned {len(rows)} rows")
 	
 	actual_active_filenames = _get_actually_active_filenames(logger)
+	hidden_files = _hidden_files_by_download(cur)
 	db_updates = []
-	
+
 	out: List[Dict[str, Any]] = []
 	for (
 		dl_id,
@@ -5639,6 +7173,13 @@ def list_downloads() -> List[Dict[str, Any]]:
 				contents = []
 		except Exception:
 			contents = []
+
+		# Files the user removed stay removed. contents is rewritten from the
+		# archive by every rebuild, so filtering here is what makes the removal
+		# outlive "Initial Database Build".
+		hidden_here = hidden_files.get(dl_id)
+		if hidden_here:
+			contents = [c for c in contents if os.path.basename(str(c)).lower() not in hidden_here]
 		try:
 			active_paks = json.loads(active_json) if active_json else []
 			if not isinstance(active_paks, list):
@@ -5707,6 +7248,11 @@ def list_downloads() -> List[Dict[str, Any]]:
 			custom_tag_names = [r[0] for r in ct_rows if r[0]]
 		except Exception:
 			pass
+
+		# Drop tags the user suppressed. Filtered here rather than in the UI so a
+		# hidden tag also disappears from the sidebar filters and from search,
+		# which read this same list.
+		tags_list = _without_hidden_tags(cur, effective_mod_id, tags_list)
 
 		out.append(
 			{
@@ -5970,7 +7516,7 @@ def _search_mod_id_remote(name: str, api_key: str, game: str = DEFAULT_GAME) -> 
 	url = f"https://api.nexusmods.com/v1/games/{game}/mods.json?{params}"
 	headers = {
 		"apikey": api_key,
-		"User-Agent": "Project_ModManager_Rivals/0.8.0",
+		"User-Agent": USER_AGENT,
 		"Application-Name": "Project_ModManager_Rivals",
 	}
 	req = urllib.request.Request(url, headers=headers, method="GET")
@@ -6273,7 +7819,7 @@ def _resolve_nexus_download_candidates(
 	if api_key:
 		headers["apikey"] = api_key
 		headers["Application-Name"] = "MarvelRivalsModManager"
-		headers["Application-Version"] = "0.8.0"
+		headers["Application-Version"] = APP_VERSION
 	req = urllib.request.Request(api_url, headers=headers, method="GET")
 	try:
 		with urllib.request.urlopen(req, timeout=30) as resp:
@@ -6482,12 +8028,102 @@ def _to_folder_name(tag: str) -> str:
 	return s or "misc"
 
 
-def _infer_character_tag(cur, name: Optional[str], pak_candidates: List[str]) -> Optional[str]:
-	"""Infer a canonical character tag for a download using pak_tags_json; fallback to name heuristics.
-	Returns a canonical character name if found, otherwise None.
+# Skin names too generic to identify anyone. "default" exists for all 82
+# characters, so matching it would file a mod under whoever came back first.
+_UNHELPFUL_SKIN_NAMES = {"default", "classic", "original", "base", "standard"}
+
+# (skin_compact, character_name) pairs, longest skin first so the most specific
+# match wins. Built once: it is 699 rows and activation happens per pak.
+_SKIN_INDEX: Optional[List[Tuple[str, str]]] = None
+
+
+def _skin_index(cur) -> List[Tuple[str, str]]:
+	global _SKIN_INDEX
+	if _SKIN_INDEX is not None:
+		return _SKIN_INDEX
+	pairs: List[Tuple[str, str]] = []
+	try:
+		rows = cur.execute(
+			"SELECT s.name, c.name FROM skins s "
+			"JOIN characters c ON c.character_id = s.character_id"
+		).fetchall()
+		for skin_name, char_name in rows:
+			if not skin_name or not char_name:
+				continue
+			if str(skin_name).strip().lower() in _UNHELPFUL_SKIN_NAMES:
+				continue
+			_, compact = _normalize(str(skin_name))
+			# Very short names ("ai", "x") match inside unrelated words.
+			if len(compact) < 5:
+				continue
+			pairs.append((compact, str(char_name)))
+	except Exception:
+		# Character data has not been extracted yet; the caller falls back.
+		return []
+	pairs.sort(key=lambda p: len(p[0]), reverse=True)
+	_SKIN_INDEX = pairs
+	return pairs
+
+
+def _character_from_skin_name(cur, text: str) -> Optional[str]:
+	"""Resolve a skin name embedded in a filename to the character wearing it.
+
+	Mod archives are named after the skin, not the hero: "LunaMirae2099",
+	"FeliciaUrbanPredator", "ElsaYoungBlood". None of those contain a canonical
+	character name, so name heuristics found nothing and the files stayed
+	unfiled at the root of ~mods. The skins table already maps every skin to its
+	character, which answers this exactly.
 	"""
-	# Aggregate tags for all candidate pak names from pak_tags_json
+	if not text:
+		return None
+	_, compact = _normalize(text)
+	if not compact:
+		return None
+	for skin_compact, char_name in _skin_index(cur):
+		if skin_compact in compact:
+			return char_name
+	return None
+
+
+def _infer_character_tag(
+	cur,
+	name: Optional[str],
+	pak_candidates: List[str],
+	mod_id: Optional[int] = None,
+) -> Optional[str]:
+	"""Infer a canonical character tag for a download, to pick its ~mods subfolder.
+
+	Sources, in order of how deliberate they are:
+
+	1. ``mod_custom_tags`` — tags the user typed for this mod. Checked FIRST and
+	   consulted at all only since this change: activation used to read the
+	   extracted tags and the filename and nothing else, so a mod whose character
+	   could not be detected automatically stayed unfiled at the root of ~mods no
+	   matter how the user tagged it. Tagging it by hand is the clearest possible
+	   statement of what it is, and it was being ignored.
+	2. ``pak_tags_json`` — tags derived from the pak contents.
+	3. Name heuristics over the download and pak filenames.
+
+	Returns a canonical character name, or None when nothing matches.
+	"""
 	tokens: set[str] = set()
+
+	if mod_id is not None:
+		try:
+			rows = cur.execute(
+				"SELECT tag FROM mod_custom_tags WHERE mod_id = ? ORDER BY added_at ASC",
+				(mod_id,),
+			).fetchall()
+			custom = {str(r[0]).strip() for r in rows if r and r[0]}
+			# Only a tag that canonicalises to a real character can name a folder;
+			# "4K" or "NSFW" must not become a directory.
+			for candidate in _canonicalize_tokens(custom):
+				if candidate not in _KNOWN_CATEGORIES:
+					return candidate
+		except Exception:
+			pass
+
+	# Aggregate tags for all candidate pak names from pak_tags_json
 	for pak in pak_candidates:
 		if not pak:
 			continue
@@ -6532,6 +8168,16 @@ def _infer_character_tag(cur, name: Optional[str], pak_candidates: List[str]) ->
 	for t in canon:
 		if t not in _KNOWN_CATEGORIES:
 			return t
+
+	# Last resort: the archive is probably named after a SKIN rather than the
+	# character — "LunaMirae2099", "FeliciaUrbanPredator", "ElsaYoungBlood".
+	# None of those contain a canonical hero name, which is why such mods stayed
+	# unfiled at the root of ~mods.
+	skin_owner = _character_from_skin_name(
+		cur, " ".join([name or ""] + [p for p in pak_candidates if isinstance(p, str)])
+	)
+	if skin_owner and skin_owner not in _KNOWN_CATEGORIES:
+		return skin_owner
 	return None
 
 
@@ -6711,6 +8357,12 @@ def delete_local_downloads_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict
 		except Exception:
 			pass
 		_safe_rebuild_conflicts(conn, active_only=None, purpose="delete_local_downloads")
+		if deleted_count:
+			_log_activity(
+				"deleted",
+				f"Deleted {deleted_count} mod(s)",
+				f"{len(removed_files)} file(s) removed from disk",
+			)
 		return {
 			"ok": True,
 			"deleted": deleted_count,
@@ -6768,6 +8420,717 @@ def disable_all_mods() -> Dict[str, Any]:
 		_safe_rebuild_conflicts(conn, active_only=True, purpose="disable_all_mods")
 		
 		return {"ok": True}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+# ─── Activity history ────────────────────────────────────────────────────────
+# What the app did, in the words the person who did it would use. Kept separate
+# from backend.log, which is for diagnostics and is unreadable to anyone who did
+# not write it.
+
+# Old entries are pruned rather than kept forever: this is "what did I just do",
+# not an audit trail, and an unbounded table on a database that is backed up in
+# full would cost more than it is worth.
+_ACTIVITY_KEEP = 500
+
+
+def _log_activity(kind: str, summary: str, detail: Optional[str] = None) -> None:
+	"""Record one user-visible action. Never raises.
+
+	Called from inside operations that have already done the real work, so a
+	failure to write history must not turn a successful activation into an
+	error the user sees.
+	"""
+	from datetime import datetime, timezone
+
+	try:
+		conn = get_db()
+		try:
+			cur = conn.cursor()
+			cur.execute(
+				"INSERT INTO activity_log (at, kind, summary, detail) VALUES (?, ?, ?, ?)",
+				(datetime.now(timezone.utc).isoformat(), kind, summary, detail),
+			)
+			cur.execute(
+				"DELETE FROM activity_log WHERE id <= "
+				"(SELECT MAX(id) - ? FROM activity_log)",
+				(_ACTIVITY_KEEP,),
+			)
+			conn.commit()
+		finally:
+			try:
+				conn.close()
+			except Exception:
+				pass
+	except Exception as exc:
+		logging.getLogger("modmanager.api").debug("[activity] not recorded: %s", exc)
+
+
+@app.get("/api/activity")
+def list_activity(limit: int = 100) -> Dict[str, Any]:
+	"""Recent actions, newest first."""
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		try:
+			rows = cur.execute(
+				"SELECT id, at, kind, summary, detail FROM activity_log "
+				"ORDER BY id DESC LIMIT ?",
+				(max(1, min(int(limit), 500)),),
+			).fetchall()
+		except Exception:
+			# Un-migrated database: an empty history is the truthful answer.
+			return {"ok": True, "entries": [], "count": 0}
+		entries = [
+			{"id": r[0], "at": r[1], "kind": r[2], "summary": r[3], "detail": r[4]}
+			for r in rows
+		]
+		return {"ok": True, "entries": entries, "count": len(entries)}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+@app.post("/api/activity/clear")
+def clear_activity() -> Dict[str, Any]:
+	"""Forget the history."""
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		cur.execute("DELETE FROM activity_log")
+		removed = cur.rowcount or 0
+		conn.commit()
+		return {"ok": True, "removed": removed}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+class BulkActivatePayload(BaseModel):
+	download_ids: List[int]
+	activate: bool
+
+
+@app.post("/api/local_downloads/bulk-activate")
+def bulk_activate_downloads(payload: BulkActivatePayload) -> Dict[str, Any]:
+	"""Turn a set of mods on or off in one go.
+
+	Exists to make the conflict rebuild happen once. set_active_paks rebuilds on
+	every call, and that rebuild is the expensive part — doing it per mod is what
+	made "select 40 mods and disable them" take minutes of the UI locking up.
+
+	Enabling activates every pak the mod ships. That matches what the mod card's
+	own toggle does; a mod with mutually exclusive variants is a case for opening
+	it, not for a bulk action to guess at.
+	"""
+	ids = [int(i) for i in (payload.download_ids or [])]
+	if not ids:
+		raise HTTPException(status_code=400, detail="download_ids is required")
+
+	logger = logging.getLogger("modmanager.api")
+	changed = skipped = failed = 0
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		hidden = _hidden_files_by_download(cur)
+		rows = {
+			int(r[0]): (r[1], r[2], r[3])
+			for r in cur.execute(
+				"SELECT id, name, contents, active_paks FROM local_downloads "
+				f"WHERE id IN ({','.join('?' * len(ids))})",
+				ids,
+			).fetchall()
+		}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+	def _load(raw):
+		try:
+			parsed = json.loads(raw) if raw else []
+			return [str(x) for x in parsed] if isinstance(parsed, list) else []
+		except Exception:
+			return []
+
+	for download_id in ids:
+		row = rows.get(download_id)
+		if not row:
+			failed += 1
+			continue
+		_name, contents_raw, active_raw = row
+		hidden_here = hidden.get(download_id, set())
+		current = _load(active_raw)
+		if payload.activate:
+			desired = [
+				c
+				for c in _load(contents_raw)
+				if os.path.basename(c).lower() not in hidden_here
+			]
+		else:
+			desired = []
+
+		if sorted(desired) == sorted(current):
+			skipped += 1
+			continue
+		try:
+			# One rebuild for the whole batch, below.
+			set_active_paks(
+				download_id, {"active_paks": desired, "rebuild_conflicts": False}
+			)
+			changed += 1
+		except HTTPException as exc:
+			failed += 1
+			logger.info("[bulk_activate] %s: %s", download_id, exc.detail)
+		except Exception as exc:
+			failed += 1
+			logger.warning("[bulk_activate] %s failed: %s", download_id, exc)
+
+	if changed:
+		conn = get_db()
+		try:
+			_safe_rebuild_conflicts(conn, active_only=True, purpose="bulk_activate")
+		finally:
+			try:
+				conn.close()
+			except Exception:
+				pass
+		_log_activity(
+			"activated" if payload.activate else "deactivated",
+			f"{'Enabled' if payload.activate else 'Disabled'} {changed} mod(s)",
+			f"{skipped} already in that state, {failed} failed" if (skipped or failed) else None,
+		)
+
+	return {"ok": True, "changed": changed, "skipped": skipped, "failed": failed}
+
+
+class BulkTagPayload(BaseModel):
+	mod_ids: List[int]
+	tag: str
+
+
+@app.post("/api/mods/bulk-tag")
+def bulk_tag_mods(payload: BulkTagPayload) -> Dict[str, Any]:
+	"""Add one tag to several mods."""
+	from datetime import datetime, timezone
+
+	tag = (payload.tag or "").strip()
+	if not tag:
+		raise HTTPException(status_code=400, detail="tag is required")
+	ids = [int(i) for i in (payload.mod_ids or [])]
+	if not ids:
+		raise HTTPException(status_code=400, detail="mod_ids is required")
+
+	added = skipped = 0
+	now = datetime.now(timezone.utc).isoformat()
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		for mod_id in ids:
+			existing = cur.execute(
+				"SELECT 1 FROM mod_custom_tags WHERE mod_id = ? AND tag = ? COLLATE NOCASE",
+				(mod_id, tag),
+			).fetchone()
+			if existing:
+				skipped += 1
+				continue
+			cur.execute(
+				"INSERT INTO mod_custom_tags (mod_id, tag, added_at) VALUES (?, ?, ?)",
+				(mod_id, tag, now),
+			)
+			added += 1
+		conn.commit()
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+	if added:
+		_log_activity("tagged", f'Tagged {added} mod(s) "{tag}"')
+	return {"ok": True, "added": added, "skipped": skipped, "tag": tag}
+
+
+def _hidden_files_by_download(cur) -> Dict[int, set]:
+	"""download_id -> lowercased basenames the user removed from that mod."""
+	out: Dict[int, set] = {}
+	try:
+		for dl_id, pak_name in cur.execute(
+			"SELECT download_id, pak_name FROM mod_hidden_files"
+		).fetchall():
+			out.setdefault(int(dl_id), set()).add(str(pak_name).lower())
+	except Exception:
+		# Un-migrated database: hide nothing rather than hiding everything.
+		return {}
+	return out
+
+
+@app.get("/api/local_downloads/hidden-files")
+def list_hidden_files() -> Dict[str, Any]:
+	"""Every pak the user has removed, so the app can offer to bring them back."""
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		try:
+			rows = cur.execute(
+				"SELECT h.download_id, h.pak_name, h.hidden_at, l.name "
+				"FROM mod_hidden_files h "
+				"LEFT JOIN local_downloads l ON l.id = h.download_id "
+				"ORDER BY h.hidden_at DESC"
+			).fetchall()
+		except Exception:
+			return {"ok": True, "files": [], "count": 0}
+		files = [
+			{
+				"download_id": r[0],
+				"pak_name": r[1],
+				"hidden_at": r[2],
+				"mod_name": r[3],
+			}
+			for r in rows
+		]
+		return {"ok": True, "files": files, "count": len(files)}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+class RestoreHiddenFilesPayload(BaseModel):
+	"""Empty list means "all of them"."""
+
+	download_ids: Optional[List[int]] = None
+
+
+@app.post("/api/local_downloads/hidden-files/restore")
+def restore_hidden_files(payload: RestoreHiddenFilesPayload) -> Dict[str, Any]:
+	"""Stop hiding removed paks.
+
+	Only clears the record — the files themselves come back the next time the
+	archive is read, which "Rebuild Local Downloads" does.
+	"""
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		if payload.download_ids:
+			placeholders = ",".join("?" * len(payload.download_ids))
+			cur.execute(
+				f"DELETE FROM mod_hidden_files WHERE download_id IN ({placeholders})",
+				[int(i) for i in payload.download_ids],
+			)
+		else:
+			cur.execute("DELETE FROM mod_hidden_files")
+		restored = cur.rowcount or 0
+		conn.commit()
+		logging.getLogger("modmanager.api").info(
+			"[hidden_files] restored %s entry/entries", restored
+		)
+		return {"ok": True, "restored": restored}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+class RemoveDownloadFilePayload(BaseModel):
+	pak_name: str
+
+
+def _bundle_members(entries: List[str], target: str) -> List[str]:
+	"""Every archive entry belonging to the same pak as ``target``.
+
+	Unreal ships a pak as up to three files with one stem — .pak, .utoc, .ucas —
+	and the UI shows them as a single row. Deleting only the .pak would leave two
+	orphans behind that the game may still try to mount.
+	"""
+	stem = os.path.splitext(os.path.basename(target))[0].lower()
+	out: List[str] = []
+	for entry in entries:
+		base = os.path.basename(entry)
+		root, ext = os.path.splitext(base)
+		if root.lower() == stem and ext.lower() in (".pak", ".utoc", ".ucas"):
+			out.append(entry)
+	return out or [target]
+
+
+def _rewrite_zip_without(archive: Path, drop: Set[str], dest: Path) -> int:
+	"""Copy every member except ``drop`` into a new zip. Returns members dropped."""
+	import zipfile
+
+	dropped = 0
+	with zipfile.ZipFile(archive) as src, zipfile.ZipFile(
+		dest, "w", zipfile.ZIP_DEFLATED
+	) as out:
+		for info in src.infolist():
+			if info.filename in drop:
+				dropped += 1
+				continue
+			out.writestr(info, src.read(info.filename))
+	return dropped
+
+
+@app.post("/api/local_downloads/{download_id}/delete-file")
+def delete_download_file(
+	download_id: int, payload: RemoveDownloadFilePayload
+) -> Dict[str, Any]:
+	"""Delete a pak from the mod's archive for good.
+
+	The destructive sibling of remove-file, which only hides. This rewrites the
+	archive on disk, so the file cannot be recovered by a rebuild — that is the
+	whole point, and why the UI asks first.
+
+	The new archive is built beside the original and swapped in only once it is
+	complete. A failure part-way leaves the original untouched rather than
+	half-written.
+	"""
+	logger = logging.getLogger("modmanager.api")
+	target = (payload.pak_name or "").strip()
+	if not target:
+		raise HTTPException(status_code=400, detail="pak_name is required")
+
+	path, _mod_id, download_name = _download_archive_path(download_id)
+	archive = Path(path)
+	if archive.is_dir():
+		raise HTTPException(
+			status_code=400,
+			detail="This mod is a folder, not an archive. Delete the file from disk instead.",
+		)
+	if archive.suffix.lower() != ".zip":
+		# rar/7z deletion needs the external tool and rewrites in place, which is
+		# not something to do to someone's only copy on a guess.
+		raise HTTPException(
+			status_code=400,
+			detail=f"Only .zip archives can be edited here; this is a {archive.suffix} file.",
+		)
+
+	from core.utils.archive import list_entries
+
+	try:
+		entries = list_entries(str(archive))
+	except Exception as exc:
+		raise HTTPException(status_code=400, detail=f"Could not read the archive: {exc}")
+
+	lowered = target.lower()
+	base = os.path.basename(lowered)
+	matches = [
+		e
+		for e in entries
+		if e.lower() == lowered or os.path.basename(e.lower()) == base
+	]
+	if not matches:
+		raise HTTPException(
+			status_code=404, detail=f"{target} is not in {archive.name}"
+		)
+
+	drop: Set[str] = set()
+	for match in matches:
+		drop.update(_bundle_members(entries, match))
+
+	# Take it out of ~mods first, through the normal path, so the folder
+	# bookkeeping stays correct.
+	conn = get_db()
+	try:
+		row = conn.execute(
+			"SELECT active_paks FROM local_downloads WHERE id = ?", (download_id,)
+		).fetchone()
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+	try:
+		active = json.loads(row[0]) if row and row[0] else []
+	except Exception:
+		active = []
+	dropped_bases = {os.path.basename(d).lower() for d in drop}
+	remaining_active = [
+		a for a in active if os.path.basename(str(a)).lower() not in dropped_bases
+	]
+	if len(remaining_active) != len(active):
+		try:
+			set_active_paks(download_id, {"active_paks": remaining_active})
+		except Exception as exc:
+			logger.warning("[delete_download_file] could not deactivate first: %s", exc)
+
+	staging = archive.with_suffix(archive.suffix + ".rebuilding")
+	try:
+		removed = _rewrite_zip_without(archive, drop, staging)
+		os.replace(staging, archive)
+	except Exception as exc:
+		try:
+			if staging.exists():
+				staging.unlink()
+		except OSError:
+			pass
+		raise HTTPException(status_code=500, detail=f"Could not rewrite the archive: {exc}")
+
+	# The archive is the source of truth for contents; drop the rows that
+	# described what is no longer in it.
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		try:
+			stored = cur.execute(
+				"SELECT contents FROM local_downloads WHERE id = ?", (download_id,)
+			).fetchone()
+			contents = json.loads(stored[0]) if stored and stored[0] else []
+		except Exception:
+			contents = []
+		remaining = [
+			c for c in contents if os.path.basename(str(c)).lower() not in dropped_bases
+		]
+		cur.execute(
+			"UPDATE local_downloads SET contents = ? WHERE id = ?",
+			(json.dumps(remaining, ensure_ascii=False), download_id),
+		)
+		# A file that no longer exists cannot be "hidden".
+		cur.execute(
+			"DELETE FROM mod_hidden_files WHERE download_id = ? AND LOWER(pak_name) = ?",
+			(download_id, base),
+		)
+		for table in ("pak_assets", "pak_assets_json", "mod_paks"):
+			try:
+				cur.execute(
+					f"DELETE FROM {table} WHERE LOWER(pak_name) IN "
+					f"({','.join('?' * len(dropped_bases))})",
+					tuple(dropped_bases),
+				)
+			except Exception as exc:
+				logger.debug("[delete_download_file] %s cleanup skipped: %s", table, exc)
+		conn.commit()
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+	logger.info(
+		"[delete_download_file] download=%s removed %s member(s) from %s",
+		download_id, removed, archive.name,
+	)
+	_log_activity(
+		"file_deleted",
+		f"Deleted {os.path.basename(target)} from {download_name or archive.name}",
+		f"{removed} file(s) removed from the archive — not recoverable",
+	)
+	return {"ok": True, "deleted": os.path.basename(target), "members_removed": removed}
+
+
+@app.post("/api/local_downloads/{download_id}/restore-file")
+def restore_download_file(
+	download_id: int, payload: RemoveDownloadFilePayload
+) -> Dict[str, Any]:
+	"""Un-hide one pak inside a mod.
+
+	The file itself was never deleted -- removing only stopped the app offering
+	it -- so this is just dropping the record. It reappears immediately, without
+	needing a rebuild, because the filtering happens when the mod is read.
+	"""
+	target = os.path.basename((payload.pak_name or "").strip())
+	if not target:
+		raise HTTPException(status_code=400, detail="pak_name is required")
+
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		cur.execute(
+			"DELETE FROM mod_hidden_files WHERE download_id = ? AND LOWER(pak_name) = ?",
+			(download_id, target.lower()),
+		)
+		restored = cur.rowcount or 0
+		conn.commit()
+		logging.getLogger("modmanager.api").info(
+			"[restore_download_file] download=%s pak=%s restored=%s",
+			download_id, target, restored,
+		)
+		if restored:
+			_log_activity("file_restored", f"Restored {target}", f"download {download_id}")
+		return {"ok": True, "restored": restored, "pak_name": target}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+class ModFileNotePayload(BaseModel):
+	pak_name: str
+	note: str
+
+
+@app.get("/api/local_downloads/{download_id}/file-notes")
+def get_file_notes(download_id: int) -> Dict[str, Any]:
+	"""Per-pak notes for one download.
+
+	A mod often ships a dozen variants named A_rogueVA / A_rogueVB / A_rogueVC,
+	which say nothing about what they actually change. Without somewhere to write
+	it down, telling them apart means enabling them one at a time, every time.
+	"""
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		try:
+			rows = cur.execute(
+				"SELECT pak_name, note, updated_at FROM mod_file_notes WHERE download_id = ?",
+				(download_id,),
+			).fetchall()
+		except Exception:
+			return {"ok": True, "notes": {}}
+		return {
+			"ok": True,
+			"notes": {r[0]: {"note": r[1], "updatedAt": r[2]} for r in rows},
+		}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+@app.post("/api/local_downloads/{download_id}/file-notes")
+def set_file_note(download_id: int, payload: ModFileNotePayload) -> Dict[str, Any]:
+	"""Save or clear one pak's note. An empty note deletes the row."""
+	from datetime import datetime, timezone
+
+	pak = (payload.pak_name or "").strip()
+	if not pak:
+		raise HTTPException(status_code=400, detail="pak_name is required")
+
+	note = (payload.note or "").strip()
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		if note:
+			cur.execute(
+				"INSERT OR REPLACE INTO mod_file_notes "
+				"(download_id, pak_name, note, updated_at) VALUES (?, ?, ?, ?)",
+				(download_id, pak, note, datetime.now(timezone.utc).isoformat()),
+			)
+		else:
+			cur.execute(
+				"DELETE FROM mod_file_notes WHERE download_id = ? AND pak_name = ?",
+				(download_id, pak),
+			)
+		conn.commit()
+		return {"ok": True, "pak_name": pak, "note": note}
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
+@app.post("/api/local_downloads/{download_id}/remove-file")
+def remove_download_file(
+	download_id: int, payload: RemoveDownloadFilePayload
+) -> Dict[str, Any]:
+	"""Drop one pak from a mod, instead of deleting the whole mod.
+
+	A mod often ships a dozen variants and only one is wanted; the only option
+	before was removing the entire download.
+
+	Hiding is purely a view concern: the pak is deactivated so it leaves ~mods,
+	and its name is recorded in mod_hidden_files. Nothing else is touched.
+
+	It used to also rewrite local_downloads.contents and delete the per-pak rows,
+	which made removal two mechanisms fighting each other. contents is rebuilt
+	from the archive by every ingest, so that edit was undone on the next run
+	while the record survived; and because the row really was gone, restoring
+	could not put the file back without a full rebuild. Filtering on read instead
+	means a rebuild cannot resurrect a hidden file and restoring it is immediate.
+	"""
+	import logging
+
+	logger = logging.getLogger("modmanager.api")
+	target = (payload.pak_name or "").strip()
+	if not target:
+		raise HTTPException(status_code=400, detail="pak_name is required")
+
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		row = cur.execute(
+			"SELECT contents, active_paks FROM local_downloads WHERE id = ?", (download_id,)
+		).fetchone()
+		if not row:
+			raise HTTPException(status_code=404, detail=f"Download {download_id} not found")
+
+		def _load(raw):
+			try:
+				parsed = json.loads(raw) if raw else []
+				return parsed if isinstance(parsed, list) else []
+			except Exception:
+				return []
+
+		contents = _load(row[0])
+		active = _load(row[1])
+
+		lowered = target.lower()
+		base = os.path.basename(lowered)
+
+		def _matches(entry: str) -> bool:
+			e = str(entry).lower()
+			return e == lowered or os.path.basename(e) == base
+
+		if not any(_matches(c) for c in contents):
+			raise HTTPException(
+				status_code=404, detail=f"{target} is not part of download {download_id}"
+			)
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+	# Deactivate through the normal path first, so the files leave ~mods and the
+	# folder bookkeeping stays correct rather than being duplicated here.
+	remaining_active = [a for a in active if not _matches(a)]
+	if len(remaining_active) != len(active):
+		set_active_paks(download_id, {"active_paks": remaining_active})
+
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		# The record is the only thing written. Per-pak rows in pak_assets and
+		# friends are left in place: the pak is inactive, so it cannot win a
+		# conflict, and keeping them means a restored file works at once instead
+		# of waiting for the next ingest to re-derive them.
+		from datetime import datetime, timezone
+
+		cur.execute(
+			"INSERT OR REPLACE INTO mod_hidden_files (download_id, pak_name, hidden_at) "
+			"VALUES (?, ?, ?)",
+			(download_id, os.path.basename(target), datetime.now(timezone.utc).isoformat()),
+		)
+		conn.commit()
+
+		remaining = [c for c in contents if not _matches(c)]
+		logger.info(
+			"[remove_download_file] download=%s hidden=%s (%s file(s) left)",
+			download_id,
+			target,
+			len(remaining),
+		)
+		_log_activity(
+			"file_hidden",
+			f"Hid {os.path.basename(target)}",
+			f"download {download_id}",
+		)
+		return {"ok": True, "removed": target, "remaining": len(remaining)}
+	except Exception:
+		conn.rollback()
+		raise
 	finally:
 		try:
 			conn.close()
@@ -6960,7 +9323,19 @@ def set_active_paks(download_id: int, payload: Dict[str, Any] = Body(...)) -> Di
 	try:
 		# candidate paks from contents desired list
 		candidate_paks = [p for p in desired if isinstance(p, str)]
-		tag = _infer_character_tag(cur, name=download_name, pak_candidates=candidate_paks)
+		# Custom tags are keyed the way the rest of the app keys them: the Nexus
+		# mod id, or -(download id) for a local mod that has none. Local mods are
+		# exactly the ones extraction cannot identify, so this is the case that
+		# needed the user's own tag in the first place.
+		effective_mod_id = (
+			mod_id_for_download if mod_id_for_download is not None else -int(download_id)
+		)
+		tag = _infer_character_tag(
+			cur,
+			name=download_name,
+			pak_candidates=candidate_paks,
+			mod_id=effective_mod_id,
+		)
 		if tag:
 			char_folder = mods_dir / _to_folder_name(tag)
 	except Exception:
@@ -7283,6 +9658,26 @@ def set_active_paks(download_id: int, payload: Dict[str, Any] = Body(...)) -> Di
 		conn.close()
 	except Exception:
 		pass
+
+	# Only when something moved. Toggling a mod that is already in the wanted
+	# state is a no-op, and recording those would bury the real actions.
+	if copied or removed:
+		label = download_name or f"download {download_id}"
+		if applied and copied:
+			_log_activity(
+				"activated",
+				f"Enabled {label}",
+				f"{len(copied)} file(s): {', '.join(os.path.basename(c) for c in copied[:4])}",
+			)
+		elif not applied:
+			_log_activity("deactivated", f"Disabled {label}", f"{len(removed)} file(s)")
+		else:
+			_log_activity(
+				"changed",
+				f"Changed which files are on for {label}",
+				f"+{len(copied)} / -{len(removed)}",
+			)
+
 	return {
 		"ok": True,
 		"download_id": download_id,
@@ -7525,6 +9920,38 @@ def get_local_download(download_id: int) -> Dict[str, Any]:
 		except Exception:
 			active_paks = []
 
+		# This is the endpoint the mod's Files tab reads, and it did not filter
+		# removed files -- only list_downloads did. So a rebuild rewrote contents
+		# from the archive and every removed pak was visibly back inside the mod,
+		# which is exactly what the record was supposed to prevent.
+		# Listed from the record, not by partitioning contents: remove-file also
+		# strips the entry from contents, so deriving the hidden list from what
+		# is left there would show nothing until a rebuild happened to put the
+		# row back — the file would vanish with no sign of where it went.
+		try:
+			hidden_contents: List[str] = [
+				r[0]
+				for r in cur.execute(
+					"SELECT pak_name FROM mod_hidden_files WHERE download_id = ? "
+					"ORDER BY pak_name",
+					(download_id,),
+				).fetchall()
+			]
+		except Exception:
+			hidden_contents = []
+		hidden_here = {name.lower() for name in hidden_contents}
+		if hidden_here:
+			contents = [
+				c for c in contents if os.path.basename(str(c)).lower() not in hidden_here
+			]
+			# A hidden file must not stay active: it is out of the list, so there
+			# would be no way to switch it off again.
+			active_paks = [
+				p
+				for p in active_paks
+				if os.path.basename(str(p)).lower() not in hidden_here
+			]
+
 		import logging
 		logger = logging.getLogger("modmanager.api.downloads")
 		actual_active_filenames = _get_actually_active_filenames(logger)
@@ -7559,6 +9986,9 @@ def get_local_download(download_id: int) -> Dict[str, Any]:
 			"version": version,
 			"path": path,
 			"contents": contents,
+			# Returned rather than merely omitted, so the mod can show what it is
+			# hiding and let it back in one file at a time.
+			"hidden_contents": hidden_contents,
 			"active_paks": active_paks,
 			"created_at": created_at,
 			"latest_version": latest_version,
@@ -8111,6 +10541,17 @@ def update_mod_file_state(collection_id: int, file_id: int, body: Dict[str, Any]
 # =============================================================================
 class BackupCreatePayload(BaseModel):
 	name: Optional[str] = None
+	# How many archives to retain after this one is written. None disables the
+	# rotation entirely for callers that want to manage it themselves.
+	keep: Optional[int] = None
+
+
+class BackupPrunePayload(BaseModel):
+	keep: int = 5
+
+
+class BackupDeletePayload(BaseModel):
+	path: str
 
 
 class BackupRestorePayload(BaseModel):
@@ -8123,10 +10564,125 @@ def create_backup_route(payload: Optional[BackupCreatePayload] = Body(default=No
 	"""Snapshot the database + settings into a zip under <data_dir>/backups."""
 	from core.backup import BackupError, create_backup
 
+	from core.backup import DEFAULT_KEEP_BACKUPS
+
+	keep = payload.keep if (payload and payload.keep is not None) else DEFAULT_KEEP_BACKUPS
 	try:
-		return create_backup(name=(payload.name if payload else None))
+		result = create_backup(name=(payload.name if payload else None), keep=keep)
 	except BackupError as exc:
 		raise HTTPException(status_code=400, detail=str(exc))
+
+	_log_activity(
+		"backup",
+		f"Saved snapshot \"{result.get('name')}\"",
+		f"{result.get('total_mods', 0)} mods ({result.get('active_mods', 0)} active)",
+	)
+	return result
+
+
+@app.get("/api/nexus/browse")
+def nexus_browse_route(
+	query: Optional[str] = None,
+	category: Optional[str] = None,
+	author: Optional[str] = None,
+	sort_by: str = "endorsements",
+	descending: bool = True,
+	include_adult: bool = True,
+	offset: int = 0,
+	count: int = 30,
+) -> Dict[str, Any]:
+	"""Search Nexus for mods, so browsing does not require leaving the app.
+
+	Backed by GraphQL v2 rather than the v1 REST API this project uses
+	elsewhere: v1 has no search endpoint at all. The API key is passed when
+	configured but is not required — the mods query answers anonymously.
+	"""
+	from core.nexus.graphql import NexusGraphQLError, normalise_mod, search_mods
+	from core.nexus.nexus_api import get_api_key
+
+	try:
+		nodes, total = search_mods(
+			query=query,
+			category=category,
+			author=author,
+			sort_by=sort_by,
+			descending=descending,
+			include_adult=include_adult,
+			offset=offset,
+			count=count,
+			api_key=get_api_key(),
+		)
+	except NexusGraphQLError as exc:
+		# 502: the failure is upstream, not in the caller's request.
+		raise HTTPException(status_code=502, detail=str(exc))
+
+	mods = [normalise_mod(n) for n in nodes]
+	installed = _installed_nexus_mod_ids()
+	for mod in mods:
+		mod["isInstalled"] = mod["modId"] in installed
+
+	return {
+		"ok": True,
+		"mods": mods,
+		"total": total,
+		"offset": offset,
+		"count": len(mods),
+		"has_more": offset + len(mods) < total,
+	}
+
+
+@app.get("/api/nexus/categories")
+def nexus_categories_route() -> Dict[str, Any]:
+	"""Category names for the browse filter."""
+	from core.nexus.graphql import list_categories
+	from core.nexus.nexus_api import get_api_key
+
+	return {"ok": True, "categories": list_categories(api_key=get_api_key())}
+
+
+def _installed_nexus_mod_ids() -> set:
+	"""Nexus mod ids already present locally, so the browser can mark them.
+
+	Best-effort: showing an "Installed" badge is not worth failing the search
+	over, so a database problem degrades to marking nothing.
+	"""
+	try:
+		conn = get_db()
+		try:
+			rows = conn.execute(
+				"SELECT DISTINCT mod_id FROM local_downloads WHERE mod_id IS NOT NULL"
+			).fetchall()
+			return {int(r[0]) for r in rows if r[0] is not None}
+		finally:
+			conn.close()
+	except Exception as exc:
+		logger.debug("[nexus_browse] Could not read installed mod ids: %s", exc)
+		return set()
+
+
+@app.post("/api/backup/delete")
+def delete_backup_route(payload: BackupDeletePayload) -> Dict[str, Any]:
+	"""Delete one archive chosen by the user."""
+	from core.backup import BackupError as _BackupError
+	from core.backup import delete_backup
+
+	try:
+		return delete_backup(payload.path)
+	except _BackupError as exc:
+		raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/backup/prune")
+def prune_backups_route(payload: BackupPrunePayload) -> Dict[str, Any]:
+	"""Delete all but the newest ``keep`` archives."""
+	from core.backup import BackupError as _BackupError
+	from core.backup import prune_backups
+
+	try:
+		removed = prune_backups(keep=payload.keep)
+	except _BackupError as exc:
+		raise HTTPException(status_code=400, detail=str(exc))
+	return {"ok": True, "removed": removed, "count": len(removed)}
 
 
 @app.get("/api/backup/list")
@@ -8142,16 +10698,125 @@ def list_backups_route() -> Dict[str, Any]:
 	return {"ok": True, "backups": backups, "count": len(backups)}
 
 
+def _read_active_paks() -> Dict[int, List[str]]:
+	"""What each download has active according to the database right now."""
+	state: Dict[int, List[str]] = {}
+	conn = get_db()
+	try:
+		for dl_id, active_json in conn.execute(
+			"SELECT id, active_paks FROM local_downloads"
+		).fetchall():
+			try:
+				parsed = json.loads(active_json) if active_json else []
+			except Exception:
+				parsed = []
+			state[int(dl_id)] = [p for p in parsed if isinstance(p, str) and p] if isinstance(parsed, list) else []
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+	return state
+
+
+def _materialise_active_paks(previous: Dict[int, List[str]]) -> Dict[str, Any]:
+	"""Make the game's ~mods folder match what the database now says is active.
+
+	Restoring a backup replaces mods.db, and mods.db records which paks *should*
+	be active -- but a mod is only really active when its .pak file is sitting in
+	~mods. Nothing was moving those files, so a restore changed a column and
+	nothing else. Worse, it did not even leave the column alone: list_downloads
+	prunes active_paks down to the files it can actually find in ~mods and writes
+	that back, so the restored state was erased by the first refresh afterwards.
+	The user saw "Database restored from snapshot" and no mods came back.
+
+	``previous`` is the activation state captured *before* the database was
+	replaced, i.e. what is really on disk. Writing it back to the row before
+	asking for the target makes set_active_paks see a truthful "from" state, so
+	it both copies in what is missing and deletes what should no longer be there.
+	"""
+	logger = logging.getLogger("modmanager.api")
+	target = _read_active_paks()
+	applied = removed = failed = 0
+
+	for dl_id, desired in sorted(target.items()):
+		was = previous.get(dl_id, [])
+		if not desired and not was:
+			continue
+		if sorted(desired) == sorted(was):
+			# Already what the archive asks for; the files are where they belong.
+			continue
+		try:
+			conn = get_db()
+			try:
+				update_local_download_active_paks(conn, dl_id, was)
+				conn.commit()
+			finally:
+				try:
+					conn.close()
+				except Exception:
+					pass
+			# One rebuild for the whole restore instead of one per mod.
+			set_active_paks(dl_id, {"active_paks": desired, "rebuild_conflicts": False})
+			if desired:
+				applied += 1
+			else:
+				removed += 1
+		except HTTPException as exc:
+			# A mod present in the archive but since deleted from disk cannot be
+			# re-activated. That is expected, not a reason to abort the restore.
+			failed += 1
+			logger.info("[restore] download %s could not be re-activated: %s", dl_id, exc.detail)
+		except Exception as exc:
+			failed += 1
+			logger.warning("[restore] download %s could not be re-activated: %s", dl_id, exc)
+
+	logger.info(
+		"[restore] re-activated=%s deactivated=%s failed=%s", applied, removed, failed
+	)
+	return {"activated": applied, "deactivated": removed, "failed": failed}
+
+
 @app.post("/api/backup/restore")
 def restore_backup_route(payload: BackupRestorePayload) -> Dict[str, Any]:
-	"""Restore a backup archive over the live database."""
+	"""Restore a backup archive over the live database, then apply it to ~mods."""
 	from core.backup import BackupError, restore_backup
 
+	# Captured before the database is replaced: afterwards the rows describe the
+	# archive, and what is actually on disk is unknowable.
+	previous_active = _read_active_paks()
+
 	try:
-		return restore_backup(path=payload.path, remap_paths=payload.remap_paths)
+		result = restore_backup(path=payload.path, remap_paths=payload.remap_paths)
 	except BackupError as exc:
 		# A rejected archive leaves the live database untouched.
 		raise HTTPException(status_code=400, detail=str(exc))
+
+	try:
+		result["reactivated"] = _materialise_active_paks(previous_active)
+	except Exception as exc:
+		# The database is already restored; report the shortfall rather than
+		# failing a restore that did happen.
+		logging.getLogger("modmanager.api").warning(
+			"[restore] could not re-apply active paks: %s", exc
+		)
+		result["reactivated"] = {"activated": 0, "deactivated": 0, "failed": -1}
+
+	try:
+		refresh_conflicts()
+	except Exception as exc:
+		logging.getLogger("modmanager.api").debug(
+			"[restore] conflict rebuild after restore failed: %s", exc
+		)
+
+	re = result.get("reactivated") or {}
+	_log_activity(
+		"restored",
+		f"Restored from {os.path.basename(payload.path)}",
+		f"{re.get('activated', 0)} mod(s) switched back on, "
+		f"{re.get('deactivated', 0)} off, {re.get('failed', 0)} failed",
+	)
+	return result
 
 
 def _record_collection_import_failure(slug_key: str, error: str) -> None:
@@ -8482,6 +11147,16 @@ def assign_mod_id(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 			if not path.exists():
 				continue
 
+			# Resolved BEFORE the row is rewritten. Looking it up afterwards by
+			# the new path depended on normalize_download_path producing exactly
+			# the stored spelling; when it did not, the lookup found nothing and
+			# the user's images were silently left behind under the old key.
+			existing_row = cur.execute(
+				"SELECT id FROM local_downloads WHERE path = ? OR path = ?",
+				(l_path, str(abs_str)),
+			).fetchone()
+			source_mod_id = -int(existing_row[0]) if existing_row else None
+
 			file_size = path.stat().st_size
 			matched_file = None
 			main_file = None
@@ -8550,8 +11225,21 @@ def assign_mod_id(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 				""",
 				(rel_normalized_path, nexus_mod_id, matched_version, l_path, str(abs_str))
 			)
+			# Everything the user attached while the download was unlinked is
+			# keyed by the negated download id. Linking changes which key the app
+			# reads, so without moving these across, the images and tags simply
+			# stopped appearing — indistinguishable from having been deleted, at
+			# the exact moment the user was told the mod was linked.
+			if source_mod_id is not None:
+				moved = _migrate_local_mod_data(cur, source_mod_id, int(nexus_mod_id))
+				if moved["images"] or moved["tags"]:
+					logger.info(
+						"[assign_mod_id] carried %s image(s) and %s tag(s) from %s to %s",
+						moved["images"], moved["tags"], source_mod_id, nexus_mod_id,
+					)
+
 			renamed_count += 1
-			
+
 		conn.commit()
 		if renamed_count > 0:
 			_sync_mod_metadata(conn, mod_id=nexus_mod_id, mod_name=None)

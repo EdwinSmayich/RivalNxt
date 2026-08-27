@@ -1,0 +1,11 @@
+# Windows batch files must keep CRLF endings.
+#
+# cmd.exe does not parse an LF-only .bat correctly: it splits lines in the wrong
+# places, so REM comments start executing as commands and the script dies with
+# "'Builds' is not recognized as an internal or external command". build_local.bat
+# had been normalised to LF and failed exactly that way on a clean checkout.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts must keep LF, or bash reports "\r: command not found".
+*.sh text eol=lf

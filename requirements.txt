@@ -9,5 +9,9 @@ py7zr>=0.20.0
 rarfile>=4.0
 tzdata>=2023.3
 pylocres>=0.1.0
-bbcode>=1.1.0  
+bbcode>=1.1.0
+# Re-encodes uploaded mod artwork before it is stored. Without Pillow the
+# image endpoints fall back to storing originals verbatim, which is what grew
+# mods.db past 2 GB. Keep it declared even though it is imported lazily.
+Pillow>=10.0.0  
  

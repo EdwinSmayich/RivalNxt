@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from core.api.dependencies import get_db
 from core.db.db import get_connection, get_all_characters, get_character_skins
 from core.extraction.service import extract_and_ingest
 
@@ -321,5 +322,86 @@ async def remove_mod_custom_tag(mod_id: int, tag_id: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to remove custom tag: {str(e)}")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Hidden (suppressed) auto-detected tags
+# ---------------------------------------------------------------------------
+# Custom tags are rows the user created, so removing one is a DELETE. Tags
+# derived from Nexus metadata or pak extraction have no row to delete, and
+# deleting them at the source does not stick: extraction recomputes them and the
+# next Nexus sync overwrites them. A suppression row is recorded instead, and
+# the read paths filter against it.
+
+
+class HiddenTagRequest(BaseModel):
+    tag: str
+
+
+@router.get("/mods/{mod_id}/hidden-tags", response_model=List[str])
+async def get_mod_hidden_tags(mod_id: int):
+    """Return the auto-detected tags the user has suppressed for this mod."""
+    # get_db() rather than get_connection(): only the former guarantees
+    # migrations have run, and mod_hidden_tags is new enough that the table may
+    # not exist yet on a database this process has not initialised.
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT tag FROM mod_hidden_tags WHERE mod_id = ? ORDER BY hidden_at",
+            (mod_id,),
+        ).fetchall()
+        return [row[0] for row in rows if row[0]]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch hidden tags: {str(e)}")
+    finally:
+        conn.close()
+
+
+@router.post("/mods/{mod_id}/hidden-tags", status_code=201)
+async def hide_mod_tag(mod_id: int, request: HiddenTagRequest):
+    """Suppress an auto-detected tag for this mod. Idempotent."""
+    tag = request.tag.strip()
+    if not tag:
+        raise HTTPException(status_code=400, detail="Tag cannot be empty")
+    if len(tag) > 100:
+        raise HTTPException(status_code=400, detail="Tag must be 100 characters or fewer")
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO mod_hidden_tags (mod_id, tag) VALUES (?, ?)",
+            (mod_id, tag),
+        )
+        conn.commit()
+        return {"ok": True, "mod_id": mod_id, "tag": tag}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to hide tag: {str(e)}")
+    finally:
+        conn.close()
+
+
+@router.delete("/mods/{mod_id}/hidden-tags/{tag}", response_model=dict)
+async def unhide_mod_tag(mod_id: int, tag: str):
+    """Bring a suppressed tag back.
+
+    Keyed by name rather than row id: the client knows the tag it wants back but
+    never sees the suppression row.
+    """
+    conn = get_db()
+    try:
+        result = conn.execute(
+            "DELETE FROM mod_hidden_tags WHERE mod_id = ? AND tag = ? COLLATE NOCASE",
+            (mod_id, tag.strip()),
+        )
+        conn.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Tag is not hidden")
+        return {"ok": True, "restored": tag}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to restore tag: {str(e)}")
     finally:
         conn.close()

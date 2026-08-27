@@ -7,10 +7,14 @@ import logging
 import os
 import shutil
 import sys
-import time
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+# Concurrent Nexus fetches. Kept low on purpose: Nexus rate-limits per hour and
+# this runs under a single user's API key.
+_SYNC_WORKERS = 4
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -43,6 +47,7 @@ from core.utils.nexus_metadata import (
 )
 from field_prefs import filter_aggregate_payload, load_prefs
 from scripts import ingest_download_assets, rebuild_tags
+from scripts.sync_nexus_to_db import DEFAULT_MAX_AGE_HOURS, _fresh_mod_ids
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -236,9 +241,16 @@ def _sync_mod_metadata(
 	mod_ids: List[int],
 	*,
 	game: str,
-	rate_delay: float,
+	rate_delay: float,  # noqa: ARG001 - see below
 	log: logging.Logger,
 ) -> int:
+	"""Pull Nexus metadata for ``mod_ids`` into the database.
+
+	``rate_delay`` is still accepted because ``--rate-delay`` remains a CLI flag,
+	but it no longer does anything: the per-mod sleep it controlled existed to
+	pace a strictly sequential loop, and the fetches now overlap on a small
+	worker pool instead. Removing the parameter would break callers passing it.
+	"""
 	if not mod_ids:
 		log.info("No mod IDs to sync from Nexus.")
 		return 0
@@ -249,12 +261,51 @@ def _sync_mod_metadata(
 		return 0
 	prefs = load_prefs()
 	processed = 0
-	for idx, mod_id in enumerate(mod_ids, start=1):
-		try:
-			payload = collect_all_for_mod(key, game, mod_id)
-		except Exception as exc:
-			log.error("Failed to fetch Nexus payload for mod %s: %s", mod_id, exc)
-			continue
+
+	# Skip mods this install already asked about recently. The standalone Sync
+	# Nexus task has done this since 0023_mod_sync_freshness; this path never did,
+	# so a bootstrap re-fetched every linked mod unconditionally — three requests
+	# each. On a free Nexus key (100 requests/hour) a library of ~130 linked mods
+	# is ~390 requests, i.e. enough to exhaust the hourly budget in one press and
+	# start failing partway through.
+	#
+	# Nothing is fresh on a genuinely initial build, so the first run is
+	# unaffected; only re-runs within the window get cheaper.
+	fresh = _fresh_mod_ids(conn, mod_ids, DEFAULT_MAX_AGE_HOURS)
+	if fresh:
+		mod_ids = [m for m in mod_ids if m not in fresh]
+		log.info(
+			"Skipping %d mod(s) synced within the last %gh.", len(fresh), DEFAULT_MAX_AGE_HOURS
+		)
+	if not mod_ids:
+		log.info("All linked mods are already up to date.")
+		return 0
+
+	# Fetch in parallel, write serially.
+	#
+	# Each mod costs three blocking HTTP round-trips, and the loop additionally
+	# slept between mods: 128 linked mods meant ~380 sequential requests plus
+	# over a minute of pure sleeping. Overlapping the waiting is the entire win
+	# — collect_all_for_mod touches no database state, so nothing about the
+	# writes below changes. Worker count stays modest because Nexus rate-limits
+	# per hour and this runs under one user's key.
+	log.info("Fetching Nexus metadata for %d mod(s) with %d workers", len(mod_ids), _SYNC_WORKERS)
+	payloads: List[Tuple[int, Any]] = []
+	with ThreadPoolExecutor(max_workers=min(_SYNC_WORKERS, len(mod_ids))) as pool:
+		futures = {pool.submit(collect_all_for_mod, key, game, mid): mid for mid in mod_ids}
+		for future in as_completed(futures):
+			mod_id = futures[future]
+			try:
+				payloads.append((mod_id, future.result()))
+			except Exception as exc:
+				log.error("Failed to fetch Nexus payload for mod %s: %s", mod_id, exc)
+
+	# Restore the caller's ordering so logs and writes stay deterministic.
+	order = {mid: i for i, mid in enumerate(mod_ids)}
+	payloads.sort(key=lambda pair: order.get(pair[0], 0))
+
+	synced_at = datetime.now(timezone.utc).isoformat()
+	for mod_id, payload in payloads:
 		filtered = filter_aggregate_payload(payload, prefs)
 		mod_info_payload = dict(filtered.get("mod_info") or {})
 		desc_text = extract_description_text(filtered.get("description"))
@@ -270,6 +321,20 @@ def _sync_mod_metadata(
 		if not changelog_payload or (isinstance(changelog_payload, dict) and not changelog_payload.get("changelogs")):
 			changelog_payload = derive_changelogs_from_files(filtered.get("files"))
 		replace_mod_changelogs(conn, mod_id, changelog_payload)
+
+		# Stamped only after the payload is stored, so an interrupted run
+		# re-fetches instead of believing it already has the data. Without this
+		# the bootstrap left last_synced_at NULL, which meant the standalone Sync
+		# Nexus task treated every mod as never-synced and refetched the lot.
+		if mod_info_status == 200:
+			try:
+				conn.execute(
+					"UPDATE mods SET last_synced_at = ? WHERE mod_id = ?", (synced_at, mod_id)
+				)
+				conn.commit()
+			except Exception:
+				log.debug("Could not stamp last_synced_at for mod %s", mod_id, exc_info=True)
+
 		log.info(
 			"Synced mod %s (info=%s files=%s changelogs=%s)",
 			mod_id,
@@ -278,8 +343,6 @@ def _sync_mod_metadata(
 			changelog_status,
 		)
 		processed += 1
-		if idx < len(mod_ids):
-			time.sleep(max(0.0, rate_delay))
 	return processed
 
 
@@ -296,6 +359,12 @@ def _run_ingest(
 		ingest_args.extend(["--downloads-root", str(downloads_root)])
 	if not args.no_extract:
 		ingest_args.append("--extract")
+		# A full rebuild must actually rebuild. The standalone ingest skips
+		# downloads whose archive is unchanged, which is right for the everyday
+		# "Rebuild Local Downloads" button but wrong here: this is the button
+		# people press when the database is suspect, and silently skipping would
+		# make it look like it did nothing. Its speedup comes from parallelism.
+		ingest_args.append("--force")
 	try:
 		rc = ingest_download_assets.main(ingest_args)
 		if rc != 0:

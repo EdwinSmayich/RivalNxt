@@ -8,7 +8,17 @@ import {
   categoriesMatchTag,
   extractNonCategoryTags,
 } from "../lib/categoryUtils";
-import { lookupTags, type TagLookupResponse } from "../lib/api";
+import {
+  bulkActivate,
+  bulkTag,
+  deleteLocalDownloads,
+  lookupTags,
+  type TagLookupResponse,
+} from "../lib/api";
+import { BulkActionBar } from "./BulkActionBar";
+import { Button } from "./ui/button";
+import { CheckSquare } from "lucide-react";
+import { toast } from "sonner";
 
 interface DownloadsPageProps {
   mods: Mod[];
@@ -57,6 +67,13 @@ export function DownloadsPage({
     "overview" | "files" | "changelog" | "images" | "assets"
   >("overview");
   const [tagLookupMap, setTagLookupMap] = useState<TagLookupResponse>({});
+
+  // ── Bulk selection ────────────────────────────────────────────────────────
+  // Keyed by the card's own id so the set survives the list re-sorting or
+  // re-filtering underneath it.
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   // Build a stable signature of all tags so we re-fetch only when tags actually change
   const tagsSignature = useMemo(() => {
@@ -342,6 +359,99 @@ export function DownloadsPage({
     sortOrder,
   ]);
 
+  const cardKey = (mod: Mod) => String(mod.backendModId ?? mod.id);
+  const selectedMods = useMemo(
+    () => filteredMods.filter((m) => selectedIds.has(cardKey(m))),
+    [filteredMods, selectedIds],
+  );
+
+  const exitSelection = () => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  };
+
+  const toggleSelect = (mod: Mod) => {
+    const key = cardKey(mod);
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  /** Download ids behind the selection — what activation actually operates on. */
+  const selectedDownloadIds = () =>
+    selectedMods.flatMap((m) =>
+      (m.sourceDownloadIds ?? []).map(Number).filter(Number.isFinite),
+    );
+
+  /** Mod ids, using the same negative-id convention as everywhere else. */
+  const selectedModIds = () =>
+    selectedMods
+      .map((m) => {
+        if (m.backendModId != null) return Number(m.backendModId);
+        const downloads = m.sourceDownloadIds ?? [];
+        return downloads.length > 0 ? -Number(downloads[0]) : null;
+      })
+      .filter((id): id is number => id != null && Number.isFinite(id));
+
+  const runBulk = async (label: string, work: () => Promise<string>) => {
+    setBulkBusy(true);
+    const toastId = "bulk-op";
+    toast.loading(label, { id: toastId });
+    try {
+      const summary = await work();
+      toast.success(summary, { id: toastId });
+      exitSelection();
+      onRefresh?.();
+      onConflictStateChanged?.();
+    } catch (err) {
+      toast.error(
+        `Failed: ${err instanceof Error ? err.message : String(err)}`,
+        { id: toastId },
+      );
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  const handleBulkActivate = (activate: boolean) => {
+    const ids = selectedDownloadIds();
+    if (ids.length === 0) return;
+    void runBulk(
+      `${activate ? "Enabling" : "Disabling"} ${selectedMods.length} mod(s)…`,
+      async () => {
+        const r = await bulkActivate(ids, activate);
+        const extra = [
+          r.skipped ? `${r.skipped} already ${activate ? "on" : "off"}` : "",
+          r.failed ? `${r.failed} failed` : "",
+        ]
+          .filter(Boolean)
+          .join(", ");
+        return `${activate ? "Enabled" : "Disabled"} ${r.changed} mod(s)${extra ? ` · ${extra}` : ""}`;
+      },
+    );
+  };
+
+  const handleBulkTag = (tag: string) => {
+    const ids = selectedModIds();
+    if (ids.length === 0) return;
+    void runBulk(`Tagging ${ids.length} mod(s)…`, async () => {
+      const r = await bulkTag(ids, tag);
+      return `Tagged ${r.added} mod(s) "${r.tag}"${r.skipped ? ` · ${r.skipped} already had it` : ""}`;
+    });
+  };
+
+  const handleBulkDelete = () => {
+    const ids = selectedDownloadIds();
+    if (ids.length === 0) return;
+    void runBulk(`Deleting ${selectedMods.length} mod(s)…`, async () => {
+      const r = await deleteLocalDownloads(ids);
+      return `Deleted ${r.deleted} mod(s)`;
+    });
+  };
+
   return (
     <>
       <div className="flex flex-col h-full">
@@ -357,6 +467,35 @@ export function DownloadsPage({
           onSortOrderChange={setSortOrder}
           onModAdded={onModAdded}
         />
+
+        {selectionMode ? (
+          <BulkActionBar
+            count={selectedMods.length}
+            total={filteredMods.length}
+            busy={bulkBusy}
+            onEnable={() => handleBulkActivate(true)}
+            onDisable={() => handleBulkActivate(false)}
+            onTag={handleBulkTag}
+            onDelete={handleBulkDelete}
+            onSelectAll={() => setSelectedIds(new Set(filteredMods.map(cardKey)))}
+            onClear={exitSelection}
+          />
+        ) : (
+          filteredMods.length > 1 && (
+            <div className="flex justify-end px-6 py-2 border-b border-border/40">
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => setSelectionMode(true)}
+                title="Pick several mods and act on them at once"
+              >
+                <CheckSquare className="w-4 h-4" />
+                Select mods
+              </Button>
+            </div>
+          )
+        )}
 
         {/* Mods grid/list */}
         <style>{`.custom-scrollbar::-webkit-scrollbar {
@@ -435,6 +574,9 @@ export function DownloadsPage({
                     onOpenFilesTab={handleOpenFilesTab}
                     onAssignModId={onAssignModId}
                     onRefresh={onRefresh}
+                    selectable={selectionMode}
+                    selected={selectedIds.has(cardKey(mod))}
+                    onToggleSelect={toggleSelect}
                   />
                 )}
               />

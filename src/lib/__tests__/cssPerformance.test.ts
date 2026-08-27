@@ -172,26 +172,42 @@ describe("index.css transition hygiene", () => {
     expect(willChange).not.toMatch(/\bgap\b/);
   });
 
-  it(".header-action-text animates transform, not max-width", () => {
+  it(".header-action-text never animates a layout property", () => {
     const block = /\.header-action-text\s*\{([^}]*)\}/.exec(css);
     expect(block).not.toBeNull();
     const body = block![1];
     const transition = /transition:\s*([^;]+)/.exec(body)?.[1] ?? "";
-    expect(transition).toMatch(/\btransform\b/);
-    expect(transition).not.toMatch(/\bmax-width\b/);
-
-    const willChange = /will-change:\s*([^;]+)/.exec(body)?.[1] ?? "";
-    expect(willChange).not.toMatch(/\bmax-width\b/);
-    expect(willChange).toMatch(/\btransform\b/);
+    for (const prop of ["max-width", "width", "margin", "padding"]) {
+      expect(transition, `.header-action-text animates ${prop}`).not.toMatch(
+        new RegExp(`\\b${prop}\\b`),
+      );
+    }
   });
 
-  it("the hover reveal still exists (behaviour preserved)", () => {
-    // The label must still become visible on hover, or the fix broke the UI.
-    expect(css).toMatch(/\.header-action-btn:hover\s+\.header-action-text/);
-    const hoverBlock = /\.header-action-btn:hover\s+\.header-action-text[^{]*\{([^}]*)\}/.exec(css);
-    expect(hoverBlock).not.toBeNull();
-    expect(hoverBlock![1]).toMatch(/opacity:\s*1/);
-    expect(hoverBlock![1]).toMatch(/scaleX\(1\)/);
+  it("no hover rule changes the size of a header action", () => {
+    // Regression: the label was revealed by flipping `width: 0` to `width: auto`
+    // (plus a margin) on :hover. That reflows the whole header row, so moving
+    // the pointer across the actions visibly shoved every neighbouring button
+    // around. Whatever the reveal mechanism is, it must not resize anything.
+    const LAYOUT = ["width", "max-width", "min-width", "margin", "margin-left", "padding", "gap"];
+    const offenders: string[] = [];
+
+    const hoverBlocks = css.matchAll(/\.header-action[^{]*:(?:hover|focus-visible)[^{]*\{([^}]*)\}/g);
+    for (const match of hoverBlocks) {
+      for (const decl of match[1].split(";")) {
+        const prop = decl.split(":")[0]?.trim().toLowerCase();
+        if (prop && LAYOUT.includes(prop)) {
+          offenders.push(`${prop} in "${match[0].split("{")[0].trim()}"`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("header labels are shown by viewport width, not by hover", () => {
+    // What makes the header usable without maximising the window: the labels
+    // collapse on narrow viewports and `title` carries the name instead.
+    expect(css).toMatch(/@media\s*\(min-width:[^)]*\)\s*\{\s*\.header-action-text/);
   });
 
   it("respects prefers-reduced-motion for the reveal", () => {

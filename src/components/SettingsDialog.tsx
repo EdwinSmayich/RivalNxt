@@ -114,6 +114,22 @@ const TASKS: Array<{
     description:
       "Clean up older versions of mods when a newer version is already installed locally.",
   },
+  {
+    key: "compact_images" as SettingsTask,
+    label: "Compact Mod Artwork",
+    description:
+      "Shrink oversized mod images and reclaim the space. Backs up first.",
+  },
+  {
+    key: "dedupe_images" as SettingsTask,
+    label: "Remove Duplicate Images",
+    description: "Delete repeated copies of the same picture, keeping the first.",
+  },
+  {
+    key: "reorganize_mods" as SettingsTask,
+    label: "Sort Mods Into Folders",
+    description: "Move already-active mods into their character folders in ~mods.",
+  },
 ];
 
 function formatTimestamp(value?: string | null): string | null {
@@ -137,7 +153,6 @@ export function SettingsDialog({
 }: SettingsDialogProps) {
   const [formValues, setFormValues] =
     useState<SettingsFormValues>(EMPTY_SETTINGS);
-
   useEffect(() => {
     if (!open) {
       setFormValues(EMPTY_SETTINGS);
@@ -737,6 +752,17 @@ export function SettingsDialog({
                           value={formValues.aes_key_hex}
                           onChange={handleInputChange("aes_key_hex")}
                         />
+                        {/* The field was labelled "AES key" with no explanation,
+                            so it read like a credential someone had to supply. */}
+                        <p className="text-xs text-muted-foreground">
+                          Lets the app read what is <em>inside</em> a mod's .pak
+                          files — the asset list used for tags and conflict
+                          detection. Marvel Rivals encrypts that index with one
+                          key shared by all players, and it is already filled in.
+                          Installing and enabling mods works without it; only the
+                          asset list goes empty. Change it only if a game update
+                          changes the key.
+                        </p>
                       </div>
 
                       <div
@@ -792,6 +818,7 @@ export function SettingsDialog({
                       outputs are captured for review.
                     </p>
                   </div>
+
 
                   <div
                     style={{
@@ -1000,6 +1027,7 @@ export function SettingsDialog({
                                   task={task.key}
                                   output={outputText}
                                   isRunning={isRunning}
+                                  startedAt={result?.started_at ?? null}
                                   fallbackMinHeight="h-24"
                                 />
                               </div>

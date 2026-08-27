@@ -125,3 +125,30 @@ export async function invokeSaveTextFile(
 export async function invokeReadTextFile(path: string): Promise<string> {
   return await invoke<string>("read_text_file", { path });
 }
+
+/**
+ * Put text on the clipboard.
+ *
+ * navigator.clipboard needs a secure context, which the Tauri webview is, but
+ * the textarea fallback costs three lines and covers the dev server over plain
+ * http as well as any future webview that refuses permission.
+ */
+export async function copyToClipboard(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    // Fall through to the manual approach.
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  try {
+    document.execCommand("copy");
+  } finally {
+    document.body.removeChild(area);
+  }
+}

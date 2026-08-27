@@ -23,6 +23,7 @@ import {
 } from "./ui/dropdown-menu";
 import { useTheme } from "./ThemeProvider";
 import { useNsfwFilter } from "./NSFWFilterProvider";
+import { AdultContentToggle } from "./AdultContentToggle";
 
 interface SearchHeaderProps {
   searchQuery: string;
@@ -176,33 +177,7 @@ export function SearchHeader({
           {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
         </Button>
 
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={toggleNsfwBlur}
-          title={
-            nsfwBlurEnabled
-              ? "NSFW content is blurred (click to show)"
-              : "NSFW content is visible (click to blur)"
-          }
-          className="relative px-2"
-          style={!nsfwBlurEnabled ? { border: "2px solid #ef4444" } : undefined}
-        >
-          <img
-            src="/icons/18-plus.svg"
-            alt="18+"
-            className="w-4 h-4"
-            style={{ filter: "brightness(0) invert(1)" }}
-          />
-          {nsfwBlurEnabled && (
-            <span className="absolute inset-0 flex items-center justify-center">
-              <span
-                className="w-[70%] h-0.5 rotate-[-20deg] rounded-full"
-                style={{ backgroundColor: "#ef4444" }}
-              />
-            </span>
-          )}
-        </Button>
+        <AdultContentToggle shown={!nsfwBlurEnabled} onToggle={toggleNsfwBlur} />
       </div>
       {/* Add Mods Modal */}
       <AddModModal

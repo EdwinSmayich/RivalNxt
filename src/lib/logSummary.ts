@@ -405,6 +405,7 @@ function summarizeIngest(raw: string): ParsedSummary {
   const lines = splitLines(raw);
   let total: number | null = null;
   let processed = 0;
+  let skipped = 0;
   let sawCompletionLine = false;
   const seen = new Set<string>();
   const seenArchivePaths = new Set<string>();
@@ -413,6 +414,18 @@ function summarizeIngest(raw: string): ParsedSummary {
     const found = matchNumber(line, /found\s+(\d+)\s+download row\(s\)/i);
     if (found !== null) {
       total = found;
+      return;
+    }
+
+    // Archives whose fingerprint is unchanged are not re-extracted, so they
+    // never appear as processed. Counting them is what lets the step reach 213
+    // of 213 instead of stalling at the 2 that actually needed work.
+    const unchanged = matchNumber(
+      line,
+      /skipping\s+(\d+)\s+unchanged\s+download/i,
+    );
+    if (unchanged !== null) {
+      skipped = unchanged;
       return;
     }
 
@@ -486,15 +499,28 @@ function summarizeIngest(raw: string): ParsedSummary {
     return { supported: false, steps: [] };
   }
 
+  // The script's closing "Processed N archive(s)" line is the authority on
+  // whether the run finished. Requiring processed >= total instead meant that
+  // once unchanged archives started being skipped, a completed run reporting
+  // "2 of 213" was rendered as still active and the spinner never stopped.
+  const accountedFor = processed + skipped;
   const completed =
-    total !== null ? processed >= total && total >= 0 : sawCompletionLine;
+    sawCompletionLine || (total !== null && total >= 0 && accountedFor >= total);
   const status: StepStatus = completed ? "done" : "active";
   const label = status === "done" ? "Extracted mods" : "Extracting mods";
 
   const boundedProcessed =
     total !== null ? Math.min(processed, total) : processed;
+  const boundedAccountedFor =
+    total !== null ? Math.min(accountedFor, total) : accountedFor;
 
   const detail = (() => {
+    if (skipped > 0) {
+      const suffix = total !== null ? ` of ${total}` : "";
+      return boundedProcessed > 0
+        ? `Extracted ${boundedProcessed}${suffix}; ${skipped} already up to date`
+        : `All ${skipped} archive(s) already up to date`;
+    }
     if (total !== null) {
       return `Processed ${boundedProcessed} of ${total} archive(s)`;
     }
@@ -514,8 +540,10 @@ function summarizeIngest(raw: string): ParsedSummary {
       {
         id: "ingest",
         label,
+        // The bar tracks everything accounted for, not just what was extracted,
+        // so a run that skipped 211 unchanged archives still fills.
         status,
-        current: boundedProcessed || undefined,
+        current: boundedAccountedFor || undefined,
         total: total ?? undefined,
         detail,
       },

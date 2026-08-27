@@ -220,9 +220,14 @@ def test_rollback_handlers_were_preserved():
     src = Path(server.__file__).read_text(encoding="utf-8")
     # Four write endpoints previously did logger.error + conn.rollback() + raise 500.
     # They must still roll back, then re-raise so the global handler assigns an id.
-    assert src.count("conn.rollback()\n\t\traise") == 4, (
-        "rollback-then-reraise blocks were lost or duplicated during the 500 "
-        f"cleanup (found {src.count('conn.rollback()' + chr(10) + chr(9) * 2 + 'raise')})"
+    #
+    # A lower bound, not an exact count: this guards against the blocks being
+    # *lost*, and an exact count fails whenever a new write endpoint correctly
+    # adopts the same pattern — punishing the behaviour the test exists to
+    # enforce. The "no bare 500" assertion below is what keeps the shape honest.
+    found = src.count("conn.rollback()\n\t\traise")
+    assert found >= 4, (
+        f"rollback-then-reraise blocks were lost during the 500 cleanup (found {found}, expected at least 4)"
     )
     # And none of them may still convert the error into a bare 500.
     assert "conn.rollback()\n\t\traise HTTPException" not in src

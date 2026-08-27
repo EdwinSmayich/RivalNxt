@@ -214,7 +214,10 @@ export type SettingsTask =
   | "rebuild_conflicts"
   | "bootstrap_rebuild"
   | "rebuild_character_data"
-  | "delete_outdated_versions";
+  | "delete_outdated_versions"
+  | "compact_images"
+  | "dedupe_images"
+  | "reorganize_mods";
 
 export type ApiSettingsTaskStatus =
   | "pending"
@@ -745,12 +748,16 @@ export type ModImage = {
   filename?: string;
   mimeType?: string;
   uploadedAt?: string;
+  /** Explicitly starred as the mod's card preview. */
+  isPreview?: boolean;
 };
 
 export type ApiModImagesResponse = {
   ok: boolean;
   nexus_images: ModImage[];
   custom_images: ModImage[];
+  /** True when the mod has a Nexus picture but the user removed it from the list. */
+  nexus_image_hidden?: boolean;
 };
 
 export async function fetchModImages(modId: number): Promise<ModImage[]> {
@@ -758,6 +765,311 @@ export async function fetchModImages(modId: number): Promise<ModImage[]> {
     `/api/mods/${modId}/images`,
   );
   return [...response.nexus_images, ...response.custom_images];
+}
+
+/** Images plus whether the Nexus picture is currently hidden. */
+export async function fetchModImagesDetailed(
+  modId: number,
+): Promise<{ images: ModImage[]; nexusHidden: boolean }> {
+  const response = await getJson<ApiModImagesResponse>(
+    `/api/mods/${modId}/images`,
+  );
+  return {
+    images: [...response.nexus_images, ...response.custom_images],
+    nexusHidden: Boolean(response.nexus_image_hidden),
+  };
+}
+
+// ─── Activity history ────────────────────────────────────────────────────────
+
+export type ActivityEntry = {
+  id: number;
+  at: string;
+  kind: string;
+  summary: string;
+  detail: string | null;
+};
+
+/**
+ * What the app did recently, newest first.
+ *
+ * Toasts vanish after four seconds, so "did that actually apply?" had no answer
+ * short of reading backend.log. This is the same events in plain language.
+ */
+export async function listActivity(limit = 100): Promise<ActivityEntry[]> {
+  const response = await getJson<{ ok: boolean; entries: ActivityEntry[] }>(
+    `/api/activity?limit=${limit}`,
+  );
+  return response.entries ?? [];
+}
+
+export async function clearActivity(): Promise<{ ok: boolean; removed: number }> {
+  return postJson<Record<string, never>, { ok: boolean; removed: number }>(
+    `/api/activity/clear`,
+    {},
+  );
+}
+
+// ─── Bulk operations ─────────────────────────────────────────────────────────
+
+/**
+ * Turn several mods on or off at once.
+ *
+ * A single call rather than one per mod because the conflict rebuild that
+ * follows each activation is the expensive part; batching it is the whole point.
+ */
+export async function bulkActivate(
+  downloadIds: number[],
+  activate: boolean,
+): Promise<{ ok: boolean; changed: number; skipped: number; failed: number }> {
+  return postJson<
+    { download_ids: number[]; activate: boolean },
+    { ok: boolean; changed: number; skipped: number; failed: number }
+  >(`/api/local_downloads/bulk-activate`, {
+    download_ids: downloadIds,
+    activate,
+  });
+}
+
+/** Add one tag to several mods. */
+export async function bulkTag(
+  modIds: number[],
+  tag: string,
+): Promise<{ ok: boolean; added: number; skipped: number; tag: string }> {
+  return postJson<
+    { mod_ids: number[]; tag: string },
+    { ok: boolean; added: number; skipped: number; tag: string }
+  >(`/api/mods/bulk-tag`, { mod_ids: modIds, tag });
+}
+
+// ─── Per-pak notes and removals ──────────────────────────────────────────────
+
+export type ModFileNote = { note: string; updatedAt: string };
+
+/**
+ * Notes the user wrote against individual .pak files.
+ *
+ * Mods routinely ship a dozen variants called A_rogueVA / A_rogueVB / A_rogueVC,
+ * which say nothing about what they change. Keyed by pak name so a rebuild that
+ * renumbers rows cannot orphan them.
+ */
+export async function getFileNotes(
+  downloadId: number,
+): Promise<Record<string, ModFileNote>> {
+  const response = await getJson<{ ok: boolean; notes: Record<string, ModFileNote> }>(
+    `/api/local_downloads/${downloadId}/file-notes`,
+  );
+  return response.notes ?? {};
+}
+
+/** Save a note, or clear it by passing an empty string. */
+export async function setFileNote(
+  downloadId: number,
+  pakName: string,
+  note: string,
+): Promise<{ ok: boolean; pak_name: string; note: string }> {
+  return postJson<
+    { pak_name: string; note: string },
+    { ok: boolean; pak_name: string; note: string }
+  >(`/api/local_downloads/${downloadId}/file-notes`, { pak_name: pakName, note });
+}
+
+export type HiddenModFile = {
+  download_id: number;
+  pak_name: string;
+  hidden_at: string;
+  mod_name: string | null;
+};
+
+/**
+ * Paks the user removed from their mods.
+ *
+ * Removals used to live only in local_downloads.contents, which every rebuild
+ * overwrites from the archive — so they all came back. They are recorded
+ * separately now, and this is what lets the app offer to undo them.
+ */
+export async function listHiddenFiles(): Promise<HiddenModFile[]> {
+  const response = await getJson<{ ok: boolean; files: HiddenModFile[] }>(
+    `/api/local_downloads/hidden-files`,
+  );
+  return response.files ?? [];
+}
+
+/** Stop hiding removed paks. Omit ids to restore every one of them. */
+export async function restoreHiddenFiles(
+  downloadIds?: number[],
+): Promise<{ ok: boolean; restored: number }> {
+  return postJson<{ download_ids?: number[] }, { ok: boolean; restored: number }>(
+    `/api/local_downloads/hidden-files/restore`,
+    downloadIds && downloadIds.length > 0 ? { download_ids: downloadIds } : {},
+  );
+}
+
+/**
+ * Delete a pak from the mod's archive for good.
+ *
+ * The destructive counterpart to removeDownloadFile, which only hides. The
+ * archive is rewritten on disk, so a rebuild cannot bring the file back.
+ */
+export async function deleteDownloadFile(
+  downloadId: number,
+  pakName: string,
+): Promise<{ ok: boolean; deleted: string; members_removed: number }> {
+  return postJson<
+    { pak_name: string },
+    { ok: boolean; deleted: string; members_removed: number }
+  >(`/api/local_downloads/${downloadId}/delete-file`, { pak_name: pakName });
+}
+
+/**
+ * Put one removed pak back into a mod.
+ *
+ * Takes effect immediately: the file was never deleted, and hiding is applied
+ * when the mod is read, so nothing has to be rebuilt.
+ */
+export async function restoreDownloadFile(
+  downloadId: number,
+  pakName: string,
+): Promise<{ ok: boolean; restored: number; pak_name: string }> {
+  return postJson<
+    { pak_name: string },
+    { ok: boolean; restored: number; pak_name: string }
+  >(`/api/local_downloads/${downloadId}/restore-file`, { pak_name: pakName });
+}
+
+/** One image found inside a mod's own archive. */
+export type ArchiveImage = {
+  /** Path inside the archive — the handle used to import it. */
+  entry: string;
+  name: string;
+  width: number;
+  height: number;
+  bytes: number;
+  /** Small JPEG data URL, for the picker only. */
+  thumbnail: string;
+};
+
+/**
+ * Images shipped inside the mod's own archive.
+ *
+ * Nexus publishes one picture per mod and its API exposes no gallery, so this
+ * is where the other variants actually live — and it works for hand-made .pak
+ * drops that were never on Nexus at all. Nothing is stored by this call.
+ */
+export async function listArchiveImages(
+  downloadId: number,
+): Promise<{ images: ArchiveImage[]; reason?: string }> {
+  const response = await getJson<{
+    ok: boolean;
+    images: ArchiveImage[];
+    reason?: string;
+  }>(`/api/local_downloads/${downloadId}/archive-images`);
+  return { images: response.images ?? [], reason: response.reason };
+}
+
+/** A cover image of some Nexus mod matching a character or skin name. */
+export type NexusImageResult = {
+  url: string;
+  thumbnail: string;
+  modName: string;
+  modId: number;
+  author: string;
+  adult: boolean;
+  /** Which search phrase found it — the full one means an exact skin match. */
+  matchedTerm: string;
+  /** True when the image belongs to this very mod, not a similar one. */
+  ownMod?: boolean;
+};
+
+/**
+ * Cover pictures of Nexus mods matching a name.
+ *
+ * For a mod that ships no artwork of its own. This is not that mod's gallery —
+ * the mod page is behind a Cloudflare JavaScript challenge that 403s automated
+ * requests — but other mods for the same character are reachable through the
+ * search API, which is the same path Browse Nexus already uses.
+ */
+export async function searchNexusImages(
+  query: string,
+  count = 24,
+  modId?: number | null,
+): Promise<NexusImageResult[]> {
+  // Passing the mod id puts that mod's own pictures at the front — the cover
+  // plus any gallery links its author wrote into the description. That is
+  // everything Nexus will give up for a specific mod.
+  const linked = modId != null && modId > 0 ? `&mod_id=${modId}` : "";
+  const response = await getJson<{ ok: boolean; images: NexusImageResult[] }>(
+    `/api/nexus/image-search?query=${encodeURIComponent(query)}&count=${count}${linked}`,
+  );
+  return response.images ?? [];
+}
+
+/** A Nexus mod this download might be, offered when assigning a mod id. */
+export type ModIdSuggestion = {
+  modId: number;
+  name: string;
+  author: string;
+  thumbnail: string | null;
+  modPageUrl: string;
+  adult: boolean;
+  matchedTerm: string;
+};
+
+/**
+ * Nexus mods a download is plausibly a copy of.
+ *
+ * Assigning an id meant reading it off the website and typing it in. The
+ * download's own file name and tags are enough to offer candidates — but they
+ * stay suggestions, because a wrong id silently attaches the wrong artwork.
+ */
+export async function suggestModIds(
+  downloadId: number,
+  count = 8,
+): Promise<{ suggestions: ModIdSuggestion[]; currentModId: number | null; searchedFor: string[] }> {
+  const response = await getJson<{
+    ok: boolean;
+    suggestions: ModIdSuggestion[];
+    currentModId: number | null;
+    searchedFor: string[];
+  }>(`/api/local_downloads/${downloadId}/mod-id-suggestions?count=${count}`);
+  return {
+    suggestions: response.suggestions ?? [],
+    currentModId: response.currentModId ?? null,
+    searchedFor: response.searchedFor ?? [],
+  };
+}
+
+/** Store the chosen archive images against the mod. Duplicates are skipped. */
+export async function importArchiveImages(
+  downloadId: number,
+  entries: string[],
+): Promise<{
+  ok: boolean;
+  mod_id: number;
+  imported: number;
+  duplicates: number;
+  failed: number;
+}> {
+  return postJson<
+    { entries: string[] },
+    { ok: boolean; mod_id: number; imported: number; duplicates: number; failed: number }
+  >(`/api/local_downloads/${downloadId}/archive-images/import`, { entries });
+}
+
+/**
+ * Remove the Nexus picture from a mod's gallery, or put it back.
+ *
+ * Nothing is deleted upstream — the app just stops offering it, so this is
+ * reversible and safe to hand to a delete button.
+ */
+export async function setNexusImageHidden(
+  modId: number,
+  hidden: boolean,
+): Promise<{ ok: boolean; hidden: boolean }> {
+  return postJson<Record<string, never>, { ok: boolean; hidden: boolean }>(
+    `/api/mods/${modId}/images/nexus/${hidden ? "hide" : "show"}`,
+    {},
+  );
 }
 
 export async function uploadModImages(
@@ -813,6 +1125,23 @@ export async function uploadModImagesBase64(
   );
 }
 
+/**
+ * Persist a user-chosen image order. The first id becomes the card preview.
+ *
+ * Ordering was upload order with no way to change it, and the preview endpoint
+ * selected the lowest row id, so a better screenshot added later could never be
+ * promoted.
+ */
+export async function reorderModImages(
+  modId: number,
+  imageIds: number[],
+): Promise<{ ok: boolean; order: number[] }> {
+  return postJson<{ image_ids: number[] }, { ok: boolean; order: number[] }>(
+    `/api/mods/${modId}/images/reorder`,
+    { image_ids: imageIds },
+  );
+}
+
 export async function deleteModImage(
   imageId: number,
 ): Promise<{ ok: boolean; deleted_id: number }> {
@@ -821,23 +1150,68 @@ export async function deleteModImage(
   );
 }
 
+export type ModCustomPreviews = {
+  /** modId -> data URL of the image to show on the card. */
+  images: Record<number, string>;
+  /**
+   * Mods where the user explicitly starred an image.
+   *
+   * The card used to prefer the Nexus picture_url unconditionally, so a chosen
+   * image never showed for a mod linked with Assign Mod ID. Only an explicit
+   * choice may outrank the Nexus artwork — "first custom image" is a default,
+   * not a decision.
+   */
+  explicit: Set<number>;
+};
+
 export async function getModCustomImagePreviews(
   modIds: number[],
-): Promise<Record<number, string>> {
+): Promise<ModCustomPreviews> {
   if (!modIds || modIds.length === 0) {
-    return {};
+    return { images: {}, explicit: new Set() };
   }
   const idsParam = modIds.join(",");
   const response = await getJson<{
     ok: boolean;
     images: Record<string, string>;
+    explicit?: string[];
   }>(`/api/mods/custom-images-preview?mod_ids=${encodeURIComponent(idsParam)}`);
   // Convert string keys to number keys
-  const result: Record<number, string> = {};
+  const images: Record<number, string> = {};
   for (const [key, value] of Object.entries(response.images)) {
-    result[Number(key)] = value;
+    images[Number(key)] = value;
   }
-  return result;
+  return {
+    images,
+    explicit: new Set((response.explicit ?? []).map(Number)),
+  };
+}
+
+/**
+ * Remove one pak from a mod without deleting the whole mod.
+ *
+ * The source archive is untouched — re-running "Rebuild Local Downloads"
+ * restores the file.
+ */
+export async function removeDownloadFile(
+  downloadId: number,
+  pakName: string,
+): Promise<{ ok: boolean; removed: string; remaining: number }> {
+  return postJson<
+    { pak_name: string },
+    { ok: boolean; removed: string; remaining: number }
+  >(`/api/local_downloads/${downloadId}/remove-file`, { pak_name: pakName });
+}
+
+/** Mark an image as the mod's card preview. */
+export async function setModImagePreview(
+  modId: number,
+  imageId: number,
+): Promise<{ ok: boolean }> {
+  return postJson<Record<string, never>, { ok: boolean }>(
+    `/api/mods/${modId}/images/${imageId}/preview`,
+    {},
+  );
 }
 
 // Downloads
@@ -848,6 +1222,8 @@ export type ApiDownload = {
   version: string | null;
   path: string;
   contents: string[];
+  /** Files removed from this mod, kept out of `contents` until restored. */
+  hidden_contents?: string[];
   active_paks: string[];
   // Client-side aggregation helper: when grouping multiple local_downloads for the same mod,
   // keep track of which download rows were merged.
@@ -1408,6 +1784,135 @@ export async function getAllCustomTags(): Promise<string[]> {
   return getJson<string[]>(`/api/mods/all-custom-tags`);
 }
 
+// ── Nexus browsing ──────────────────────────────────────────────────────────
+// Backed by Nexus GraphQL v2. The v1 REST API used elsewhere in this file has
+// no search endpoint at all, which is why browsing previously meant leaving the
+// app for the website.
+
+export type NexusBrowseMod = {
+  modId: number;
+  name: string;
+  summary: string;
+  version: string;
+  author: string;
+  uploaderProfileUrl: string | null;
+  adult: boolean;
+  downloads: number;
+  endorsements: number;
+  createdAt: string | null;
+  updatedAt: string | null;
+  pictureUrl: string | null;
+  thumbnailUrl: string | null;
+  category: string;
+  modPageUrl: string | null;
+  isInstalled: boolean;
+};
+
+export type NexusBrowseResult = {
+  ok: boolean;
+  mods: NexusBrowseMod[];
+  total: number;
+  offset: number;
+  count: number;
+  has_more: boolean;
+};
+
+export type NexusSortField =
+  | "endorsements"
+  | "downloads"
+  | "createdAt"
+  | "updatedAt"
+  | "name";
+
+/** Category names offered in the browse filter. */
+export async function listNexusCategories(): Promise<string[]> {
+  const data = await getJson<{ ok: boolean; categories: string[] }>(
+    "/api/nexus/categories",
+  );
+  return data.categories ?? [];
+}
+
+export async function browseNexus(options: {
+  query?: string;
+  category?: string;
+  author?: string;
+  sortBy?: NexusSortField;
+  descending?: boolean;
+  includeAdult?: boolean;
+  offset?: number;
+  count?: number;
+} = {}): Promise<NexusBrowseResult> {
+  const params = new URLSearchParams();
+  if (options.query) params.set("query", options.query);
+  if (options.category) params.set("category", options.category);
+  if (options.author) params.set("author", options.author);
+  if (options.sortBy) params.set("sort_by", options.sortBy);
+  if (options.descending !== undefined) params.set("descending", String(options.descending));
+  if (options.includeAdult !== undefined) {
+    params.set("include_adult", String(options.includeAdult));
+  }
+  if (options.offset !== undefined) params.set("offset", String(options.offset));
+  if (options.count !== undefined) params.set("count", String(options.count));
+
+  return getJson<NexusBrowseResult>(`/api/nexus/browse?${params.toString()}`);
+}
+
+/**
+ * Store images from URLs the user pasted.
+ *
+ * Neither Nexus API exposes a mod's gallery — the Mod type carries one picture
+ * in several sizes, and the media query cannot be narrowed to a mod — so this
+ * is the user-driven way to attach the rest of a mod's screenshots.
+ */
+export async function uploadModImagesByUrl(
+  modId: number,
+  urls: string[],
+): Promise<{
+  ok: boolean;
+  uploaded_count: number;
+  image_ids: number[];
+  failures: { url: string; error: string }[];
+}> {
+  return postJson<
+    { urls: string[] },
+    { ok: boolean; uploaded_count: number; image_ids: number[]; failures: { url: string; error: string }[] }
+  >(`/api/mods/${modId}/images/by-url`, { urls });
+}
+
+// ── Hidden (suppressed) auto-detected tags ──────────────────────────────────
+// Custom tags are rows the user created, so removing one is a DELETE. Tags
+// derived from Nexus metadata or pak extraction have no row to delete, and
+// removing them at the source does not stick: extraction recomputes them and the
+// next sync overwrites them. Hiding records a suppression the read paths honour.
+
+/** Auto-detected tags the user has suppressed for this mod. */
+export async function getModHiddenTags(modId: number): Promise<string[]> {
+  return getJson<string[]>(`/api/mods/${modId}/hidden-tags`);
+}
+
+/** Suppress an auto-detected tag. Idempotent. */
+export async function hideModTag(
+  modId: number,
+  tag: string,
+): Promise<{ ok: boolean; tag: string }> {
+  return postJson<{ tag: string }, { ok: boolean; tag: string }>(
+    `/api/mods/${modId}/hidden-tags`,
+    { tag },
+  );
+}
+
+/** Bring a suppressed tag back. */
+export async function unhideModTag(
+  modId: number,
+  tag: string,
+): Promise<{ ok: boolean; restored: string }> {
+  const baseUrl = await getBaseUrl();
+  const path = `/api/mods/${modId}/hidden-tags/${encodeURIComponent(tag)}`;
+  const res = await fetch(`${baseUrl}${path}`, { method: "DELETE" });
+  if (!res.ok) await handleError(res, "DELETE", path);
+  return res.json();
+}
+
 // ── Custom Author Metadata ──────────────────────────────────────────────────
 
 export interface CustomAuthor {
@@ -1493,6 +1998,10 @@ export type ApiBackupInfo = {
   manifest_version: number | null;
   total_mods: number | null;
   active_mods: number | null;
+  /** Why the archive exists: "manual", "pre-restore" or "pre-compact". */
+  kind: string;
+  /** Human-readable explanation shown in the backup list. */
+  description: string;
   data_dir: string | null;
   marvel_rivals_root: string | null;
   downloads_root: string | null;
@@ -1501,6 +2010,8 @@ export type ApiBackupInfo = {
 export type ApiBackupCreateResult = ApiBackupInfo & {
   ok: boolean;
   archive_name: string;
+  /** Paths of older archives rotated out to keep the folder bounded. */
+  pruned: string[];
 };
 
 export type ApiBackupRestoreResult = {
@@ -1511,6 +2022,18 @@ export type ApiBackupRestoreResult = {
   remapped_paths: number;
   restored_settings: boolean;
   safety_snapshot: string | null;
+  /**
+   * How many mods the backend physically switched back on in ~mods.
+   *
+   * Restoring the database alone changes nothing a player can see: a mod is
+   * active because its .pak sits in the game folder, not because a column says
+   * so. `failed` counts mods the archive had active that are no longer on disk.
+   */
+  reactivated?: {
+    activated: number;
+    deactivated: number;
+    failed: number;
+  };
 };
 
 export async function createBackup(name?: string): Promise<ApiBackupCreateResult> {
@@ -1530,6 +2053,26 @@ export async function listServerBackups(): Promise<ApiBackupInfo[]> {
   if (!res.ok) await handleError(res, "GET", "/api/backup/list");
   const data = (await res.json()) as { ok: boolean; backups: ApiBackupInfo[] };
   return data.backups ?? [];
+}
+
+/** Delete one archive. The backend refuses paths outside the backups folder. */
+export async function deleteBackup(
+  path: string,
+): Promise<{ ok: boolean; deleted: string; size_bytes: number }> {
+  return postJson<{ path: string }, { ok: boolean; deleted: string; size_bytes: number }>(
+    "/api/backup/delete",
+    { path },
+  );
+}
+
+/** Delete all but the newest `keep` archives. */
+export async function pruneBackups(
+  keep: number,
+): Promise<{ ok: boolean; removed: string[]; count: number }> {
+  return postJson<{ keep: number }, { ok: boolean; removed: string[]; count: number }>(
+    "/api/backup/prune",
+    { keep },
+  );
 }
 
 export async function restoreBackup(

@@ -26,6 +26,9 @@ const DownloadsPage = lazy(() =>
 const ActiveModsView = lazy(() =>
   import("./components/ActiveModsView").then((m) => ({ default: m.ActiveModsView })),
 );
+const NexusBrowseView = lazy(() =>
+  import("./components/NexusBrowseView").then((m) => ({ default: m.NexusBrowseView })),
+);
 const CollectionsPage = lazy(() =>
   import("./components/CollectionsPage").then((m) => ({ default: m.CollectionsPage })),
 );
@@ -63,6 +66,9 @@ const AssignModIdModal = lazy(() =>
 const CrashDetectorModal = lazy(() =>
   import("./components/CrashDetectorModal").then((m) => ({ default: m.CrashDetectorModal })),
 );
+const ActivityDialog = lazy(() =>
+  import("./components/ActivityDialog").then((m) => ({ default: m.ActivityDialog })),
+);
 import { parseCrashContext, type CrashInfo } from "./lib/crashParser";
 import { toast } from "sonner";
 import { Toaster } from "./components/ui/sonner";
@@ -85,7 +91,6 @@ import {
   listNxmHandoffs,
   previewNxmHandoff,
   setActivePaks,
-  disableAllMods,
   scanActive,
   getLocalDownload,
   getPakAssets,
@@ -101,6 +106,7 @@ import {
   getBootstrapStatus,
   getHealth,
   getModCustomImagePreviews,
+  type ModCustomPreviews,
   toggleFavourite,
   fetchFavourites,
   getGameVersionCheck,
@@ -110,6 +116,14 @@ import {
   type ApiUpdateSettingsRequest,
   type ApiBootstrapStatus,
 } from "./lib/api";
+import {
+  disableAllRemembering,
+  findActivePreset,
+  getRememberedLoadout,
+  listPresets,
+  restoreLoadout,
+} from "./lib/loadoutActions";
+import type { Loadout } from "./lib/backupUtils";
 import { nextPollDelay } from "./lib/pollingHelpers";
 import { useHasBeenTrue } from "./lib/lazyMount";
 import { prefetchWhenIdle } from "./lib/prefetch";
@@ -134,6 +148,9 @@ const SETTINGS_TASK_LABELS: Record<SettingsTask, string> = {
   bootstrap_rebuild: "Initial Database Build",
   rebuild_character_data: "Rebuild Character Data",
   delete_outdated_versions: "Delete Outdated Versions",
+  compact_images: "Compact Mod Artwork",
+  dedupe_images: "Remove Duplicate Images",
+  reorganize_mods: "Sort Mods Into Folders",
 };
 
 const PROGRESS_STAGE_FILTERS = [
@@ -194,8 +211,16 @@ export default function App() {
   // State management
   const [mods, setMods] = useState<any[]>([]);
   const [activeTab, setActiveTab] = useState<
-    "downloads" | "active" | "collections"
+    "downloads" | "active" | "collections" | "nexus"
   >("downloads");
+  // Which filterable tab to come back to when a sidebar filter is used from a
+  // tab that ignores filters.
+  const lastLibraryTab = useRef<"downloads" | "active">("downloads");
+  useEffect(() => {
+    if (activeTab === "downloads" || activeTab === "active") {
+      lastLibraryTab.current = activeTab;
+    }
+  }, [activeTab]);
   const [assignModIdTarget, setAssignModIdTarget] = useState<any | null>(null);
   const assignModIdEverOpened = useHasBeenTrue(!!assignModIdTarget);
   const [selectedCategory, setSelectedCategory] = useState("all");
@@ -244,7 +269,17 @@ export default function App() {
   const [gameUpdateNewCharacters, setGameUpdateNewCharacters] = useState<string[]>([]);
   const [gameUpdateNewSkins, setGameUpdateNewSkins] = useState<string[]>([]);
   const [backupOpen, setBackupOpen] = useState(false);
+  // Drives the header's Restore Loadout button. Read from localStorage on mount
+  // so a loadout remembered in a previous session is still offered.
+  const [rememberedLoadout, setRememberedLoadout] = useState<Loadout | null>(
+    () => getRememberedLoadout(),
+  );
+  const [presets, setPresets] = useState<Loadout[]>(() => listPresets());
+  /** Which preset matches what is enabled right now, if any. */
+  const [activePresetId, setActivePresetId] = useState<string | null>(null);
   const backupEverOpened = useHasBeenTrue(backupOpen);
+  const [activityOpen, setActivityOpen] = useState(false);
+  const activityEverOpened = useHasBeenTrue(activityOpen);
   const [collectionsCount, setCollectionsCount] = useState(0);
   const [backupsRefreshTrigger, setBackupsRefreshTrigger] = useState(0);
 
@@ -926,8 +961,10 @@ export default function App() {
 
     const customImages =
       modIds.length > 0
-        ? await getModCustomImagePreviews(modIds).catch(() => ({}))
-        : {};
+        ? await getModCustomImagePreviews(modIds).catch(
+            () => ({ images: {}, explicit: new Set<number>() }),
+          )
+        : { images: {}, explicit: new Set<number>() };
 
     const favSet = new Set(favouritedIds);
     const mapped = grouped.map((d) => toUiMod(d, customImages));
@@ -1566,77 +1603,6 @@ export default function App() {
     }
   };
 
-  const handleDisableAll = async () => {
-    const toastId = "disable-all";
-    toast.loading("Disabling active mods...", { id: toastId });
-
-    try {
-      await scanActive();
-      const allDownloads = await listDownloads();
-      const activeDownloads = allDownloads.filter(
-        (dl) => dl.active_paks && dl.active_paks.length > 0
-      );
-
-      let deactivatedCount = 0;
-      for (const dl of activeDownloads) {
-        await setActivePaks(Number(dl.id), []);
-        deactivatedCount++;
-      }
-
-      // If nothing was deactivated via complete sweep, try falling back to legacy list to be safe
-      if (deactivatedCount === 0) {
-        const activeModsToDisable = installedMods.filter((mod) => mod.isActive !== false);
-        for (const mod of activeModsToDisable) {
-          const downloadIds = mod.sourceDownloadIds || [];
-          for (const dlId of downloadIds) {
-            await setActivePaks(Number(dlId), []);
-            deactivatedCount++;
-          }
-        }
-      }
-
-      await scanActive();
-      if (deactivatedCount === 0) {
-        toast.info("No active mods to disable", { id: toastId });
-      } else {
-        toast.success(`Successfully disabled all active mods (${deactivatedCount} deactivated)`, { id: toastId });
-      }
-    } catch (error: any) {
-      toast.error(error?.message || "Failed to disable mods", { id: toastId });
-    } finally {
-      void refreshMods({ includeConflicts: true });
-    }
-  };
-
-  const handleEnableAll = async () => {
-    const inactiveModsToEnable = installedMods.filter((mod) => mod.isActive === false);
-    const inactiveCount = inactiveModsToEnable.length;
-    if (inactiveCount === 0) {
-      toast.info("No disabled mods to enable");
-      return;
-    }
-
-    const toastId = "enable-all";
-    toast.loading(`Enabling ${inactiveCount} mod(s)...`, { id: toastId });
-
-    try {
-      for (const mod of inactiveModsToEnable) {
-        const downloadIds = mod.sourceDownloadIds || [];
-        for (const dlId of downloadIds) {
-          const dl = await getLocalDownload(Number(dlId));
-          const paks = (dl.contents || []).filter((f: string) => f.toLowerCase().endsWith(".pak"));
-          await setActivePaks(Number(dlId), paks);
-        }
-      }
-      await scanActive();
-      toast.success(`${inactiveCount} mod${inactiveCount !== 1 ? "s" : ""} enabled`, { id: toastId });
-    } catch (error: any) {
-      toast.error(error?.message || "Failed to enable mods", { id: toastId });
-    } finally {
-      void refreshMods({ includeConflicts: true });
-    }
-  };
-
   const refreshMods = async (
     options: { quiet?: boolean; includeConflicts?: boolean; skipScan?: boolean } = {},
   ) => {
@@ -1660,6 +1626,20 @@ export default function App() {
       }
       setMods(deduped);
       void fetchCollectionsCount();
+
+      // Work out which preset (if any) is currently loaded. Presets were listed
+      // with no indication of which one was in effect.
+      try {
+        const saved = listPresets();
+        setPresets(saved);
+        setActivePresetId(
+          saved.length > 0
+            ? findActivePreset(await listDownloads(), saved)?.id ?? null
+            : null,
+        );
+      } catch {
+        setActivePresetId(null);
+      }
     } catch (e: any) {
       if (quiet) {
         console.error("Auto refresh failed", e);
@@ -1798,6 +1778,10 @@ export default function App() {
         const taskLabel = SETTINGS_TASK_LABELS[task] ?? task;
         if (finalJob.status === "succeeded" && finalJob.ok) {
           toast.success(`${taskLabel} completed`);
+          // Released before the refresh, not after. Reloading a large library
+          // takes seconds, and awaiting it here left the button spinning
+          // "Running" long after the task had finished and said so.
+          setSettingsTaskBusy(null);
           await refreshMods({ quiet: true, includeConflicts: true });
         } else {
           const exitSuffix =
@@ -1830,13 +1814,86 @@ export default function App() {
     void fetchCollectionsCount();
   };
 
+  // Disable All records the loadout first, so it is reversible by design rather
+  // than only if the user remembered to take a backup beforehand.
   const handleDisableAllMods = async () => {
+    const toastId = "disable-all-mods";
+    toast.loading("Remembering current loadout…", { id: toastId });
     try {
-      await disableAllMods();
-      toast.success("All mods have been disabled");
+      const { loadout, disabled } = await disableAllRemembering();
+      setRememberedLoadout(getRememberedLoadout());
+
+      if (disabled === 0) {
+        toast.info("No active mods to disable", { id: toastId });
+        return;
+      }
+
+      toast.success(`Disabled ${disabled} mod${disabled === 1 ? "" : "s"}`, {
+        id: toastId,
+        description: `Restore Loadout brings back ${loadout.activePaks} pak file${loadout.activePaks === 1 ? "" : "s"}.`,
+        duration: 6000,
+      });
       handleRefresh();
     } catch (err) {
-      toast.error(`Failed to disable all mods: ${err instanceof Error ? err.message : String(err)}`);
+      toast.error(
+        `Failed to disable all mods: ${err instanceof Error ? err.message : String(err)}`,
+        { id: toastId },
+      );
+    }
+  };
+
+  const handleApplyPreset = async (presetId: string) => {
+    const preset = presets.find((p) => p.id === presetId);
+    if (!preset) return;
+
+    const toastId = "apply-preset-header";
+    toast.loading(`Applying "${preset.name}"…`, { id: toastId });
+    try {
+      const { updated, missing } = await restoreLoadout(preset);
+      if (updated === 0) {
+        toast.info(`Mods already match "${preset.name}"`, { id: toastId });
+      } else {
+        toast.success(`Applied "${preset.name}" — ${updated} mod${updated === 1 ? "" : "s"} updated`, {
+          id: toastId,
+          description:
+            missing > 0
+              ? `${missing} mod${missing === 1 ? " is" : "s are"} no longer installed.`
+              : undefined,
+          duration: 7000,
+        });
+      }
+      handleRefresh();
+    } catch (err) {
+      toast.error(
+        `Failed to apply preset: ${err instanceof Error ? err.message : String(err)}`,
+        { id: toastId },
+      );
+    }
+  };
+
+  const handleRestoreLoadout = async () => {
+    const toastId = "restore-loadout";
+    toast.loading("Restoring loadout…", { id: toastId });
+    try {
+      const { updated, missing } = await restoreLoadout(rememberedLoadout);
+      if (updated === 0) {
+        toast.info("Mods already match the remembered loadout", { id: toastId });
+      } else {
+        toast.success(`Restored ${updated} mod${updated === 1 ? "" : "s"}`, {
+          id: toastId,
+          description:
+            missing > 0
+              ? `${missing} mod${missing === 1 ? " is" : "s are"} no longer installed and could not be restored.`
+              : undefined,
+          duration: 7000,
+        });
+      }
+      handleRefresh();
+    } catch (err) {
+      toast.error(
+        `Failed to restore loadout: ${err instanceof Error ? err.message : String(err)}`,
+        { id: toastId },
+      );
     }
   };
 
@@ -1946,7 +2003,10 @@ export default function App() {
     return undefined;
   }
 
-  function toUiMod(d: ApiDownload, customImages: Record<number, string> = {}) {
+  function toUiMod(
+    d: ApiDownload,
+    customImages: ModCustomPreviews = { images: {}, explicit: new Set() },
+  ) {
     // Consolidate tags and remove any stray tokens like 'data' and generic categories for robustness
     const rawTags = (d.tags || []).filter(
       (t) => t && !["data"].includes(t.toLowerCase()),
@@ -1966,9 +2026,25 @@ export default function App() {
     const categoryTags = deriveCategoryTags(cleanTags);
 
 
-    // Priority: Nexus picture_url > Custom image > Fallback
+    // Priority: image the user starred > Nexus picture_url > any custom image
+    // > fallback.
+    //
+    // This used to put picture_url first unconditionally, so on a mod linked
+    // with Assign Mod ID the card always showed the website's artwork and the
+    // star appeared to do nothing. Only an *explicit* choice jumps the queue —
+    // "this mod happens to have a custom image" must not silently replace the
+    // Nexus thumbnail for everyone.
+    const previewKey =
+      d.mod_id != null ? d.mod_id : d.id != null ? -d.id : null;
+    const customImage =
+      previewKey != null ? customImages.images[previewKey] : undefined;
+    const chosenByUser =
+      previewKey != null && customImages.explicit.has(previewKey);
+
     let images: string[];
-    if (d.picture_url) {
+    if (customImage && chosenByUser) {
+      images = [customImage];
+    } else if (d.picture_url) {
       let thumbUrl = d.picture_url;
       // Nexus staticdelivery supports a /thumbnails/ path which is much smaller (e.g. 385px vs 1920px)
       if (
@@ -1979,24 +2055,12 @@ export default function App() {
         thumbUrl = d.picture_url.replace("/images/", "/images/thumbnails/");
       }
       images = [thumbUrl];
+    } else if (customImage) {
+      images = [customImage];
     } else {
-      // Try to get custom image
-      let customImage: string | undefined;
-      if (d.mod_id != null && customImages[d.mod_id]) {
-        customImage = customImages[d.mod_id];
-      } else if (d.mod_id == null && d.id != null) {
-        // For local mods, use synthetic ID (negative download ID)
-        const syntheticId = -d.id;
-        customImage = customImages[syntheticId];
-      }
-
-      if (customImage) {
-        images = [customImage];
-      } else {
-        images = [
-          "https://i.pinimg.com/1200x/44/da/5e/44da5e6d9dd75cb753ab5925aff4ce4c.jpg",
-        ];
-      }
+      images = [
+        "https://i.pinimg.com/1200x/44/da/5e/44da5e6d9dd75cb753ab5925aff4ce4c.jpg",
+      ];
     }
     const installedVersion = d.version || undefined;
     const localVersionKey = d.local_version_key ?? null;
@@ -2424,12 +2488,28 @@ export default function App() {
     return candidate;
   }
 
+  /**
+   * Bring the filtered view back into sight before applying a sidebar filter.
+   *
+   * Only Downloads and Active Mods read these filters. Clicking a character
+   * while Browse Nexus (or Collections) was open still narrowed the list, but
+   * the list was not on screen, so the click looked like it did nothing at all.
+   * Returning to whichever library tab was last used keeps the filter and shows
+   * its effect.
+   */
+  const revealFilteredList = () => {
+    setActiveTab((current) =>
+      current === "downloads" || current === "active" ? current : lastLibraryTab.current,
+    );
+  };
+
   // Character/Skin Toggle Handler
   // When a skin is clicked, both the character and skin tags are added to the filter.
   // The filter logic uses .every() to ensure ALL selected tags must be present.
   // Example: Clicking "default" under "emma frost" adds both to selectedCharacters,
   // so only mods with BOTH "emma frost" AND "default" will show.
   const handleCharacterToggle = (character: string) => {
+    revealFilteredList();
     setSelectedCharacters((prev) =>
       prev.includes(character)
         ? prev.filter((c) => c !== character)
@@ -2438,12 +2518,14 @@ export default function App() {
   };
 
   const handleCustomTagToggle = (tag: string) => {
+    revealFilteredList();
     setSelectedCustomTags((prev) =>
       prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag],
     );
   };
 
   const handleCategoryChange = (category: string) => {
+    revealFilteredList();
     setSelectedCategory(category);
     // Clear character filters when switching away from characters
     if (category !== "characters") {
@@ -2488,7 +2570,13 @@ export default function App() {
                 onOpenSettings={handleOpenSettings}
                 onOpenBootstrap={handleOpenBootstrap}
                 onOpenBackup={() => setBackupOpen(true)}
+                onOpenActivity={() => setActivityOpen(true)}
                 onDisableAllMods={handleDisableAllMods}
+                onRestoreLoadout={handleRestoreLoadout}
+                rememberedLoadout={rememberedLoadout}
+                presets={presets}
+                onApplyPreset={handleApplyPreset}
+                activePresetId={activePresetId}
                 hasLastCrash={crashInfo !== null}
                 onViewLastCrash={() => setCrashDetectorOpen(true)}
               />
@@ -2517,8 +2605,6 @@ export default function App() {
                   <ActiveModsView
                     mods={mods}
                     onToggleMod={handleToggleMod}
-                    onDisableAll={handleDisableAll}
-                    onEnableAll={handleEnableAll}
                     onUpdate={handleUpdate}
                     onCheckUpdate={handleCheckUpdate}
                     onUninstall={handleUninstall}
@@ -2532,6 +2618,8 @@ export default function App() {
                     onRefresh={handleRefresh}
                     onAssignModId={handleAssignModId}
                   />
+                ) : activeTab === "nexus" ? (
+                  <NexusBrowseView />
                 ) : (
                   <CollectionsPage
                     installedMods={mods}
@@ -2632,12 +2720,23 @@ export default function App() {
             <Suspense fallback={null}>
             <BackupModal
               open={backupOpen}
-              onClose={() => setBackupOpen(false)}
+              onClose={() => {
+                setBackupOpen(false);
+                // Presets and the remembered loadout are edited inside the
+                // modal but surfaced in the header, so re-read them on close.
+                setPresets(listPresets());
+                setRememberedLoadout(getRememberedLoadout());
+              }}
               mods={mods}
               onToggleMod={handleToggleMod}
               onBackupCreated={() => setBackupsRefreshTrigger((t) => t + 1)}
               onBackupRestored={() => refreshMods({ quiet: true, includeConflicts: true })}
             />
+            </Suspense>
+          )}
+          {activityEverOpened && (
+            <Suspense fallback={null}>
+              <ActivityDialog open={activityOpen} onOpenChange={setActivityOpen} />
             </Suspense>
           )}
           {assignModIdEverOpened && (

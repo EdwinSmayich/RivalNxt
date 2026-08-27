@@ -188,7 +188,11 @@ export function BackupRestoreModal({ meta, installedMods, onComplete, onClose }:
           } catch { /* best effort */ }
         }
 
-        // Restore custom images
+        // Restore custom images.
+        //
+        // The backend skips images this mod already has, so replaying a restore
+        // no longer multiplies the library. Sending them anyway is still wasted
+        // work, but correctness does not depend on this call being careful.
         if (backupEntry?.customImages && backupEntry.customImages.length > 0) {
           try {
             await uploadModImagesBase64(effectiveModId, backupEntry.customImages);

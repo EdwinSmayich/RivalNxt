@@ -1,6 +1,5 @@
 from __future__ import annotations
 import argparse
-import json
 import logging
 import sqlite3
 from typing import Dict, List, Tuple
@@ -71,41 +70,6 @@ def build_pak_tags(rows: List[Tuple[str, int | None, str | None, str | None]]) -
         if rec["mod_id"] is None and mod_id is not None:
             rec["mod_id"] = mod_id
     return agg
-
-
-def upsert_pak_tags(conn: sqlite3.Connection, agg: Dict[str, Dict]) -> int:
-    cur = conn.cursor()
-    batch: List[Tuple[str, int | None, str]] = []
-    for pak_name, data in agg.items():
-        # Collect entities (character names) and categories as separate tags
-        ents = sorted(list(data["by_entity"].keys()))
-        cats_set = set()
-        for cats in data["by_entity"].values():
-            cats_set.update(cats)
-        cats_set.update(data["unknown_cats"])
-        cats = sorted(list(cats_set))
-        # Store entities and categories as separate array elements, not comma-joined
-        tags: List[str] = []
-        if ents:
-            tags.extend(ents)
-        if cats:
-            tags.extend(cats)
-        tags_json = json.dumps(tags, ensure_ascii=False)
-        batch.append((pak_name, data["mod_id"], tags_json))
-    cur.executemany(
-        """
-        INSERT INTO pak_tags_json(pak_name, mod_id, tags_json)
-        VALUES(?, ?, ?)
-        ON CONFLICT(pak_name) DO UPDATE SET
-            mod_id = excluded.mod_id,
-            tags_json = excluded.tags_json
-        ;
-        """,
-        batch,
-    )
-    conn.commit()
-    return len(batch)
-
 
 def main(argv=None) -> int:
     args = parse_args(argv)

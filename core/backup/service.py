@@ -22,6 +22,7 @@ import sqlite3
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +33,12 @@ MANIFEST_NAME = "manifest.json"
 DB_ENTRY_NAME = "mods.db"
 SETTINGS_ENTRY_NAME = "settings.json"
 BACKUPS_DIRNAME = "backups"
+
+# How many archives to retain. Nothing ever deleted from the backups directory:
+# every manual snapshot, every pre-restore safety copy and every pre-compact copy
+# accumulated, and each one is a full database. Defined here rather than beside
+# prune_backups because create_backup takes it as a default argument.
+DEFAULT_KEEP_BACKUPS = 5
 
 
 class BackupError(Exception):
@@ -47,6 +54,8 @@ class BackupInfo:
     manifest_version: Optional[int]
     total_mods: Optional[int]
     active_mods: Optional[int]
+    kind: str
+    description: str
     data_dir: Optional[str]
     marvel_rivals_root: Optional[str]
     downloads_root: Optional[str]
@@ -60,6 +69,8 @@ class BackupInfo:
             "manifest_version": self.manifest_version,
             "total_mods": self.total_mods,
             "active_mods": self.active_mods,
+            "kind": self.kind,
+            "description": self.description,
             "data_dir": self.data_dir,
             "marvel_rivals_root": self.marvel_rivals_root,
             "downloads_root": self.downloads_root,
@@ -145,6 +156,9 @@ def create_backup(
     name: Optional[str] = None,
     timestamp: Optional[str] = None,
     data_dir: Optional[Path] = None,
+    keep: Optional[int] = DEFAULT_KEEP_BACKUPS,
+    kind: str = "manual",
+    description: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Snapshot the database + settings into a timestamped zip.
 
@@ -175,6 +189,11 @@ def create_backup(
             "manifest_version": BACKUP_MANIFEST_VERSION,
             "created_at": created_at,
             "name": name or label,
+            # Why this archive exists. Without it the list showed bare internal
+            # names like "pre-compact-images" with nothing to explain them.
+            "kind": kind,
+            "description": description
+            or "Snapshot you created from the Backup screen.",
             "total_mods": total_mods,
             "active_mods": active_mods,
             # Recorded so restore can remap absolute paths when the app has
@@ -211,6 +230,18 @@ def create_backup(
         }
     )
     logger.info("[backup] Created %s (%s bytes)", archive_path, result["size_bytes"])
+
+    # Rotate AFTER the new archive is on disk and counted, so the retention
+    # window always includes what was just written and a failure here cannot
+    # cost the user the backup they asked for.
+    pruned: List[str] = []
+    if keep is not None:
+        try:
+            pruned = prune_backups(keep=keep, data_dir=root)
+        except Exception as exc:
+            logger.warning("[backup] Retention pass failed: %s", exc)
+    result["pruned"] = pruned
+
     return result
 
 
@@ -227,6 +258,48 @@ def _read_manifest(archive: Path) -> Dict[str, Any]:
         return {}
 
 
+# Archives are named by whatever produced them, so the prefix is the only clue
+# an older manifest gives about why it exists.
+_KIND_BY_PREFIX = {
+    "pre-restore": "pre-restore",
+    "pre-compact-images": "pre-compact",
+    "pre-image-shrink": "pre-compact",
+}
+
+_KIND_LABELS = {
+    "pre-restore": "Before restore",
+    "pre-compact": "Before shrinking artwork",
+    "manual": "Manual snapshot",
+}
+
+_KIND_DESCRIPTIONS = {
+    "pre-restore": (
+        "Automatic snapshot taken just before a restore was applied. "
+        "Restore this to undo that restore."
+    ),
+    "pre-compact": (
+        "Automatic snapshot taken before mod artwork was re-encoded to save "
+        "space. Restore this to get the original full-size images back."
+    ),
+    "manual": "Snapshot you created from the Backup screen.",
+}
+
+
+def _infer_kind(filename: str) -> str:
+    for prefix, kind in _KIND_BY_PREFIX.items():
+        if filename.startswith(prefix):
+            return kind
+    return "manual"
+
+
+def _friendly_name(kind: str, fallback: str) -> str:
+    return _KIND_LABELS.get(kind, fallback)
+
+
+def _describe_kind(kind: str) -> str:
+    return _KIND_DESCRIPTIONS.get(kind, _KIND_DESCRIPTIONS["manual"])
+
+
 def list_backups(*, data_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
     """Enumerate backup archives on disk.
 
@@ -239,18 +312,33 @@ def list_backups(*, data_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
     for entry in sorted(target.glob("*.zip")):
         manifest = _read_manifest(entry)
         try:
-            size = entry.stat().st_size
+            stat = entry.stat()
+            size = stat.st_size
         except OSError:
+            stat = None
             size = 0
+
+        kind = manifest.get("kind") or _infer_kind(entry.name)
+        # Archives written before manifests carried a description still need to
+        # explain themselves, and older safety snapshots have no created_at at
+        # all — the file's own mtime is a truthful stand-in for both.
+        created_at = manifest.get("created_at")
+        if not created_at and stat is not None:
+            created_at = (
+                datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
+            )
+
         out.append(
             BackupInfo(
-                name=manifest.get("name") or entry.stem,
+                name=manifest.get("name") or _friendly_name(kind, entry.stem),
                 path=str(entry),
-                created_at=manifest.get("created_at"),
+                created_at=created_at,
                 size_bytes=size,
                 manifest_version=manifest.get("manifest_version"),
                 total_mods=manifest.get("total_mods"),
                 active_mods=manifest.get("active_mods"),
+                kind=kind,
+                description=manifest.get("description") or _describe_kind(kind),
                 data_dir=manifest.get("data_dir"),
                 marvel_rivals_root=manifest.get("marvel_rivals_root"),
                 downloads_root=manifest.get("downloads_root"),
@@ -259,6 +347,74 @@ def list_backups(*, data_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
     # Newest first; archives without a timestamp sort last.
     out.sort(key=lambda b: (b.created_at or ""), reverse=True)
     return [b.as_dict() for b in out]
+
+
+# ---------------------------------------------------------------------------
+# Retention
+# ---------------------------------------------------------------------------
+# A library that fills the user's disk is its own failure mode. Retention size
+# lives with the module constants above, since create_backup defaults to it.
+
+
+def delete_backup(path: str, *, data_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Delete a single archive.
+
+    Constrained to the backups directory on purpose: the path arrives from the
+    client, and an unchecked unlink here would delete any file the backend can
+    reach.
+    """
+    target = Path(path).resolve()
+    allowed = backups_dir(data_dir).resolve()
+
+    try:
+        inside = target.is_relative_to(allowed)
+    except AttributeError:  # pragma: no cover - Python < 3.9
+        inside = str(target).startswith(str(allowed))
+    if not inside:
+        raise BackupError("refusing to delete a file outside the backups folder")
+    if target.suffix.lower() != ".zip":
+        raise BackupError("only backup archives can be deleted")
+    if not target.exists():
+        raise BackupError(f"backup not found: {target.name}")
+
+    size = target.stat().st_size
+    target.unlink()
+    logger.info("[backup] Deleted %s (%s bytes)", target, size)
+    return {"ok": True, "deleted": str(target), "size_bytes": size}
+
+
+def prune_backups(
+    *, keep: int = DEFAULT_KEEP_BACKUPS, data_dir: Optional[Path] = None
+) -> List[str]:
+    """Delete all but the ``keep`` newest archives. Returns what was removed.
+
+    Ordering follows :func:`list_backups` (newest first), so the most recent
+    snapshot is never a candidate — which matters because the newest archive is
+    usually the safety copy for whatever the user just did.
+
+    ``keep`` below 1 is rejected rather than clamped: a caller asking to keep
+    zero backups is a bug, and honouring it would delete the lot.
+    """
+    if keep < 1:
+        raise BackupError(f"refusing to prune with keep={keep}; at least 1 must be retained")
+
+    entries = list_backups(data_dir=data_dir)
+    doomed = entries[keep:]
+    removed: List[str] = []
+
+    for info in doomed:
+        path = Path(info["path"])
+        try:
+            path.unlink()
+            removed.append(str(path))
+        except OSError as exc:
+            # A locked or already-deleted file must not fail the backup that
+            # triggered this cleanup.
+            logger.warning("[backup] Could not prune %s: %s", path, exc)
+
+    if removed:
+        logger.info("[backup] Pruned %s old backup(s), kept %s", len(removed), keep)
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +460,42 @@ def _verify_restored_db(db_file: Path) -> None:
         raise BackupError(f"restored file is not a valid database: {exc}") from exc
     finally:
         conn.close()
+
+
+def _overwrite_live_database(staged_db: Path, live_db: Path) -> None:
+    """Copy the staged database over the live one *through SQLite*.
+
+    Replacing the file with ``shutil.copyfile`` cannot work while the app is
+    running. ``core/db/db.py`` opens every connection with
+    ``PRAGMA mmap_size = 268435456``, so SQLite keeps mods.db memory-mapped; on
+    Windows ``open(dst, 'wb')`` issues CreateFile(CREATE_ALWAYS), which fails
+    against a file that has a live mapped section with ERROR_USER_MAPPED_FILE.
+    That code is absent from CPython's winerror->errno table, so it arrived as
+    the thoroughly unhelpful ``OSError: [Errno 22] Invalid argument`` and the UI
+    only ever showed "Restore failed: Failed to fetch".
+
+    Retiring the connection pool first does not help. It bumps a generation
+    counter so each worker thread drops its cached handle on its *next*
+    ``get_db()``; an idle thread never gets there, and its mapping outlives the
+    restore. SQLite's own backup API sidesteps the whole problem by writing
+    through the existing handles rather than around them, and it is transactional
+    -- a failure part-way leaves the live database on its previous contents
+    instead of half-overwritten.
+    """
+    src = sqlite3.connect(str(staged_db))
+    try:
+        dst = sqlite3.connect(str(live_db))
+        try:
+            # A maintenance task holding the write lock is transient; wait for it
+            # rather than failing the restore.
+            dst.execute("PRAGMA busy_timeout = 30000")
+            src.backup(dst)
+        finally:
+            dst.close()
+    except sqlite3.Error as exc:
+        raise BackupError(f"could not write the restored database: {exc}") from exc
+    finally:
+        src.close()
 
 
 def _remap_paths(db_file: Path, mapping: Dict[str, str]) -> int:
@@ -383,8 +575,10 @@ def restore_backup(
                 mapping[str(old_downloads)] = str(current_downloads)
             remapped = _remap_paths(staged_db, mapping)
 
-        # Release any pooled handles across every thread BEFORE replacing the
-        # file; on Windows a live handle blocks the replacement outright.
+        # Retire pooled handles so no thread keeps serving reads from the
+        # pre-restore state. This is housekeeping, not a precondition:
+        # _overwrite_live_database writes through SQLite precisely so that
+        # handles which outlive this call cannot block the restore.
         try:
             from core.api.dependencies import reset_schema_cache
 
@@ -397,21 +591,32 @@ def restore_backup(
         if live_db.exists():
             from datetime import datetime, timezone
 
-            stamp = _safe_component(
-                (timestamp or datetime.now(timezone.utc).isoformat()).replace(":", "-")
-            )
+            # One value for both the filename and the manifest. These were
+            # computed separately, and the manifest got the raw `timestamp`
+            # argument — None on every real call — so every safety snapshot was
+            # written with created_at: null and listed as "date unknown".
+            safety_created_at = timestamp or datetime.now(timezone.utc).isoformat()
+            stamp = _safe_component(safety_created_at.replace(":", "-"))
             safety = backups_dir(root) / f"pre-restore-{stamp}.zip"
             try:
                 safety_snapshot = tmpdir / "pre_restore.db"
                 _snapshot_database(live_db, safety_snapshot)
+                total_mods, active_mods = _count_mods(safety_snapshot)
                 with zipfile.ZipFile(safety, "w", zipfile.ZIP_DEFLATED) as zf:
                     zf.writestr(
                         MANIFEST_NAME,
                         json.dumps(
                             {
                                 "manifest_version": BACKUP_MANIFEST_VERSION,
-                                "created_at": timestamp,
-                                "name": "pre-restore safety snapshot",
+                                "created_at": safety_created_at,
+                                "name": "Before restore",
+                                "kind": "pre-restore",
+                                "description": (
+                                    "Automatic snapshot of your library taken just before "
+                                    f"restoring {Path(path).name}. Restore this to undo it."
+                                ),
+                                "total_mods": total_mods,
+                                "active_mods": active_mods,
                                 "data_dir": str(root),
                             },
                             indent=2,
@@ -423,16 +628,12 @@ def restore_backup(
                 safety = None
 
         live_db.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(staged_db, live_db)
-        # The snapshot is self-contained, so stale WAL/SHM sidecars from the
-        # replaced database must not be left behind pointing at old pages.
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(str(live_db) + suffix)
-            try:
-                if sidecar.exists():
-                    sidecar.unlink()
-            except OSError as exc:
-                logger.warning("[backup] Could not remove %s: %s", sidecar, exc)
+        _overwrite_live_database(staged_db, live_db)
+        # No WAL/SHM cleanup here on purpose. The old code deleted the sidecars
+        # because it had replaced the database file behind SQLite's back and they
+        # would have described pages that no longer existed. The restore now goes
+        # through SQLite, so the WAL holds the restored pages and deleting it
+        # would throw the restore away.
 
         restored_settings = False
         if has_settings:

@@ -35,7 +35,7 @@ Measured against upstream at the time of this fork:
 | Moved | 20 |
 | **Left exactly as the author wrote them** | **236 (70%)** |
 | Files this fork adds | 46 |
-| Diff | +17,085 / −12,863 across 148 files |
+| Diff | +17,103 / −12,859 across 148 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
 rewrite, and it would not exist without the original. Check the numbers rather

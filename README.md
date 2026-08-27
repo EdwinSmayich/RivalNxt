@@ -11,7 +11,7 @@ detection, Nexus Mods integration and a local database.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#installation)
 [![Version](https://img.shields.io/badge/version-1.0.0-success?style=for-the-badge)](#)
-[![Tests](https://img.shields.io/badge/tests-878%20passing-brightgreen?style=for-the-badge)](#verification)
+[![Tests](https://img.shields.io/badge/tests-861%20passing-brightgreen?style=for-the-badge)](#verification)
 
 </div>
 
@@ -152,10 +152,15 @@ maturin, bundles the Python backend with PyInstaller, and produces the installer
 ### Verification
 
 ```bash
-npm run typecheck && npm test        # 255 frontend tests
+npm run typecheck && npm test        # 238 frontend tests
 python -m pytest tests/backend -q    # 623 backend tests
 ruff check core scripts src-python
 ```
+
+Seventeen further tests check that the shipped bundle is actually code-split.
+They read `dist/`, so they skip unless you have run `npm run build` first —
+deliberately, because a test that cannot see its subject should say so rather
+than pass. With a build present the total is 878.
 
 ---
 

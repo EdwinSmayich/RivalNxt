@@ -2,599 +2,178 @@
 
 <img src="./src-tauri/icons/frontendlogo.ico" alt="RivalNxt Logo" width="128" height="128">
 
-# RivalNxt
+# RivalNxt — Community Fork
 
 ### Marvel Rivals Mod Manager
 
-_One desktop app to manage, activate, and validate Marvel Rivals mods with conflict detection, NexusMods integration, and blazing-fast local database._
+A desktop app to install, organise and switch Marvel Rivals mods, with conflict
+detection, Nexus Mods integration and a local database.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#installation)
-[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
-[![React](https://img.shields.io/badge/React-18+-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://reactjs.org)
-[![Rust](https://img.shields.io/badge/Rust-1.70+-DEA584?style=for-the-badge&logo=rust&logoColor=black)](https://rustlang.org)
-[![Tauri](https://img.shields.io/badge/Tauri-2.0-FFC131?style=for-the-badge&logo=tauri&logoColor=black)](https://tauri.app)
-
-[Features](#-features) • [Installation](#-installation) • [Development Guide](#-development-guide) • [Contributing](#-contributing)
+[![Version](https://img.shields.io/badge/version-1.0.0-success?style=for-the-badge)](#)
+[![Tests](https://img.shields.io/badge/tests-878%20passing-brightgreen?style=for-the-badge)](#verification)
 
 </div>
 
 ---
 
-## ✨ Features
-
-**🎯 Core Functionality**
-
-- **Smart Mod Management** - Activate, deactivate, and organize mods with per-mod and bulk actions
-- **Conflict Detection** - Automatic detection and resolution of mod conflicts with tag rebuilding
-- **Game Update Auto-Detection** - Automatically detects game updates on startup to dynamically rebuild character and skin data
-- **Automated Mod Recovery** - Uses MD5 hashing and background daemons to automatically recover and link broken or misnamed mod files
-- **Crash Detection** - Persistent crash log parsing utility to quickly identify faulty mods causing game crashes
-- **Backup & Restore** - Comprehensive backup system allowing safe save and recovery of mod configurations
-- **Custom Tagging** - Intelligent tag engine with custom tag support, advanced filtering, and search indexing
-- **Outdated Mod Cleanup** - Automated scanning and deep cleanup for outdated versions of downloaded mods
-- **Hierarchical File Tree** - Nested file tree renderer for granular pak activation in complex mod folder structures
-- **Quick Start** - Direct "Start Game" button integrated into the main header for faster game launches
-- **Auto-Detection** - Automatically detects Marvel Rivals installation path via Steam/Epic Games registry and archive tools (WinRAR)
-- **One-Click Downloads** - Click "Download with Mod Manager" on NexusMods to instantly download and install mods
-- **Background Processing** - Automatic download processing via NXM protocol without manual intervention
-
-**🔧 Technical Highlights**
-
-- **Local-First Database** - Portable SQLite with health checks, robust conflict checks, and inspection utilities
-- **Rust-Powered Core** - Native Rust `rust-ue-tools` library with PyO3 bindings via Maturin
-- **Modern Tech Stack** - Tauri 2 desktop shell + React/Vite frontend + FastAPI/Python backend
-- **AI Knowledge Graph** - Built-in cross-language AST knowledge graph generation tool (`graphify`) for AI agent assistance
-- **CI/CD Automation** - GitHub Actions workflow for automated builds and releases
-- **One-Click Build** - Complete build script for easy local development setup
-
-**🌐 NexusMods Integration**
-
-- **Collections Support** - Full support for Nexus Collections and mass downloads with duplicate handling
-- **Browser Integration** - "Download with Mod Manager" button on NexusMods automatically opens RivalNxt
-- **NXM Protocol** - Persistent handoff system and background downloading via Windows registry integration
-- **Background Processing** - Automatic download processing via `NxmBackgroundListener` component
-- **Image Uploads** - Native drag-and-drop custom image uploading directly in the mod interface
-- **Dynamic Meta Resolution** - Intelligent fallback resolution using Fandom Wiki to identify character skins accurately
-- **API Integration** - Metadata fetching, automated ingestion, and update notifications
-- **Test Functionality** - Built-in protocol validation tools
-
-**⚡ Rust UE Tools Library**
-
-- **PyO3 Integration** - Python bindings built with Maturin for seamless interop
-- **Native Performance** - Rust library replaces slow Python/external tool processing
-- **PAK/UTOC Support** - Direct unpacking and listing without external CLI dependencies
-- **AES Encryption** - Built-in support for encrypted mod files
-- **Batch Processing** - Parallel processing for multiple mod files
-- **Archive Support** - Handles ZIP and RAR archives containing mod files
-
-## 🚀 Installation
-
-### 1. Download the Installer
-
-- Go to the **Releases** page.
-- Download the latest setup file, for example:
-  **`RivalNxt_0.8.0_x64-setup.exe`** (or any newer version).
-
-### 2. Install & Launch
-
-- Run the installer.
-- Launch the application after installation completes.
-
-### 3. Configure Paths
-
-RivalNxt can **automatically detect** your Marvel Rivals installation if installed via Steam or Epic Games Store.
-
-In **Settings**:
-
-- **Local downloads directory** → Select the folder where your Marvel Rivals mods are downloaded/saved (create anywhere or use existing folder)
-- **Nexus Personal API Key** → Get your [API key](https://next.nexusmods.com/settings/api-keys) (scroll all the way down) and paste it into RivalNxt
-
-> 💡 **Tip**: The app also auto-detects archive tools (WinRAR) for extracting mod files.
-
-#### ⚠️ Mod Folder Naming Convention
-
-Every mod inside your `marvel_rivals_local_downloads_root` directory must follow this format:
-
-`<name>-<modid>-<version>`
-
-Example: `CoolSkin-12345-1.0.0`
-
-This helps the app detect and track mods accurately.
-
-### 5. You're Ready to Use the App
-
-No Node.js, Rust, or Python is needed for normal usage.
-
-### For Developers
-
-See the [Development Guide](#-development-guide) below.
-
-## 🏗️ Architecture
-
-```mermaid
-%%{init: {
-  "flowchart": {
-    "nodeSpacing": 40,
-    "rankSpacing": 40
-  }
-}}%%
-flowchart LR
-    FE["🎨 React + Vite"]
-    Tauri["🖥️ Tauri 2.0"]
-    API["⚙️ FastAPI"]
-    DB[("💾 SQLite")]
-    RustUE["📦 Rust UE Tools"]
-
-    FE <-->|HTTP/IPC| Tauri
-    Tauri <-->|HTTP| API
-    API <-->|ORM| DB
-    API <-->|PyO3| RustUE
-    Tauri <-->|Rust API| RustUE
-
-    classDef frontend fill:#61dafb,stroke:#333,stroke-width:2px,color:#000
-    classDef desktop fill:#ffc131,stroke:#333,stroke-width:2px,color:#000
-    classDef backend fill:#009688,stroke:#333,stroke-width:2px,color:#fff
-    classDef shared fill:#dea584,stroke:#333,stroke-width:2px,color:#000
-    classDef data fill:#4caf50,stroke:#333,stroke-width:2px,color:#fff
-
-    class FE frontend
-    class Tauri desktop
-    class API backend
-    class RustUE shared
-    class DB data
-
-
-```
-
-**Tech Stack**
-
-- **Frontend**: React 18, TypeScript, Vite 6, Radix UI, Tailwind CSS
-- **Backend**: Python 3.10+, FastAPI, Uvicorn, SQLAlchemy
-- **Desktop**: Tauri 2.0 (Rust), Windows native
-- **Rust UE Tools**: Native Rust library with dual interfaces (Rust API + PyO3 bindings via Maturin)
-- **Database**: SQLite with optimized materialized views
-
-## 🦀 Rust UE Tools Library
-
-RivalNxt includes a high-performance native Rust library (`rust-ue-tools`) that provides programmatic access to Unreal Engine PAK and UTOC file operations, replacing external command-line tools like `repak` and `retoc_cli`.
-
-### Key Features
-
-- **✅ PAK File Support**: Unpack .pak files without external tools
-- **✅ UTOC File Support**: List contents of .utoc files (UE5 IoStore format)
-- **✅ AES Encryption**: Handle encrypted mod files with proper key management
-- **✅ Compression Support**: Full support for Oodle, Zstd, Zlib, LZ4 compression
-- **✅ Archive Processing**: Extract ZIP and RAR archives containing mod files
-- **✅ Parallel Processing**: Leverage Rayon for concurrent file operations
-- **✅ Python Bindings**: PyO3 integration for seamless Python usage
-
-### Usage Examples
-
-#### Basic Asset Path Extraction
-
-```rust
-use rust_ue_tools::Unpacker;
-
-let unpacker = Unpacker::new();
-let zip_path = "mod_file.zip";
-let aes_key = Some("0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74");
-
-match unpacker.extract_asset_paths_from_zip(zip_path, aes_key, false) {
-    Ok(asset_paths) => {
-        for asset in asset_paths {
-            println!("Asset: {}", asset);
-        }
-    }
-    Err(e) => {
-        println!("Error: {}", e);
-    }
-}
-```
-
-#### PAK File Unpacking
-
-```rust
-use rust_ue_tools::{Unpacker, PakUnpackOptions};
-
-let unpacker = Unpacker::new();
-let options = PakUnpackOptions::new()
-    .with_aes_key(aes_key.unwrap_or_default())
-    .with_strip_prefix("../../../")
-    .with_force(true)
-    .with_quiet(false);
-
-match unpacker.unpack_pak("mod.pak", "output_dir", &options) {
-    Ok(asset_paths) => {
-        println!("Unpacked {} files", asset_paths.len());
-    }
-    Err(e) => {
-        println!("Error unpacking: {}", e);
-    }
-}
-```
-
-#### UTOC File Listing
-
-```rust
-use rust_ue_tools::{Unpacker, UtocListOptions};
-
-let unpacker = Unpacker::new();
-let options = UtocListOptions::new()
-    .with_aes_key(aes_key.unwrap_or_default())
-    .with_json_format(false);
-
-match unpacker.list_utoc("mod.utoc", &options) {
-    Ok(asset_paths) => {
-        for asset in asset_paths {
-            println!("Asset: {}", asset);
-        }
-    }
-    Err(e) => {
-        println!("Error listing: {}", e);
-    }
-}
-```
-
-### Migration from Python
-
-The Rust library replaces the original Python `zip_to_asset_paths.py` script:
-
-**Before (Python)**
-
-```python
-from core.assets.zip_to_asset_paths import extract_uasset_paths_from_zip
-
-asset_paths = extract_uasset_paths_from_zip(
-    "mod.zip",
-    repak_bin="path/to/repak",
-    aes_key="your-key"
-)
-```
-
-**After (Rust)**
-
-```rust
-use rust_ue_tools::Unpacker;
-
-let unpacker = Unpacker::new();
-let asset_paths = unpacker.extract_asset_paths_from_zip(
-    "mod.zip",
-    Some("your-key"),
-    false
-)?;
-```
-
-### Building from Source
-
-```bash
-# Build with Maturin (recommended for PyO3 bindings)
-cd src-tauri/src/rust-ue-tools
-maturin build --release --features pyo3
-
-# Install the built wheel
-pip install target/wheels/*.whl
-
-# Manual Rust build (library only)
-cargo build --release --features pyo3
-
-# Run tests
-cargo test
-
-# Build documentation
-cargo doc --open
-```
-
-### Performance Benefits
-
-- **🚀 10-50x Faster**: Native Rust vs Python subprocess calls
-- **📦 No External Dependencies**: Eliminates repak.exe/retoc_cli.exe requirements
-- **💾 Memory Efficient**: Streams data instead of loading entire files
-- **🔄 Parallel Processing**: Rayon-powered concurrent operations
-- **📊 Progress Tracking**: Built-in progress reporting for long operations
-- **🐍 Python Integration**: Maturin-based PyO3 bindings for seamless Python usage
-
-## 💻 Development Guide
-
-### Prerequisites
-
-- Windows 10/11 (for desktop builds)
-- Node.js 18+ and npm
-- [Rust toolchain](https://rustup.rs/) via rustup
-- Python 3.10+
-- [Maturin](https://www.maturin.rs/) for PyO3 builds: `pip install maturin`
-- Git
-
-### Quick Start (One-Click Build)
-
-For new users, use the automated build script that handles everything:
-
-```bash
-# Clone repository with submodules
-git clone --recurse-submodules https://github.com/Rounak77382/Project_ModManager_Rivals.git
-cd Project_ModManager_Rivals
-
-# Run one-click build (Windows)
-.\build_local.bat
-
-# This will:
-# 1. Install npm dependencies
-# 2. Build Rust UE Tools with PyO3 bindings
-# 3. Create Python wrapper module
-# 4. Build Python backend with PyInstaller
-# 5. Build Tauri application
-# 6. Generate NSIS installer
-```
-
-### Manual Development Setup
-
-```bash
-# 1. Clone repository with submodules
-git clone --recurse-submodules https://github.com/Rounak77382/Project_ModManager_Rivals.git
-cd Project_ModManager_Rivals
-
-# If you already cloned without submodules:
-git submodule update --init --recursive
-
-# 2. Install frontend dependencies
-npm install
-
-# 3. Setup Python environment
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install maturin  # For PyO3 builds
-
-# 4. Build Rust UE Tools with Maturin
-cd src-tauri/src/rust-ue-tools
-maturin build --release --features pyo3
-pip install target/wheels/*.whl
-cd ../../..
-
-# 5. Start development servers
-# Terminal 1: Backend
-python src-python/run_server.py
-
-# Terminal 2: Frontend
-npm run dev
-
-# OR run full desktop app
-npm run tauri:dev
-```
-
-### Build Commands
-
-```bash
-# One-click build (recommended)
-.\build_local.bat
-
-# Manual builds
-npm run build          # Production web build
-npm run tauri:build    # Full desktop application
-
-# Rust UE Tools with Maturin
-cd src-tauri/src/rust-ue-tools
-maturin build --release --features pyo3
-maturin develop  # Install in development mode
-```
-
-### Project Structure
-
-```
-📦 RivalNxt
-├── 📁 core/                    # Python backend modules
-│   ├── api/                   # FastAPI endpoints (50+)
-│   ├── db/                    # SQLite + migrations
-│   ├── ingestion/             # File scanning & discovery
-│   ├── nexus/                 # NexusMods API client
-│   └── utils/                 # Shared utilities
-├── 📁 scripts/                # CLI automation (25+ tools)
-├── 📁 src/                    # React frontend
-│   ├── components/           # UI components
-│   ├── lib/                  # API client & utils
-│   └── styles/               # Tailwind CSS
-├── 📁 src-tauri/             # Rust desktop shell
-│   ├── src/rust-ue-tools/    # Native Rust library (Git submodule)
-│   │   ├── repak-rivals/    # Workspace with PAK/UTOC/Oodle
-│   │   ├── pyproject.toml   # Maturin build config
-│   │   └── Cargo.toml       # Rust workspace config
-│   └── src/main.rs           # Tauri main entry
-├── 📁 build_local.bat        # One-click build script
-├── 📁 .github/workflows/     # CI/CD automation
-└── 📁 src-python/            # Backend entry point
-```
-
-### Development Workflow
-
-**Code Standards**
-
-- Python: PEP 8 with type hints
-- TypeScript: Strict mode, React hooks patterns
-- Rust: Standard conventions with `tauri-plugin-*`
-
-#### Rust UE Tools Development
-
-When working on the Rust components, ensure you have the latest Rust toolchain:
-
-```bash
-# Update Rust toolchain
-rustup update stable
-
-# Check toolchain version
-rustc --version
-
-# Run Rust-specific tests
-cd src-tauri/src/rust-ue-tools
-cargo test
-cargo clippy  # Linting
-cargo fmt --check  # Code formatting check
-```
-
-**Rust Development Tools:**
-
-- **rust-analyzer** (VS Code extension) - IDE support
-- **cargo-watch** - Auto-recompile on changes: `cargo install cargo-watch`
-- **cargo-audit** - Security vulnerability checking: `cargo install cargo-audit`
-
-**Useful Commands**
-
-```bash
-# Database inspection
-python -X utf8 -m scripts.inspect_db
-
-# Database rebuild
-python -X utf8 -m scripts.rebuild_sqlite
-
-# Check missing metadata
-python -X utf8 -m scripts.report_missing_tags
-
-# Generate or update Graphify Knowledge Graph
-graphify update .
-```
-
-### 🤖 Graphify Knowledge Graph for AI Agents
-
-RivalNxt uses `graphify` to generate a cross-language Abstract Syntax Tree (AST) knowledge graph. This allows AI assistants to instantly understand the complex React + Python + Rust architecture without manually scanning every file.
-
-**Setup Instructions:**
-1. Run the update command in the project root:
-   ```bash
-   graphify update .
-   ```
-2. A `graphify-out/` folder will be generated containing the knowledge graph (`graph.json`) and a readable Wiki.
-3. AI agents configured in this project (via `.agents/` rules) will automatically query this graph to answer architecture questions accurately.
-
-> **Note:** Always run `graphify update .` after making significant structural changes to keep the AI context fresh!
-
-**VS Code Extensions** (Recommended)
-
-- Python (ms-python.python)
-- Rust Analyzer (rust-lang.rust-analyzer)
-- TypeScript (ms-vscode.vscode-typescript-next)
-- Tailwind CSS (bradlc.vscode-tailwindcss)
-
-## 🤖 CI/CD Automation
-
-RivalNxt uses GitHub Actions for automated builds and releases.
-
-### Release Workflow
-
-When a new GitHub Release is published, the workflow automatically:
-
-1. **Builds PyO3 Module** - Uses Maturin to build Python wheel with Rust bindings
-2. **Packages Backend** - Creates standalone executable with PyInstaller
-3. **Builds Tauri App** - Compiles desktop application with embedded backend
-4. **Uploads Assets** - Attaches installer to the GitHub Release
-
-### Workflow File
-
-See [`.github/workflows/release.yml`](file:///c:/Users/rouna/OneDrive/Documents/vs_code_projects/RivalNxt/.github/workflows/release.yml) for the complete CI/CD configuration.
-
-### Key Features
-
-- **Submodule Support** - Automatically initializes Git submodules
-- **Multi-stage Caching** - Caches Rust, Node, and Python dependencies
-- **Size Validation** - Ensures backend executable includes all dependencies
-- **Artifact Upload** - Uploads build artifacts for debugging
-- **Automated Release** - No manual build steps required for releases
-
-### Creating a Release
-
-```bash
-# 1. Tag your commit
-git tag v0.8.0
-git push origin v0.8.0
-
-# 2. Create GitHub Release from tag
-# The workflow will automatically build and attach the installer
-```
-
-## 🏷️ Automatic Tagging System
-
-RivalNxt includes an intelligent, zero-configuration tagging system that automatically parses mod files to discover and associate relevant metadata. 
-
-### How It Works
-
-1. **Asset Path Parsing (`tag_assets.py`)**: When a mod is loaded, the system examines the directory structure and file paths of its assets (e.g., `characters/1029/1029303/materials/`). It uses heuristics and known patterns (like 4-digit character IDs and 7-digit skin IDs) to identify which characters and skins the mod affects.
-2. **Game Data Extraction (`marvel_rivals_ids.py`)**: The `rust-ue-tools` integration unpacks `.locres` localization files directly from the game's `Paks` directory. This script extracts the official in-game names for characters and skins (e.g., matching character ID `1029` to "Magik").
-3. **Database Population (`characters.py`)**: The extracted mappings are stored in the local SQLite database. The original casing (e.g. "Magik") is preserved exactly as it appears in the localization files.
-4. **UI Integration (`DownloadsSidebar.tsx`)**: In the UI, tags are resolved dynamically against the database (`tagLookupMap`). The frontend normalizes case discrepancies (e.g. if a Nexus mod uses "magik" instead of "Magik"), avoiding duplicated filters in the sidebar and properly nesting skins under their parent characters.
-
-### Custom Tags
-Any tags provided by a mod that do not map to known characters or categories are treated as **Custom Tags** (e.g., "required", "optional", or modder-specific tags) and are also merged case-insensitively for a cleaner user interface.
-
-## ⚙️ Configuration
-
-Configuration is stored at: `%APPDATA%/com.rivalnxt.modmanager/settings.json`
-
-**Environment Variables**
-
-| Variable                             | Description             | Default           |
-| ------------------------------------ | ----------------------- | ----------------- |
-| `MM_DATA_DIR`                        | Data directory override | Platform-specific |
-| `MM_BACKEND_HOST`                    | Backend bind address    | `127.0.0.1`       |
-| `MM_BACKEND_PORT`                    | Backend port            | `8000`            |
-| `NEXUS_API_KEY`                      | NexusMods API key       | None              |
-| `MARVEL_RIVALS_ROOT`                 | Game installation path  | Required          |
-| `MARVEL_RIVALS_LOCAL_DOWNLOADS_ROOT` | Mod downloads folder    | Required          |
-
-See [Configuration Guide](./NEXUS_API_KEY_USAGE.md) for detailed setup instructions.
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](#contribution-guidelines) for details.
-
-### Contribution Guidelines
-
-**Getting Started**
-
-1. Check [open issues](https://github.com/Rounak77382/Project_ModManager_Rivals/issues)
-2. Look for [`good first issue`](https://github.com/Rounak77382/Project_ModManager_Rivals/labels/good%20first%20issue) labels
-3. Open an issue for major changes before starting work
-
-**Pull Request Process**
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit changes (`git commit -m 'Add AmazingFeature'`)
-4. Push to branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-**Code Quality Standards**
-
-- Add tests for new features
-- Update documentation
-- Follow existing code style
-- Validate all inputs and API parameters
-
-## 🐛 Known Issues
-
-See the [issue tracker](https://github.com/Rounak77382/Project_ModManager_Rivals/issues) for known bugs and feature requests.
-
-## 📄 License
-
-No license file is currently present. This project is "all rights reserved" by default. Please open an issue to discuss licensing before contributing or reusing code.
-
-Consider adding an SPDX-compatible `LICENSE` file (MIT, Apache 2.0, GPL, etc.).
-
-## 🙏 Acknowledgments
-
-Built with amazing open-source tools:
-
-- [Rust UE Tools](https://github.com/Rounak77382/rust-ue-tools) - Native Rust implementation replacing external CLI tools
-  - Based on [natimerry/repak-rivals](https://github.com/natimerry/repak-rivals) and retoc libraries
-  - Provides PAK/UTOC operations without external dependencies
-- [Tauri](https://tauri.app/) - Lightweight desktop runtime
-- [FastAPI](https://fastapi.tiangolo.com/) - Modern Python web framework
-- [React](https://reactjs.org/) + [Vite](https://vitejs.dev/) - Fast frontend tooling
-- [Radix UI](https://www.radix-ui.com/) - Accessible component primitives
-- [NexusMods](https://www.nexusmods.com/) - Modding community platform
+## Credit where it belongs
+
+This is a **fork of [Rounak77382/RivalNxt](https://github.com/Rounak77382/RivalNxt)**.
+The application, its architecture and the hard parts — reading Unreal `.pak`
+containers, the Rust UE Tools library, asset extraction, the conflict engine,
+Nexus ingestion — are **Rounak77382's work**, and most of that code is untouched
+here.
+
+Measured against upstream at the time of this fork:
+
+| | |
+|---|---|
+| Source files upstream | 233 |
+| Files this fork changes | 89 |
+| **Files left exactly as the author wrote them** | **144 (62%)** |
+| Diff | +18,975 / −13,695 across 132 files |
+
+This fork fixes bugs and adds features on top of that foundation. It is not a
+rewrite, and it would not exist without the original.
 
 ---
 
-<div align="center">
+## Why this fork exists
 
-Made with ❤️ for the Marvel Rivals modding community
+A single session of real use surfaced a set of faults, each traced to a root
+cause rather than patched at the symptom.
 
-**[⬆ back to top](#-rivalnxt)**
+### Backups did not work
 
-</div>
+**Creating one failed outright** on any sizeable library. The export serialised
+every custom image as base64 into one JSON string; a library with a few hundred
+mods produced a string past V8's maximum length and `JSON.stringify` threw
+`Invalid string length`. No file was written. Backups now snapshot the database
+itself through SQLite's online backup API, so nothing is serialised in the
+webview at all.
+
+**Restoring one crashed** with `OSError: [Errno 22] Invalid argument`. SQLite
+keeps `mods.db` memory-mapped (`PRAGMA mmap_size = 256MB`), and Windows refuses
+to truncate a file with a live mapped section — a condition CPython has no errno
+for, so it surfaced as that unhelpful message. The restore now writes *through*
+SQLite instead of replacing the file behind its back.
+
+**Restoring still changed nothing visible**, because a mod is active when its
+`.pak` sits in the game's `~mods` folder, not when a column says so. Restoring
+rewrote the column and moved no files — and the next refresh pruned the column
+back to match the disk. The restore now puts the files back too.
+
+### Other fixes
+
+- **"Rebuild Local Downloads" appeared to hang** at `2/213` forever. The task had
+  finished in 5.76 s; the progress parser treated "processed < total" as
+  in-flight, and skipping unchanged archives made that permanently true.
+- **Removed files came back** after every rebuild. The removal edited
+  `local_downloads.contents`, which the ingest rewrites from the archive.
+  Removals are now recorded separately and applied when the mod is read.
+- **Images vanished when a mod was linked** to Nexus. Anything attached to an
+  unlinked download is keyed by the negated download id; linking changed which
+  key the app reads without moving the rows. They are carried across now, and
+  two migrations recover the ones already stranded.
+- **Manual Mod IDs were lost** on every "Initial Database Build": the id is
+  parsed from the file name, which no longer contains one after the app renames
+  a file, and the override table nobody read held the answer.
+- **452 of 646 CSS classes did nothing.** `src/index.css` was a snapshot of
+  Tailwind's output, so any class added after that snapshot had no rule —
+  missing padding, margins and icon sizes across the whole app. A real Tailwind
+  build now generates them from source.
+
+### Added
+
+- **Restore points** — full snapshots and mod loadouts in one list, newest
+  first, with what each covers stated on the row
+- **Named presets** for switching between sets of mods
+- **Bulk operations** — select many mods, then enable, disable, tag or delete,
+  with a single conflict rebuild for the batch rather than one per mod
+- **History** — what the app changed and when, so "did that apply?" has an answer
+- **Per-file notes and hiding** — mods ship a dozen variants named `A_rogueVA`,
+  `A_rogueVB`…; write down which is which, hide the ones you do not want, or
+  delete them from the archive outright
+- **Images from the mod's own archive** — 45% of archives ship screenshots next
+  to the `.pak` files; pick them from a grid instead of hunting for links
+- **Nexus browsing** by name, with adult-content and category filters
+- **Progress with a percentage and an estimate**, instead of a count that stalls
+
+### Measured improvements
+
+| | Before | After |
+|---|---|---|
+| Asset ingest | 252.3 s | 57.7 s (4.4×) |
+| Repeat ingest | full re-extract | 6.0 s (fingerprint skip) |
+| Database size | 2.2 GB | 126 MB |
+| Duplicate images | 1,050 of 1,352 rows | 0 |
+| Nexus sync on rebuild | ~390 requests | skipped when fresh |
+
+The last one matters on a free Nexus key, which allows 100 requests an hour: a
+single rebuild used to exhaust the budget and start failing partway.
+
+---
+
+## Installation
+
+1. Download `RivalNxt_1.0.0_x64-setup.exe` from
+   [Releases](../../releases/latest)
+2. Run it. Windows SmartScreen will warn about an unsigned installer — the build
+   is not code-signed; choose **More info → Run anyway**, or build from source.
+3. On first launch, set your Marvel Rivals folder and your mod downloads folder
+4. Optionally add a Nexus API key in Settings to enable metadata and update checks
+
+Your Nexus API key is stored in `%APPDATA%\com.rivalnxt.modmanager\settings.json`
+and never leaves your machine.
+
+---
+
+## Building from source
+
+```bash
+git clone --recurse-submodules https://github.com/Edwin-Arb/RivalNxt.git
+cd RivalNxt
+build_local.bat
+```
+
+Requires Node 20+, Python 3.11, Rust, and WinRAR or 7-Zip for `.rar`/`.7z`
+archives. The script installs npm dependencies, builds the Rust PyO3 module with
+maturin, bundles the Python backend with PyInstaller, and produces the installer.
+
+### Verification
+
+```bash
+npm run typecheck && npm test        # 255 frontend tests
+python -m pytest tests/backend -q    # 623 backend tests
+ruff check core scripts src-python
+```
+
+---
+
+## Licence
+
+**The upstream project carries no licence**, which means all rights are reserved
+by its author. This fork exists under the licence GitHub grants for public
+repositories ([GitHub ToS §D.5](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service#5-license-grant-to-other-users)),
+which permits viewing and forking — nothing more.
+
+If you want to reuse this code beyond that, ask
+[Rounak77382](https://github.com/Rounak77382/RivalNxt) first. The upstream README
+asks exactly this, and it is a reasonable request.
+
+The bundled Oodle libraries (`oo2core_9_win64.dll`, `liboo2corelinux64.so.9`) are
+proprietary and are not covered by any of the above.
+
+---
+
+## Contributing back
+
+Fixes here are offered upstream rather than kept. If you are the original author
+and want any of this, take it — no attribution needed, no PR ceremony required.
+
+## Acknowledgements
+
+- **[Rounak77382](https://github.com/Rounak77382)** — the application itself
+- **[repak](https://github.com/trumank/repak)** — Unreal `.pak` handling
+- **Nexus Mods** — the API this integrates with

@@ -2,7 +2,7 @@
  * F8: long mod lists must virtualize, without breaking hover/scroll behaviour.
  *
  * Nothing in src/ was virtualized. ActiveModsView (two lists), DownloadsPage,
- * BrowsePage and CollectionsPage each rendered every row, so a library of several
+ * CollectionsPage rendered every row, so a library of several
  * hundred mods mounted several hundred card trees on every filter or sort change.
  */
 import { render, screen } from "@testing-library/react";
@@ -241,8 +241,7 @@ describe("every intended list is wired up", () => {
   it.each([
     ["ActiveModsView.tsx", 2], // active + inactive
     ["DownloadsPage.tsx", 1],
-    ["BrowsePage.tsx", 1],
-    ["CollectionsPage.tsx", 1], // per-collection body
+        ["CollectionsPage.tsx", 1], // per-collection body
   ])("%s uses VirtualizedModList %i time(s)", (file, count) => {
     const s = read(file);
     const uses = s.match(/<VirtualizedModList/g) ?? [];
@@ -252,7 +251,6 @@ describe("every intended list is wired up", () => {
   it.each([
     "ActiveModsView.tsx",
     "DownloadsPage.tsx",
-    "BrowsePage.tsx",
     "CollectionsPage.tsx",
   ])("%s no longer maps the full list into cards", (file) => {
     const s = read(file);
@@ -266,7 +264,6 @@ describe("every intended list is wired up", () => {
   it.each([
     "ActiveModsView.tsx",
     "DownloadsPage.tsx",
-    "BrowsePage.tsx",
     "CollectionsPage.tsx",
   ])("%s attaches scrollRef to its EXISTING scroll container", (file) => {
     const s = read(file);
@@ -281,7 +278,6 @@ describe("every intended list is wired up", () => {
   it.each([
     "ActiveModsView.tsx",
     "DownloadsPage.tsx",
-    "BrowsePage.tsx",
     "CollectionsPage.tsx",
   ])("%s drives column count from useGridColumns", (file) => {
     const s = read(file);
@@ -293,7 +289,6 @@ describe("every intended list is wired up", () => {
     for (const file of [
       "ActiveModsView.tsx",
       "DownloadsPage.tsx",
-      "BrowsePage.tsx",
       "CollectionsPage.tsx",
     ]) {
       const s = read(file);

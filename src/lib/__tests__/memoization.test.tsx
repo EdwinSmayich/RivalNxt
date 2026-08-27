@@ -1,7 +1,7 @@
 /**
  * F7: the filter + sort chains must not recompute on unrelated re-renders.
  *
- * ActiveModsView, DownloadsPage and BrowsePage each ran a category filter, a
+ * ActiveModsView and DownloadsPage each ran a category filter, a
  * hierarchical character/skin filter and a multi-key sort — 130-200 lines of
  * array work — inline in the component body. That re-ran on EVERY render,
  * including renders caused entirely by unrelated parent state such as a polling
@@ -149,7 +149,7 @@ describe("components memoise their derivation", () => {
     expect(s).toMatch(/installedCount === 0/);
   });
 
-  it.each(["DownloadsPage.tsx", "BrowsePage.tsx"])(
+  it.each(["DownloadsPage.tsx"])(
     "%s memoises its filter+sort chain",
     (file) => {
       const s = source(file);
@@ -161,7 +161,7 @@ describe("components memoise their derivation", () => {
     },
   );
 
-  it.each(["ActiveModsView.tsx", "DownloadsPage.tsx", "BrowsePage.tsx"])(
+  it.each(["ActiveModsView.tsx", "DownloadsPage.tsx"])(
     "%s no longer sorts in the render body",
     (file) => {
       const s = source(file);

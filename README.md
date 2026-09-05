@@ -10,8 +10,8 @@ A desktop app to install, organise and switch Marvel Rivals mods, with conflict
 detection, Nexus Mods integration and a local database.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#installation)
-[![Version](https://img.shields.io/badge/version-1.0.0-success?style=for-the-badge)](#)
-[![Tests](https://img.shields.io/badge/tests-861%20passing-brightgreen?style=for-the-badge)](#verification)
+[![Version](https://img.shields.io/badge/version-1.0.1-success?style=for-the-badge)](#)
+[![Tests](https://img.shields.io/badge/tests-880%20passing-brightgreen?style=for-the-badge)](#verification)
 
 </div>
 
@@ -30,12 +30,12 @@ Measured against upstream at the time of this fork:
 | | |
 |---|---|
 | Files in the upstream tree | 338 |
-| Modified | 43 |
+| Modified | 44 |
 | Deleted | 39 |
 | Moved | 20 |
-| **Left exactly as the author wrote them** | **236 (70%)** |
-| Files this fork adds | 46 |
-| Diff | +17,103 / −12,859 across 148 files |
+| **Left exactly as the author wrote them** | **235 (70%)** |
+| Files this fork adds | 48 |
+| Diff | +17,840 / −12,895 across 151 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
 rewrite, and it would not exist without the original. Check the numbers rather
@@ -91,6 +91,18 @@ back to match the disk. The restore now puts the files back too.
   Tailwind's output, so any class added after that snapshot had no rule —
   missing padding, margins and icon sizes across the whole app. A real Tailwind
   build now generates them from source.
+- **Mods piled up loose at the root of `~mods`** instead of going into their
+  character folder. `active_paks` stores the path a pak has *inside its archive*,
+  and the tag lookup is keyed by the bare filename — so every mod whose archive
+  nests its paks in a folder found no tags, resolved to no character, and was
+  filed at the root. 73 of 115 active downloads in one library. Deleting a mod's
+  tag and adding it again was the only workaround, because custom tags are read
+  before that lookup.
+- **"Sort Mods Into Folders" rewrote the library from its archives.** It
+  re-activated every active download, and activation re-extracts each
+  destination whether or not it is already correct — so sorting three strays
+  re-extracted everything, and a mod whose archive had moved could never be
+  sorted at all. It now moves the files.
 
 ### Added
 
@@ -125,7 +137,7 @@ single rebuild used to exhaust the budget and start failing partway.
 
 ## Installation
 
-1. Download `RivalNxt_1.0.0_x64-setup.exe` from
+1. Download `RivalNxt_1.0.1_x64-setup.exe` from
    [Releases](../../releases/latest)
 2. Run it. Windows SmartScreen will warn about an unsigned installer — the build
    is not code-signed; choose **More info → Run anyway**, or build from source.
@@ -142,6 +154,8 @@ and never leaves your machine.
 ```bash
 git clone --recurse-submodules https://github.com/EdwinSmayich/RivalNxt.git
 cd RivalNxt
+py -3 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 build_local.bat
 ```
 
@@ -149,18 +163,25 @@ Requires Node 20+, Python 3.11, Rust, and WinRAR or 7-Zip for `.rar`/`.7z`
 archives. The script installs npm dependencies, builds the Rust PyO3 module with
 maturin, bundles the Python backend with PyInstaller, and produces the installer.
 
+The `.venv` is not optional: the build uses that interpreter explicitly rather
+than whatever `python` resolves to, and puts `.venv\Scripts` and cargo on `PATH`
+itself. 1.0.0 was built by an interpreter that happened not to have Pillow, and
+shipped a backend that could not resize an image — silently, because PyInstaller
+reports a missing module as a warning and exits 0. The build now checks the
+bundle before calling itself done.
+
 ### Verification
 
 ```bash
 npm run typecheck && npm test        # 238 frontend tests
-python -m pytest tests/backend -q    # 623 backend tests
+python -m pytest tests/backend -q    # 642 backend tests
 ruff check core scripts src-python
 ```
 
 Seventeen further tests check that the shipped bundle is actually code-split.
 They read `dist/`, so they skip unless you have run `npm run build` first —
 deliberately, because a test that cannot see its subject should say so rather
-than pass. With a build present the total is 878.
+than pass. With a build present the total is 897.
 
 ---
 

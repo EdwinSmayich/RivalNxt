@@ -5042,28 +5042,42 @@ def _task_reorganize_mods() -> Tuple[int, Dict[str, Any]]:
 
     Folder placement happens when a mod is activated, so improving the
     inference does nothing for files activated earlier — they stay loose at the
-    root of ~mods until someone toggles them. This re-activates each mod with
-    the selection it already has, which runs the normal placement path: no new
-    logic to keep in step with the real one, and files that are already in the
-    right folder are left alone by it.
+    root of ~mods until someone toggles them.
+
+    This used to re-activate every active download, because that reuses the real
+    placement path instead of duplicating it. The cost was hidden: set_active_paks
+    unlinks and re-extracts each destination whether or not it is already
+    correct, so sorting a handful of strays rewrote the entire active library
+    from its archives — and a mod whose archive had since been deleted or moved
+    raised 404 and could never be sorted at all.
+
+    _refile_active_paks makes the same folder decision and then just moves the
+    files, so the common case touches only what is in the wrong place and does
+    not need the archives to exist. Re-activation is kept for the one case moving
+    cannot cover: a row that claims to be active with no file under ~mods.
     """
     logger = logging.getLogger("modmanager.api")
-    conn = get_db()
-    moved = unchanged = failed = 0
-    try:
-        rows = conn.execute(
-            "SELECT id, name, active_paks FROM local_downloads "
-            "WHERE active_paks IS NOT NULL AND active_paks NOT IN ('', '[]') ORDER BY id"
-        ).fetchall()
-    finally:
+    result = _refile_active_paks()
+    moved = int(result.get("downloads") or 0)
+    failed = 0
+
+    missing = [int(x) for x in (result.get("missing_downloads") or [])]
+    if missing:
+        print(f"{len(missing)} download(s) have no file under ~mods; re-extracting those.")
+    for dl_id in missing:
+        conn = get_db()
         try:
-            conn.close()
-        except Exception:
-            pass
-
-    print(f"{len(rows)} active download(s) to re-file.")
-
-    for dl_id, name, active_json in rows:
+            row = conn.execute(
+                "SELECT name, active_paks FROM local_downloads WHERE id = ?", (dl_id,)
+            ).fetchone()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if not row:
+            continue
+        name, active_json = row
         try:
             active = json.loads(active_json) if active_json else []
         except Exception:
@@ -5071,8 +5085,6 @@ def _task_reorganize_mods() -> Tuple[int, Dict[str, Any]]:
         if not isinstance(active, list) or not active:
             continue
         try:
-            # The same call the UI makes; it recomputes the target folder and
-            # relocates the files if it differs from where they sit now.
             set_active_paks(int(dl_id), {"active_paks": active})
             moved += 1
         except HTTPException as exc:
@@ -5082,9 +5094,22 @@ def _task_reorganize_mods() -> Tuple[int, Dict[str, Any]]:
             failed += 1
             logger.warning("[reorganize_mods] id=%s (%s) failed: %s", dl_id, name, exc)
 
-    print(f"Re-filed {moved} mod(s); {failed} could not be processed.")
-    logger.info("[reorganize_mods] processed=%s failed=%s", moved, failed)
-    return 0, {"processed": moved, "unchanged": unchanged, "failed": failed}
+    print(
+        f"Sorted {result.get('moved', 0)} file(s) into character folders; "
+        f"{result.get('unresolved', 0)} mod(s) had no character to file under; "
+        f"{failed} could not be processed."
+    )
+    logger.info(
+        "[reorganize_mods] files=%s downloads=%s unresolved=%s conflicts=%s failed=%s",
+        result.get("moved"), moved, result.get("unresolved"), result.get("conflicts"), failed,
+    )
+    return 0, {
+        "processed": moved,
+        "files_moved": int(result.get("moved") or 0),
+        "unresolved": int(result.get("unresolved") or 0),
+        "conflicts": int(result.get("conflicts") or 0),
+        "failed": failed,
+    }
 
 
 def _task_dedupe_images() -> Tuple[int, Dict[str, Any]]:
@@ -10775,6 +10800,150 @@ def _materialise_active_paks(previous: Dict[int, List[str]]) -> Dict[str, Any]:
 		"[restore] re-activated=%s deactivated=%s failed=%s", applied, removed, failed
 	)
 	return {"activated": applied, "deactivated": removed, "failed": failed}
+
+
+def _refile_active_paks(*, dry_run: bool = False) -> Dict[str, Any]:
+	"""Move already-active paks into the character folder they now resolve to.
+
+	set_active_paks picks the ~mods subfolder once, at activation, from whatever
+	the database knew at that moment. A mod activated before its pak tags had
+	been extracted has no character to file under, so it lands at the root of
+	~mods -- and nothing ever revisits it. The tags arrive minutes later and the
+	file stays where it was, for good.
+
+	That is how 23 paks ended up loose next to 20 correct character folders in
+	one real library. Every one of them had a correct tag by then: ELSA
+	BLOODSTONE, Cloak & Dagger, ROGUE. Re-tagging the mod by hand did not help
+	either, because tags are read when activating, and the activation had
+	already happened.
+
+	This re-runs only the folder decision, not the activation: files are moved
+	on disk, nothing is extracted from archives, and a download whose character
+	still cannot be resolved is left exactly where it is. A pak already sitting
+	in the right folder costs a dictionary lookup.
+	"""
+	logger = logging.getLogger("modmanager.api")
+	mods_dir = _mods_folder_from_env()
+	if not mods_dir.exists():
+		return {"moved": 0, "downloads": 0, "unresolved": 0, "conflicts": 0}
+
+	index = _index_mods_dir(mods_dir)
+	moved: List[Dict[str, str]] = []
+	touched_downloads = 0
+	unresolved = 0
+	conflicts: List[str] = []
+	missing_downloads: List[int] = []
+
+	conn = get_db()
+	try:
+		cur = conn.cursor()
+		rows = cur.execute(
+			"SELECT id, name, mod_id, active_paks FROM local_downloads "
+			"WHERE active_paks IS NOT NULL AND active_paks NOT IN ('', '[]')"
+		).fetchall()
+
+		for dl_id, dl_name, dl_mod_id, active_json in rows:
+			try:
+				desired = json.loads(active_json) if active_json else []
+			except Exception:
+				continue
+			if not isinstance(desired, list):
+				continue
+			desired = [p for p in desired if isinstance(p, str) and p]
+			if not desired:
+				continue
+
+			try:
+				mod_id_for_download = int(dl_mod_id) if dl_mod_id is not None else None
+			except (TypeError, ValueError):
+				mod_id_for_download = None
+			# Same key set_active_paks uses: the Nexus id, or -(download id) for a
+			# local mod that has none.
+			effective_mod_id = (
+				mod_id_for_download if mod_id_for_download is not None else -int(dl_id)
+			)
+
+			try:
+				tag = _infer_character_tag(
+					cur,
+					name=dl_name if isinstance(dl_name, str) else None,
+					pak_candidates=[os.path.basename(p) for p in desired],
+					mod_id=effective_mod_id,
+				)
+			except Exception:
+				tag = None
+			if not tag:
+				unresolved += 1
+				continue
+
+			target = mods_dir / _to_folder_name(tag)
+			download_moved = False
+
+			for item in desired:
+				stem = os.path.splitext(os.path.basename(item))[0]
+				if not _index_lookup(index, f"{stem}.pak"):
+					# The row says this is active but no such file is under ~mods.
+					# Moving cannot conjure it; only a re-extract from the archive
+					# can, so hand this download to the caller.
+					if dl_id not in missing_downloads:
+						missing_downloads.append(int(dl_id))
+					continue
+				# A pak travels with its IoStore companions or the game ignores it.
+				for ext in (".pak", ".utoc", ".ucas"):
+					fname = f"{stem}{ext}"
+					for current in _index_lookup(index, fname):
+						if current.parent == target:
+							continue
+						dest = target / fname
+						if dest.exists():
+							# Two files with one name: moving would destroy one of
+							# them, and guessing which is wrong is not this pass's
+							# job. Report it and leave both alone.
+							conflicts.append(fname)
+							continue
+						if dry_run:
+							moved.append({"file": fname, "to": target.name})
+							download_moved = True
+							continue
+						try:
+							_ensure_dir(target)
+							shutil.move(str(current), str(dest))
+						except Exception as exc:
+							logger.warning("[refile] could not move %s: %s", fname, exc)
+							continue
+						moved.append({"file": fname, "to": target.name})
+						download_moved = True
+
+			if download_moved:
+				touched_downloads += 1
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+	if moved and not dry_run:
+		# Names are stale once files have moved; the next caller must re-walk.
+		index.clear()
+		_log_activity(
+			"refile",
+			f"Sorted {len(moved)} file(s) into character folders",
+			json.dumps({"moved": moved[:50], "conflicts": conflicts[:20]}),
+		)
+
+	logger.info(
+		"[refile] moved=%s downloads=%s unresolved=%s conflicts=%s missing=%s",
+		len(moved), touched_downloads, unresolved, len(conflicts), len(missing_downloads),
+	)
+	return {
+		"moved": len(moved),
+		"downloads": touched_downloads,
+		"unresolved": unresolved,
+		"conflicts": len(conflicts),
+		"details": moved[:200],
+		"conflicting_files": conflicts[:50],
+		"missing_downloads": missing_downloads,
+	}
 
 
 @app.post("/api/backup/restore")

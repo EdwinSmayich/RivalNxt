@@ -92,6 +92,35 @@ def parse_mod_filename(filename: str) -> Tuple[str, Optional[int], str]:
             name = re.sub(r"\s+", " ", name)
             return name, mod_id_candidate, version
 
+    # 1c. Underscore convention with an ISO date instead of a Unix epoch:
+    #     <Name>_<ModID>_<Version>_<ISO timestamp>_<random suffix>
+    #     e.g. "BodyReshape_MagikSoullessSword_Addons_9902_1_2026-06-20T19-12Z_V1FxDq0Zh"
+    #          "HeavyBush_10878_1.0_2026-07-16T17-03Z_oET5q7AMd"
+    #
+    # Both patterns above anchor on a 9-11 digit epoch, so neither matches this
+    # shape and the id went unread even though it is right there in the name.
+    # In one real library that was 12 downloads, eight of them "_Addons_" files
+    # -- which is what made an add-on split away from its base mod on every
+    # rebuild, since grouping and artwork are both keyed on the mod id.
+    #
+    # The version group must start with a digit, so a name that happens to
+    # contain "_<digits>_" earlier backtracks to the real id rather than
+    # stopping at the first number it sees.
+    nexus_iso_pattern = re.compile(
+        r"^(.+?)"                              # Name (non-greedy)
+        r"_(\d{1,7})"                          # _ModID
+        r"_(\d[\w.]*)"                         # _Version, digit-led
+        r"_(\d{4}-\d{2}-\d{2}T[\d:\-]+Z?)"     # _ISO-8601 timestamp
+        r"(?:_[\w-]+)?"                        # _optional random suffix
+        r"$"
+    )
+    nexus_iso_match = nexus_iso_pattern.match(base)
+    if nexus_iso_match:
+        name_raw = nexus_iso_match.group(1)
+        if re.search(r"[^\d_]", name_raw):
+            name = re.sub(r"\s+", " ", name_raw.replace("_", " ").strip())
+            return name, int(nexus_iso_match.group(2)), nexus_iso_match.group(3)
+
     # 2. Heuristic parsing for non-Nexus files
     # Strip Unreal Engine .pak suffixes like _9999999_P, _P, _p
     base = re.sub(r"_(?:\d+_)?(?:P|p)$", "", base)

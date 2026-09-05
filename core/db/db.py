@@ -1091,7 +1091,15 @@ def replace_local_downloads(conn: sqlite3.Connection, rows: Iterable[Dict[str, A
                 id=excluded.id,
                 name=excluded.name,
                 mod_id=excluded.mod_id,
-                version=excluded.version,
+                -- A rescan often cannot read an id out of the filename: the
+                -- download was renamed, or Nexus wrote it in a shape the parser
+                -- does not know. Overwriting a known id with NULL there
+                -- silently ungroups the mod, and every rebuild did it again --
+                -- an "Addons" download separating from its base mod and taking
+                -- its artwork with it, because both are keyed on the mod id.
+                -- A rescan that *does* find an id still wins; only NULL loses.
+                mod_id=COALESCE(excluded.mod_id, local_downloads.mod_id),
+                version=COALESCE(excluded.version, local_downloads.version),
                 contents=excluded.contents,
                 active_paks=excluded.active_paks,
                 created_at=COALESCE(excluded.created_at, local_downloads.created_at)

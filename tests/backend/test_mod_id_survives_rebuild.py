@@ -125,3 +125,66 @@ class TestManualAssignmentSurvives:
             assert _mod_id(c, "x.zip") == 1
         finally:
             c.close()
+
+
+class TestARescanNeverDowngradesWhatIsKnown:
+    """A rescan that cannot read an id must not erase the one already stored.
+
+    The upsert set ``mod_id=excluded.mod_id`` unconditionally, so a scan that
+    came back with nothing wrote NULL over a perfectly good id. Overrides were
+    re-applied afterwards, which covered ids the user had assigned by hand --
+    but not ids that came from a Nexus sync, or from a filename shape the
+    parser did not know.
+
+    That is what made an "Addons" download detach from its base mod on every
+    rebuild: both are grouped by mod id, and so is their artwork. Measured on
+    one library, 12 of 209 downloads lost their id to this, eight of them
+    ``_Addons_`` files.
+    """
+
+    ADDONS = "BodyReshape_MagikSoullessSword_Addons_9902_1_2026-06-20T19-12Z_V1FxDq0Zh.rar"
+
+    def test_a_scan_without_an_id_keeps_the_stored_one(self, conn):
+        replace_local_downloads(conn, [_scan_row(self.ADDONS, "Magik Addons", mod_id=9902)])
+        assert _mod_id(conn, self.ADDONS) == 9902
+
+        # Rebuild, this time the scan yields no id at all.
+        replace_local_downloads(conn, [_scan_row(self.ADDONS, "Magik Addons")])
+        assert _mod_id(conn, self.ADDONS) == 9902, "the rebuild ungrouped the mod"
+
+    def test_repeated_rebuilds_do_not_erode_it(self, conn):
+        replace_local_downloads(conn, [_scan_row(self.ADDONS, "Magik Addons", mod_id=9902)])
+        for _ in range(5):
+            replace_local_downloads(conn, [_scan_row(self.ADDONS, "Magik Addons")])
+        assert _mod_id(conn, self.ADDONS) == 9902
+
+    def test_a_scan_that_does_find_an_id_still_wins(self, conn):
+        """Only NULL is refused; a real correction must still apply."""
+        replace_local_downloads(conn, [_scan_row(self.ADDONS, "Magik Addons", mod_id=9902)])
+        replace_local_downloads(conn, [_scan_row(self.ADDONS, "Magik Addons", mod_id=1234)])
+        assert _mod_id(conn, self.ADDONS) == 1234
+
+    def test_the_base_and_its_addons_stay_on_one_mod_id(self, conn):
+        """The user-visible symptom: one mod becoming two cards."""
+        base = "BodyReshape_MagikSoullessSword_Base.rar"
+        replace_local_downloads(conn, [
+            _scan_row(base, "Magik Base", mod_id=9902),
+            _scan_row(self.ADDONS, "Magik Addons", mod_id=9902),
+        ])
+        # Neither filename gives an id up on the next scan.
+        replace_local_downloads(conn, [
+            _scan_row(base, "Magik Base"),
+            _scan_row(self.ADDONS, "Magik Addons"),
+        ])
+        ids = {r[0] for r in conn.execute("SELECT mod_id FROM local_downloads")}
+        assert ids == {9902}, f"the pair split across {ids}"
+
+    def test_a_version_is_kept_the_same_way(self, conn):
+        row = _scan_row(self.ADDONS, "Magik Addons", mod_id=9902)
+        row["version"] = "1.2"
+        replace_local_downloads(conn, [row])
+        replace_local_downloads(conn, [_scan_row(self.ADDONS, "Magik Addons")])
+        version = conn.execute(
+            "SELECT version FROM local_downloads WHERE path = ?", (self.ADDONS,)
+        ).fetchone()[0]
+        assert version == "1.2"

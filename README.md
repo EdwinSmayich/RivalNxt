@@ -10,8 +10,8 @@ A desktop app to install, organise and switch Marvel Rivals mods, with conflict
 detection, Nexus Mods integration and a local database.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#installation)
-[![Version](https://img.shields.io/badge/version-1.0.1-success?style=for-the-badge)](#)
-[![Tests](https://img.shields.io/badge/tests-880%20passing-brightgreen?style=for-the-badge)](#verification)
+[![Version](https://img.shields.io/badge/version-1.0.2-success?style=for-the-badge)](#)
+[![Tests](https://img.shields.io/badge/tests-900%20passing-brightgreen?style=for-the-badge)](#verification)
 
 </div>
 
@@ -106,6 +106,13 @@ back to match the disk. The restore now puts the files back too.
   destination whether or not it is already correct — so sorting three strays
   re-extracted everything, and a mod whose archive had moved could never be
   sorted at all. It now moves the files.
+- **A rebuild ungrouped mods it could not re-identify.** The upsert wrote the
+  scanned `mod_id` unconditionally, so a scan that read no id put `NULL` over a
+  good one — and both grouping and artwork are keyed on it, so an `Addons`
+  download detached from its base mod and lost its images, every rebuild.
+  It read no id because both filename patterns anchor on a Unix epoch, and
+  Nexus also writes `..._9902_1_2026-06-20T19-12Z_V1FxDq0Zh.rar`. 12 of 209
+  downloads in one library; 8 of them `_Addons_` files.
 
 ### Added
 
@@ -140,7 +147,7 @@ single rebuild used to exhaust the budget and start failing partway.
 
 ## Installation
 
-1. Download `RivalNxt_1.0.1_x64-setup.exe` from
+1. Download `RivalNxt_1.0.2_x64-setup.exe` from
    [Releases](../../releases/latest)
 2. Run it. Windows SmartScreen will warn about an unsigned installer — the build
    is not code-signed; choose **More info → Run anyway**, or build from source.
@@ -177,14 +184,14 @@ bundle before calling itself done.
 
 ```bash
 npm run typecheck && npm test        # 238 frontend tests
-python -m pytest tests/backend -q    # 642 backend tests
+python -m pytest tests/backend -q    # 662 backend tests
 ruff check core scripts src-python
 ```
 
 Seventeen further tests check that the shipped bundle is actually code-split.
 They read `dist/`, so they skip unless you have run `npm run build` first —
 deliberately, because a test that cannot see its subject should say so rather
-than pass. With a build present the total is 897.
+than pass. With a build present the total is 917.
 
 ---
 

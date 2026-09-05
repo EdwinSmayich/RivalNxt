@@ -693,9 +693,9 @@ export function ModModal({
    * What to search Nexus with when looking for artwork of this character.
    *
    * Seeded from the mod's *name*, not its character tag. Authors name mods
-   * "<skin> <character>" — "Sexy Savage Land Rogue" — so the name carries the
-   * skin, which the tag does not. Searching the tag alone found the right hero
-   * wearing the wrong outfit every time.
+   * "<skin> <character>" — "LunaSnow AbyssalGlow Symbiote" — so the name
+   * carries the skin, which the tag does not. Searching the tag alone found
+   * the right hero wearing the wrong outfit every time.
    *
    * Stripped of the noise that never appears in another author's title:
    * parenthetical asides like "(support+content)", version tags, and a short

@@ -37,15 +37,15 @@ class TestTitleWords:
         assert "CYf" not in out and "IEI" not in out
 
     def test_ids_versions_and_timestamps_are_dropped(self):
-        out = server._title_words("Sexy_Jubilee_Pants_10878_1.0_2026-07-16T17-02Z_8nhyujCzj")
-        assert out == "Jubilee Pants"
+        out = server._title_words("Maskless_Malice_Remesh_2811_1.0_2026-07-16T17-02Z_8nhyujCzj")
+        assert out == "Maskless Malice Remesh"
 
     def test_parenthetical_asides_go(self):
-        assert server._title_words("Elsa Cammy (support+content)") == "Elsa Cammy"
+        assert server._title_words("The Ting (support+content)") == "The Ting"
 
     def test_packaging_words_go(self):
-        assert server._title_words("sexy-midnight-mutant-bikini-11133-1.0-1784607682") == (
-            "midnight mutant bikini"
+        assert server._title_words("lunasnow-abyssalglow-symbiote-5399-1.0-1784607682") == (
+            "lunasnow abyssalglow symbiote"
         )
 
     def test_it_falls_back_to_the_file_name(self):

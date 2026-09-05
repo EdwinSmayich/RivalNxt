@@ -5698,9 +5698,9 @@ def _nexus_image_hidden(cur, mod_id: int) -> bool:
 #
 # Mod archives are a better source and a local one. Measured over this library:
 # 55 of 123 zips carry loose images next to the .pak files, median 9 per
-# archive, and the filenames track the pak variants — FUTAVA1.png alongside
-# A_SexyAceSpadesFutaVA_9999999_P.pak. That covers hand-made .pak drops that
-# were never on Nexus at all, which no online source ever could.
+# archive, and the filenames track the pak variants — Symbiote1.png alongside
+# LunaSnow_AbyssalGlow_Symbiote_9999999_P.pak. That covers hand-made .pak drops
+# that were never on Nexus at all, which no online source ever could.
 #
 # They are full-resolution: median 6MB, largest seen 27MB. Importing them as-is
 # is what produced a 2.2GB database and the "Invalid string length" backup crash
@@ -8153,8 +8153,8 @@ def _infer_character_tag(
 		if not raw_pak:
 			continue
 		# active_paks keeps the path a pak has *inside its archive*
-		# ("Sexy MrsX (support+content)/A_MrsX_VD_9999999_P.pak"), and
-		# set_active_paks passes those straight through. pak_tags_json is keyed
+		# ("LunaSnow_AbyssalGlow_Symbiote/LunaSnow_AbyssalGlow_Symbiote_P.pak"),
+		# and set_active_paks passes those straight through. pak_tags_json is keyed
 		# by the bare filename, so every lookup for a mod whose archive nests
 		# its paks in a folder missed -- 73 of 115 active downloads in the
 		# library this was found in. No tags meant no character, so the mod was

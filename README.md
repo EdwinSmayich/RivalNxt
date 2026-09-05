@@ -92,12 +92,15 @@ back to match the disk. The restore now puts the files back too.
   missing padding, margins and icon sizes across the whole app. A real Tailwind
   build now generates them from source.
 - **Mods piled up loose at the root of `~mods`** instead of going into their
-  character folder. `active_paks` stores the path a pak has *inside its archive*,
-  and the tag lookup is keyed by the bare filename — so every mod whose archive
+  character folder. `active_paks` stores the path a pak has *inside its archive*
+  — `LunaSnow_AbyssalGlow_Symbiote/LunaSnow_AbyssalGlow_Symbiote_9999999_P.pak`
+  — and the tag lookup is keyed by the bare filename, so every mod whose archive
   nests its paks in a folder found no tags, resolved to no character, and was
-  filed at the root. 73 of 115 active downloads in one library. Deleting a mod's
-  tag and adding it again was the only workaround, because custom tags are read
-  before that lookup.
+  filed at the root. 73 of 115 active downloads in one library. The fallback,
+  matching hero names against the download name, cannot help when the mod is not
+  named after its hero: `The Ting` is a The Thing skin and `makeup file` is a
+  Luna Snow one. Deleting a mod's tag and adding it again was the only
+  workaround, because custom tags are read before that lookup.
 - **"Sort Mods Into Folders" rewrote the library from its archives.** It
   re-activated every active download, and activation re-extracts each
   destination whether or not it is already correct — so sorting three strays

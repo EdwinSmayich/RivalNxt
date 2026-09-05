@@ -72,17 +72,17 @@ class TestManualAssignmentSurvives:
 
     def test_an_explicit_assignment_outranks_the_filename_guess(self, conn):
         """Assign Mod ID is a deliberate correction; parsing is a heuristic."""
-        path = "sexy-jubilee-remove-jacket-10878-1.0-1783976607.zip"
-        replace_local_downloads(conn, [_scan_row(path, "Sexy Jubilee", mod_id=9999)])
+        path = "maskless-malice-remesh-2811-1-1-1746649625.zip"
+        replace_local_downloads(conn, [_scan_row(path, "Maskless Malice", mod_id=9999)])
         assert _mod_id(conn, path) == 9999
 
         conn.execute(
             "INSERT INTO mod_id_overrides (local_path, nexus_mod_id) VALUES (?, ?)",
-            (path, 10878),
+            (path, 2811),
         )
         conn.commit()
-        replace_local_downloads(conn, [_scan_row(path, "Sexy Jubilee", mod_id=9999)])
-        assert _mod_id(conn, path) == 10878
+        replace_local_downloads(conn, [_scan_row(path, "Maskless Malice", mod_id=9999)])
+        assert _mod_id(conn, path) == 2811
 
     def test_downloads_without_an_override_are_untouched(self, conn):
         path = "plain-mod-4242-1.0-123.zip"

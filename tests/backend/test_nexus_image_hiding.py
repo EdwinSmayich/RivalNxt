@@ -31,7 +31,7 @@ def db(monkeypatch, tmp_path):
     run_migrations(conn)
     conn.execute(
         "INSERT OR REPLACE INTO mods(mod_id, game, name, picture_url) "
-        "VALUES(7956, 'marvelrivals', 'Sexy Black Cat', 'https://static/7956.png')"
+        "VALUES(7956, 'marvelrivals', 'Maskless Malice', 'https://static/7956.png')"
     )
     conn.commit()
     conn.close()
@@ -106,7 +106,7 @@ class TestHidingTheNexusPicture:
         conn = sqlite3.connect(str(db))
         conn.execute(
             "INSERT OR REPLACE INTO mods(mod_id, game, name, picture_url) "
-            "VALUES(7956, 'marvelrivals', 'Sexy Black Cat', 'https://static/new.png')"
+            "VALUES(7956, 'marvelrivals', 'Maskless Malice', 'https://static/new.png')"
         )
         conn.commit()
         conn.close()

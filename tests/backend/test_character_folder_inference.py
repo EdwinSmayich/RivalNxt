@@ -179,55 +179,57 @@ class TestSkinNamesResolveToCharacters:
 class TestPaksNestedInsideTheirArchive:
     """A pak stored in a subfolder of its archive must still find its tags.
 
-    local_downloads.active_paks keeps the path a pak has *inside the archive* --
-    "Sexy MrsX (support+content)/A_MrsX_VD_9999999_P.pak" -- and set_active_paks
-    passes those straight to _infer_character_tag. pak_tags_json is keyed by the
-    bare filename, so every one of those lookups missed: 73 of 115 active
-    downloads in the library where this was found. No tags meant no character,
-    so the mod was filed at the root of ~mods and nothing moved it afterwards.
+    local_downloads.active_paks keeps the path a pak has *inside the archive*,
+    as in the NESTED constant below, and set_active_paks passes those straight
+    to _infer_character_tag. pak_tags_json is keyed by the bare filename, so
+    every one of those lookups missed: 73 of 115 active downloads in the library
+    where this was found. No tags meant no character, so inference fell back to
+    matching hero names against the download name -- which cannot help when the
+    mod is not named after its hero. The mod was filed at the root of ~mods and
+    nothing moved it afterwards.
 
     A hand-written tag was the only thing that worked, because custom tags are
     read before this lookup -- which is exactly what was reported: "until you
     delete the tag and add it again, sorting does not work".
     """
 
-    NESTED = "Sexy MrsX (support+content)/A_MrsX_VD_9999999_P.pak"
+    NESTED = "LunaSnow_AbyssalGlow_Symbiote/LunaSnow_AbyssalGlow_Symbiote_9999999_P.pak"
 
     def test_an_archive_relative_path_finds_the_tags(self, cur):
         cur.execute(
             "INSERT INTO pak_tags_json (pak_name, tags_json) VALUES (?, ?)",
-            ("A_MrsX_VD_9999999_P.pak", '["ROGUE", "mrs. x,material"]'),
+            ("LunaSnow_AbyssalGlow_Symbiote_9999999_P.pak", '["Luna Snow", "abyssal glow,material"]'),
         )
         assert server._infer_character_tag(
-            cur, name="sexy-mrsx-v1", pak_candidates=[self.NESTED], mod_id=6853
-        ) == "ROGUE"
+            cur, name="makeup file", pak_candidates=[self.NESTED], mod_id=5399
+        ) == "Luna Snow"
 
     def test_a_backslash_separated_path_works_too(self, cur):
         cur.execute(
             "INSERT INTO pak_tags_json (pak_name, tags_json) VALUES (?, ?)",
-            ("A_MrsX_VD_9999999_P.pak", '["ROGUE"]'),
+            ("LunaSnow_AbyssalGlow_Symbiote_9999999_P.pak", '["Luna Snow"]'),
         )
-        windows_style = "Sexy MrsX (support+content)\\A_MrsX_VD_9999999_P.pak"
+        windows_style = "LunaSnow_AbyssalGlow_Symbiote\\LunaSnow_AbyssalGlow_Symbiote_9999999_P.pak"
         assert server._infer_character_tag(
-            cur, name="sexy-mrsx-v1", pak_candidates=[windows_style], mod_id=6853
-        ) == "ROGUE"
+            cur, name="makeup file", pak_candidates=[windows_style], mod_id=5399
+        ) == "Luna Snow"
 
     def test_a_bare_filename_is_unaffected(self, cur):
         """The 42 downloads whose archives keep paks at the top must not regress."""
         cur.execute(
             "INSERT INTO pak_tags_json (pak_name, tags_json) VALUES (?, ?)",
-            ("A_rogueVA_9999999_P.pak", '["ROGUE"]'),
+            ("MakeUp_NolaehaneunManyeo_LunaSnow_9999999_P.pak", '["Luna Snow"]'),
         )
         assert server._infer_character_tag(
-            cur, name="rogue-mod", pak_candidates=["A_rogueVA_9999999_P.pak"], mod_id=99
-        ) == "ROGUE"
+            cur, name="makeup-mod", pak_candidates=["MakeUp_NolaehaneunManyeo_LunaSnow_9999999_P.pak"], mod_id=99
+        ) == "Luna Snow"
 
     def test_the_utoc_fallback_also_uses_the_bare_name(self, cur):
         """Only the .utoc row exists; the nested .pak path must still reach it."""
         cur.execute(
             "INSERT INTO pak_tags_json (pak_name, tags_json) VALUES (?, ?)",
-            ("A_MrsX_VD_9999999_P.utoc", '["ROGUE"]'),
+            ("LunaSnow_AbyssalGlow_Symbiote_9999999_P.utoc", '["Luna Snow"]'),
         )
         assert server._infer_character_tag(
-            cur, name="sexy-mrsx-v1", pak_candidates=[self.NESTED], mod_id=6853
-        ) == "ROGUE"
+            cur, name="makeup file", pak_candidates=[self.NESTED], mod_id=5399
+        ) == "Luna Snow"

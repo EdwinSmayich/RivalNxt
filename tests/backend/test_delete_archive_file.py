@@ -19,7 +19,7 @@ import pytest
 import core.api.server as server
 from core.api.dependencies import invalidate_connection_pool
 
-PAK = "A_SexyMidnightMutantVB_9999999_P"
+PAK = "LunaSnow_AbyssalGlow_Symbiote_9999999_P"
 OTHER = "A_OtherVariant_9999999_P"
 
 

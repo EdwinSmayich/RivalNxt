@@ -48,12 +48,12 @@ def env(monkeypatch, tmp_path):
     downloads = tmp_path / "downloads"
     downloads.mkdir()
 
-    archive = downloads / "Sexy Ace of Spades.zip"
+    archive = downloads / "Maskless Malice.zip"
     with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr("Sexy Ace of Spades/1.png", _png(1063, 1329))
-        zf.writestr("Sexy Ace of Spades/FUTAVA1.png", _png(1441, 977))
-        zf.writestr("Sexy Ace of Spades/notes.txt", "read me")
-        zf.writestr("Sexy Ace of Spades/A_Skin_9999999_P.pak", b"\x00" * 64)
+        zf.writestr("Maskless Malice/1.png", _png(1063, 1329))
+        zf.writestr("Maskless Malice/Malice1.png", _png(1441, 977))
+        zf.writestr("Maskless Malice/notes.txt", "read me")
+        zf.writestr("Maskless Malice/A_Skin_9999999_P.pak", b"\x00" * 64)
 
     db_path = tmp_path / "mods.db"
     conn = sqlite3.connect(str(db_path))
@@ -61,7 +61,7 @@ def env(monkeypatch, tmp_path):
     run_migrations(conn)
     conn.execute(
         "INSERT INTO local_downloads(path, id, name, mod_id, contents, active_paks) "
-        "VALUES(?, 1, 'Sexy Ace of Spades', 7956, '[]', '[]')",
+        "VALUES(?, 1, 'Maskless Malice', 7956, '[]', '[]')",
         (str(archive),),
     )
     conn.execute(
@@ -98,7 +98,7 @@ class TestListing:
     def test_it_finds_the_images_and_ignores_everything_else(self, env):
         result = server.list_archive_images(1)
         names = sorted(i["name"] for i in result["images"])
-        assert names == ["1.png", "FUTAVA1.png"], names
+        assert names == ["1.png", "Malice1.png"], names
 
     def test_each_entry_carries_a_thumbnail_and_the_real_dimensions(self, env):
         image = next(

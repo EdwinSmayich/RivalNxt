@@ -1,7 +1,7 @@
 """Removing one pak from a mod, instead of the whole mod.
 
-A mod often ships a dozen variants — SexyWhiteFoxMVA through MVH, plus bush /
-pubes / shaved — and only one is wanted. The only option was deleting the entire
+A mod often ships a dozen variants — A_rogueVA through VH, plus
+separate physics and no-physics builds — and only one is wanted. The only option was deleting the entire
 download.
 
 The source archive is never touched. Removal records the pak in
@@ -36,9 +36,9 @@ def download(client):
 
     dl_id = 987654
     contents = [
-        "A_SexyWhiteFoxMVA_9999999_P.pak",
-        "A_SexyWhiteFoxMVB_9999999_P.pak",
-        "A_SexyWhiteFoxPbush_99999999_P.pak",
+        "A_rogueVA_9999999_P.pak",
+        "A_rogueVB_9999999_P.pak",
+        "A_rogueVC_99999999_P.pak",
     ]
     conn = get_db()
     try:
@@ -82,24 +82,24 @@ class TestRemoveDownloadFile:
 
         r = client.post(
             f"/api/local_downloads/{dl_id}/remove-file",
-            json={"pak_name": "A_SexyWhiteFoxMVB_9999999_P.pak"},
+            json={"pak_name": "A_rogueVB_9999999_P.pak"},
         )
 
         assert r.status_code == 200
         assert r.json()["remaining"] == 2
         left = contents_of(dl_id)
-        assert "A_SexyWhiteFoxMVB_9999999_P.pak" not in left
-        assert "A_SexyWhiteFoxMVA_9999999_P.pak" in left
-        assert "A_SexyWhiteFoxPbush_99999999_P.pak" in left
+        assert "A_rogueVB_9999999_P.pak" not in left
+        assert "A_rogueVA_9999999_P.pak" in left
+        assert "A_rogueVC_99999999_P.pak" in left
 
     def test_similar_names_are_not_collateral(self, client, download):
         """MVA and MVB differ by one letter; a loose match would take both."""
         dl_id, _ = download
         client.post(
             f"/api/local_downloads/{dl_id}/remove-file",
-            json={"pak_name": "A_SexyWhiteFoxMVA_9999999_P.pak"},
+            json={"pak_name": "A_rogueVA_9999999_P.pak"},
         )
-        assert "A_SexyWhiteFoxMVB_9999999_P.pak" in contents_of(dl_id)
+        assert "A_rogueVB_9999999_P.pak" in contents_of(dl_id)
 
     def test_a_file_that_is_not_in_the_mod_is_rejected(self, client, download):
         dl_id, contents = download

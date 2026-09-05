@@ -30,12 +30,12 @@ Measured against upstream at the time of this fork:
 | | |
 |---|---|
 | Files in the upstream tree | 338 |
-| Modified | 44 |
+| Modified | 45 |
 | Deleted | 39 |
 | Moved | 20 |
-| **Left exactly as the author wrote them** | **235 (70%)** |
-| Files this fork adds | 48 |
-| Diff | +17,910 / −12,944 across 151 files |
+| **Left exactly as the author wrote them** | **234 (69%)** |
+| Files this fork adds | 49 |
+| Diff | +18,101 / −12,945 across 153 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
 rewrite, and it would not exist without the original. Check the numbers rather

@@ -23,8 +23,54 @@ if not exist "src-tauri" (
     exit /b 1
 )
 
-echo Updating Graphify knowledge graph...
-graphify update .
+REM Optional developer tool; not a build dependency. It printed "'graphify' is
+REM not recognized" on every build of a machine that does not have it, two
+REM lines above the output anyone actually reads.
+where graphify >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo Updating Graphify knowledge graph...
+    graphify update .
+)
+
+REM ============================================================================
+REM Pin the interpreter to the project virtualenv.
+REM
+REM This script used to call bare `python` and `pip`, so PyInstaller ran under
+REM whatever came first on PATH. When that is a different interpreter -- a
+REM system install, or the Microsoft Store stub -- the bundle comes out missing
+REM whatever the venv had and PATH did not, silently: 1.0.0 shipped without
+REM Pillow, and every image the app tried to downscale logged
+REM "No module named 'PIL'" at runtime. Nothing failed the build.
+REM ============================================================================
+set "VENV_SCRIPTS=%CD%\.venv\Scripts"
+set "PYTHON=%VENV_SCRIPTS%\python.exe"
+if not exist "%PYTHON%" (
+    echo ERROR: virtualenv not found at %PYTHON%
+    echo Create it first:
+    echo     py -3 -m venv .venv
+    echo     .venv\Scripts\python.exe -m pip install -r requirements.txt
+    exit /b 1
+)
+REM maturin, pyinstaller and ruff live here too, and none of them are on PATH
+REM unless the venv has been activated. Putting it first is what activation
+REM does; doing it here means the script does not depend on how it was started.
+set "PATH=%VENV_SCRIPTS%;%PATH%"
+echo Using interpreter: %PYTHON%
+
+REM Same story for Rust. rustup usually puts cargo on PATH, but it is not on
+REM every machine -- it was on neither the user nor the system PATH of the one
+REM 1.0.0 was built on, and maturin failed with "Do you have cargo in your
+REM PATH?". Look where rustup installs it before giving up.
+where cargo >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    if exist "%USERPROFILE%\.cargo\bin\cargo.exe" (
+        set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+        echo Added %USERPROFILE%\.cargo\bin to PATH
+    ) else (
+        echo ERROR: cargo not found. Install Rust from https://rustup.rs
+        exit /b 1
+    )
+)
 
 REM Get version from package.json
 echo.
@@ -108,7 +154,7 @@ echo [3/6] Installing and extracting wheel for PyInstaller...
 echo ============================================================================
 
 echo Installing wheel...
-pip install "%WHEEL_PATH%" --force-reinstall
+"%PYTHON%" -m pip install "%WHEEL_PATH%" --force-reinstall
 if %ERRORLEVEL% NEQ 0 (
     echo ❌ Failed to install wheel
     cd ..\..\..
@@ -116,7 +162,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Verifying installation...
-python -c "import rust_ue_tools; print('rust_ue_tools imported successfully!')"
+"%PYTHON%" -c "import rust_ue_tools; print('rust_ue_tools imported successfully!')"
 if %ERRORLEVEL% NEQ 0 (
     echo ❌ Failed to import rust_ue_tools module!
     cd ..\..\..
@@ -152,8 +198,19 @@ echo Cleaning previous builds...
 if exist dist rmdir /s /q dist
 if exist build rmdir /s /q build
 
+REM Fail here rather than shipping a bundle without them. Pillow is the one
+REM that actually went missing; every import below is used at runtime and is
+REM reached only from inside a function, so nothing else would notice.
+echo Checking build dependencies...
+"%PYTHON%" -c "import PIL, fastapi, uvicorn, requests, rust_ue_tools"
+if %ERRORLEVEL% NEQ 0 (
+    echo ERROR: the virtualenv is missing a runtime dependency.
+    echo     "%PYTHON%" -m pip install -r requirements.txt
+    exit /b 1
+)
+
 echo Building backend executable using spec file...
-python -m PyInstaller --noconfirm --clean rivalnxt_backend_merged.spec
+"%PYTHON%" -m PyInstaller --noconfirm --clean rivalnxt_backend_merged.spec
 if %ERRORLEVEL% NEQ 0 (
     echo ERROR: Python backend build failed!
     exit /b 1
@@ -161,6 +218,15 @@ if %ERRORLEVEL% NEQ 0 (
 
 if not exist dist\rivalnxt_backend.exe (
     echo ERROR: Backend executable not found in dist directory!
+    exit /b 1
+)
+
+REM PyInstaller reports a missing module as a warning and exits 0, so the only
+REM way to know Pillow made it in is to ask the bundle itself.
+echo Verifying the bundle can import Pillow...
+"%PYTHON%" scripts\verify_bundle.py dist\rivalnxt_backend.exe
+if %ERRORLEVEL% NEQ 0 (
+    echo ERROR: the built backend is missing a module it needs at runtime.
     exit /b 1
 )
 echo ✓ Python backend built successfully

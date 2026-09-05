@@ -8149,9 +8149,18 @@ def _infer_character_tag(
 			pass
 
 	# Aggregate tags for all candidate pak names from pak_tags_json
-	for pak in pak_candidates:
-		if not pak:
+	for raw_pak in pak_candidates:
+		if not raw_pak:
 			continue
+		# active_paks keeps the path a pak has *inside its archive*
+		# ("Sexy MrsX (support+content)/A_MrsX_VD_9999999_P.pak"), and
+		# set_active_paks passes those straight through. pak_tags_json is keyed
+		# by the bare filename, so every lookup for a mod whose archive nests
+		# its paks in a folder missed -- 73 of 115 active downloads in the
+		# library this was found in. No tags meant no character, so the mod was
+		# filed at the root of ~mods and stayed there. The user's own tag was
+		# the only thing that worked, because step 1 above runs before this.
+		pak = os.path.basename(raw_pak)
 		tr = cur.execute("SELECT tags_json FROM pak_tags_json WHERE pak_name = ?", (pak,)).fetchone()
 		if (not tr or not tr[0]) and "." in pak:
 			stem = os.path.splitext(pak)[0]

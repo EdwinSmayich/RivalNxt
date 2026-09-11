@@ -36,7 +36,7 @@ was taken:
 | Moved | 20 |
 | **Left exactly as the author wrote them** | **230 (66%)** |
 | Files this fork adds | 53 |
-| Diff | +18,963 / −13,788 across 167 files |
+| Diff | +18,964 / −13,788 across 167 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
 rewrite, and it would not exist without the original. Check the numbers rather

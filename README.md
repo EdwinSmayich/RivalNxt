@@ -10,8 +10,8 @@ A desktop app to install, organise and switch Marvel Rivals mods, with conflict
 detection, Nexus Mods integration and a local database.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#installation)
-[![Version](https://img.shields.io/badge/version-1.0.2-success?style=for-the-badge)](#)
-[![Tests](https://img.shields.io/badge/tests-900%20passing-brightgreen?style=for-the-badge)](#verification)
+[![Version](https://img.shields.io/badge/version-1.0.3-success?style=for-the-badge)](#)
+[![Tests](https://img.shields.io/badge/tests-915%20passing-brightgreen?style=for-the-badge)](#verification)
 
 </div>
 
@@ -129,6 +129,11 @@ back to match the disk. The restore now puts the files back too.
   to the `.pak` files; pick them from a grid instead of hunting for links
 - **Nexus browsing** by name, with adult-content and category filters
 - **Progress with a percentage and an estimate**, instead of a count that stalls
+- **Game patch awareness** — a patch can stop every mod applying at once. The
+  date is read off the game's own containers, and mods whose author has posted
+  anything since are listed, so you are not opening 167 cards to find out who
+  has rebuilt. Labelled "updated since the patch", not "fixed": an author may
+  have changed a screenshot.
 
 ### Measured improvements
 
@@ -147,7 +152,7 @@ single rebuild used to exhaust the budget and start failing partway.
 
 ## Installation
 
-1. Download `RivalNxt_1.0.2_x64-setup.exe` from
+1. Download `RivalNxt_1.0.3_x64-setup.exe` from
    [Releases](../../releases/latest)
 2. Run it. Windows SmartScreen will warn about an unsigned installer — the build
    is not code-signed; choose **More info → Run anyway**, or build from source.
@@ -184,14 +189,14 @@ bundle before calling itself done.
 
 ```bash
 npm run typecheck && npm test        # 238 frontend tests
-python -m pytest tests/backend -q    # 662 backend tests
+python -m pytest tests/backend -q    # 677 backend tests
 ruff check core scripts src-python
 ```
 
 Seventeen further tests check that the shipped bundle is actually code-split.
 They read `dist/`, so they skip unless you have run `npm run build` first —
 deliberately, because a test that cannot see its subject should say so rather
-than pass. With a build present the total is 917.
+than pass. With a build present the total is 932.
 
 ---
 

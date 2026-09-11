@@ -810,6 +810,40 @@ export async function clearActivity(): Promise<{ ok: boolean; removed: number }>
   );
 }
 
+export type PatchUpdatedMod = {
+  mod_id: number;
+  name: string | null;
+  author: string | null;
+  version: string | null;
+  updated_at: string;
+  updated_timestamp: number;
+  icon: string | null;
+};
+
+export type GamePatchStatus =
+  | { known: false; reason: string }
+  | {
+      known: true;
+      patched_at: string;
+      patched_at_epoch: number;
+      detected_from: string;
+      mods_total: number;
+      updated_count: number;
+      updated: PatchUpdatedMod[];
+    };
+
+/**
+ * When the game last changed, and which mods their authors touched after it.
+ *
+ * A game patch can break every installed mod at once, and the only question
+ * that matters the next morning is which ones have moved since. Distinct from
+ * getPakVersionStatus, which compares a download against the newest file on
+ * Nexus regardless of when the game changed.
+ */
+export async function getGamePatchStatus(): Promise<GamePatchStatus> {
+  return getJson<GamePatchStatus>(`/api/game/patch-status`);
+}
+
 // ─── Bulk operations ─────────────────────────────────────────────────────────
 
 /**

@@ -20,6 +20,7 @@ import { Label } from "./ui/label";
 import { invoke } from "@tauri-apps/api/core";
 import { Loader2, RefreshCw, Play, Folder, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
+import { GamePatchPanel } from "./GamePatchPanel";
 
 import {
   type ApiSettings,
@@ -811,6 +812,8 @@ export function SettingsDialog({
                     gap: "24px",
                   }}
                 >
+                  <GamePatchPanel />
+
                   <div style={{ marginBottom: "8px" }}>
                     <h3 className="text-lg font-semibold">Maintenance Tasks</h3>
                     <p className="text-sm text-muted-foreground">

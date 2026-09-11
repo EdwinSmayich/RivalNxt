@@ -4797,6 +4797,29 @@ def list_mods(limit: int = 100) -> List[Dict[str, Any]]:
 			pass
 
 
+@app.get("/api/game/patch-status")
+def get_game_patch_status() -> Dict[str, Any]:
+	"""When the game was last patched, and which mods were updated after it.
+
+	Distinct from /api/pak-version-status, which compares a download's version
+	against the newest file on Nexus. This answers a different question, and the
+	one that matters the morning after a patch breaks every mod at once: of the
+	mods installed here, which ones has their author touched *since* the game
+	changed under them.
+	"""
+	from core.game.patch import patch_status
+
+	settings = _get_current_settings()
+	conn = get_db()
+	try:
+		return patch_status(conn, settings.marvel_rivals_root)
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+
+
 @app.get("/api/pak-version-status")
 def get_pak_version_status_endpoint(
 	mod_id: Optional[int] = None,

@@ -25,17 +25,18 @@ containers, the Rust UE Tools library, asset extraction, the conflict engine,
 Nexus ingestion — are **Rounak77382's work**, and most of that code is untouched
 here.
 
-Measured against upstream at the time of this fork:
+Measured against upstream's current `main`, which has moved on since this fork
+was taken:
 
 | | |
 |---|---|
-| Files in the upstream tree | 338 |
-| Modified | 45 |
-| Deleted | 39 |
+| Files in the upstream tree | 344 |
+| Modified | 49 |
+| Deleted | 45 |
 | Moved | 20 |
-| **Left exactly as the author wrote them** | **234 (69%)** |
-| Files this fork adds | 49 |
-| Diff | +18,101 / −12,945 across 153 files |
+| **Left exactly as the author wrote them** | **230 (66%)** |
+| Files this fork adds | 53 |
+| Diff | +18,963 / −13,788 across 167 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
 rewrite, and it would not exist without the original. Check the numbers rather

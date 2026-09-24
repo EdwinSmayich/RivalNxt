@@ -31,12 +31,12 @@ was taken:
 | | |
 |---|---|
 | Files in the upstream tree | 344 |
-| Modified | 49 |
+| Modified | 51 |
 | Deleted | 45 |
 | Moved | 20 |
-| **Left exactly as the author wrote them** | **230 (66%)** |
-| Files this fork adds | 53 |
-| Diff | +18,964 / −13,788 across 167 files |
+| **Left exactly as the author wrote them** | **228 (66%)** |
+| Files this fork adds | 54 |
+| Diff | +19,213 / −13,806 across 170 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
 rewrite, and it would not exist without the original. Check the numbers rather

@@ -57,7 +57,16 @@ def extract_character_and_skin_data() -> Dict[str, Any]:
     print("[1/4] Extracting character names from locres...")
     character_names = _extract_character_names(paks_dir)
     print(f"Extracted {len(character_names)} character names")
-    
+    if not character_names:
+        # Every character would be named "Character <id>" from here. That is a
+        # failure, not a result, and it used to be reported as one: the task
+        # finished green while the character filter quietly showed raw ids.
+        print(
+            f"WARNING: no character names could be read from {paks_dir}. "
+            "Every character would fall back to a placeholder name; the "
+            "database keeps the names it already has instead."
+        )
+
     # Step 2: Extract skin IDs
     print("[2/4] Extracting skin IDs from pakchunkCharacter...")
     character_skins = _extract_skin_ids(paks_dir)

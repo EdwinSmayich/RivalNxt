@@ -209,8 +209,13 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+REM --workpath keeps PyInstaller out of build\, which vite.config.mts uses as
+REM its outDir. Sharing it meant the frontend build wiped PyInstaller's
+REM intermediates, so the .toc files the verification below reads were gone by
+REM the time anyone looked -- and the two tools were silently fighting over one
+REM directory on every build.
 echo Building backend executable using spec file...
-"%PYTHON%" -m PyInstaller --noconfirm --clean rivalnxt_backend_merged.spec
+"%PYTHON%" -m PyInstaller --noconfirm --clean --workpath build-backend rivalnxt_backend_merged.spec
 if %ERRORLEVEL% NEQ 0 (
     echo ERROR: Python backend build failed!
     exit /b 1

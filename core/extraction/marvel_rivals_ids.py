@@ -14,6 +14,7 @@ Can be used as:
 
 import sys
 import re
+import tempfile
 from pathlib import Path
 from collections import defaultdict
 
@@ -57,9 +58,15 @@ def get_all_locres_strings(paks_dir):
     unpacker = PyUnpacker()
     
     for pak_path in paks_to_process:
-        pak_temp_dir = Path(f"temp_locres_{pak_path.stem}")
-        pak_temp_dir.mkdir(exist_ok=True)
-        
+        # A relative path here put the scratch directory wherever the process
+        # happened to be running. The Tauri shell sets no working directory for
+        # the backend, so that was inherited from however the app was launched --
+        # and when it landed somewhere unwritable the mkdir raised, the handler
+        # below returned {}, and every character was renamed "Character <id>".
+        # Reproduced: from C:\Windows\System32 this yields 0 names where any
+        # writable directory yields 80.
+        pak_temp_dir = Path(tempfile.mkdtemp(prefix=f"locres_{pak_path.stem}_"))
+
         try:
             unpacker.unpack_pak(
                 str(pak_path),

@@ -2161,7 +2161,27 @@ def insert_characters(conn: sqlite3.Connection, characters: List[Tuple[str, str]
     """
     cur = conn.cursor()
     cur.executemany(
-        "INSERT OR REPLACE INTO characters (character_id, name) VALUES (?, ?)",
+        # Never trade a real name for a placeholder.
+        #
+        # extract_character_names_from_locres returns {} on any failure, and the
+        # combine step then names every character "Character <id>". With a plain
+        # INSERT OR REPLACE one failed rebuild rewrote all 80 real names as
+        # placeholders, and the character filter showed "character 1015" instead
+        # of "Storm" with nothing to indicate anything had gone wrong.
+        #
+        # The comparison is exact rather than a LIKE: the placeholder is built as
+        # f"Character {char_id}", so an incoming name that equals that string for
+        # this row's own id is the fallback and nothing else is.
+        """
+        INSERT INTO characters (character_id, name) VALUES (?, ?)
+        ON CONFLICT(character_id) DO UPDATE SET
+            name = CASE
+                WHEN excluded.name = 'Character ' || characters.character_id
+                 AND characters.name <> 'Character ' || characters.character_id
+                THEN characters.name
+                ELSE excluded.name
+            END
+        """,
         characters
     )
     conn.commit()
@@ -2176,7 +2196,24 @@ def insert_skins(conn: sqlite3.Connection, skins: List[Tuple[str, str, str, str]
     """
     cur = conn.cursor()
     cur.executemany(
-        "INSERT OR REPLACE INTO skins (skin_id, character_id, variant, name) VALUES (?, ?, ?, ?)",
+        # Same guard as insert_characters, for the same reason. When neither the
+        # game's locres nor the wiki yields a name, combine_extraction_data falls
+        # back to f"variant {variant}", so a failed extraction would rewrite
+        # "mirae 2099" as "variant 500". The wiki fallback is what kept the skin
+        # names alive when every character name was lost; there is no reason to
+        # depend on that holding next time.
+        """
+        INSERT INTO skins (skin_id, character_id, variant, name) VALUES (?, ?, ?, ?)
+        ON CONFLICT(skin_id) DO UPDATE SET
+            character_id = excluded.character_id,
+            variant = excluded.variant,
+            name = CASE
+                WHEN excluded.name = 'variant ' || skins.variant
+                 AND skins.name <> 'variant ' || skins.variant
+                THEN skins.name
+                ELSE excluded.name
+            END
+        """,
         skins
     )
     conn.commit()

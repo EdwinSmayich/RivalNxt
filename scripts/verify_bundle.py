@@ -19,8 +19,10 @@ import sys
 from pathlib import Path
 
 # Imported from inside functions at runtime, so nothing at build time notices
-# their absence and no test covers the frozen bundle.
-REQUIRED = ("PIL", "fastapi", "uvicorn", "requests", "rust_ue_tools")
+# their absence and no test covers the frozen bundle. pylocres is on the list
+# because character names are read from the game's .locres files through it,
+# and losing them renames every hero to "Character <id>".
+REQUIRED = ("PIL", "fastapi", "uvicorn", "requests", "rust_ue_tools", "pylocres")
 
 
 def _collect(node: object, out: set[str]) -> None:
@@ -66,10 +68,17 @@ def main() -> int:
         return 1
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [d for d in (root / "build").glob("*") if d.is_dir()]
+    # build-backend/ is PyInstaller's; build/ belongs to vite. They used to be
+    # the same directory, and the frontend build erased these files.
+    candidates = [
+        d
+        for parent in ("build-backend", "build")
+        for d in (root / parent).glob("*")
+        if d.is_dir()
+    ]
     build_dir = next((d for d in candidates if any(d.glob("*.toc"))), None)
     if build_dir is None:
-        print(f"FAIL: no PyInstaller .toc files under {root / 'build'};")
+        print(f"FAIL: no PyInstaller .toc files under {root / 'build-backend'};")
         print("      cannot confirm what went into the bundle.")
         return 1
 

@@ -18,6 +18,7 @@ __pycache__/
 
 # ── Build output ─────────────────────────────────────────────────────────────
 build/
+build-backend/
 dist/
 src-tauri/target/
 src-tauri/sidecars/

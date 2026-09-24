@@ -10,8 +10,8 @@ A desktop app to install, organise and switch Marvel Rivals mods, with conflict
 detection, Nexus Mods integration and a local database.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#installation)
-[![Version](https://img.shields.io/badge/version-1.0.3-success?style=for-the-badge)](#)
-[![Tests](https://img.shields.io/badge/tests-915%20passing-brightgreen?style=for-the-badge)](#verification)
+[![Version](https://img.shields.io/badge/version-1.0.4-success?style=for-the-badge)](#)
+[![Tests](https://img.shields.io/badge/tests-926%20passing-brightgreen?style=for-the-badge)](#verification)
 
 </div>
 
@@ -114,6 +114,16 @@ back to match the disk. The restore now puts the files back too.
   It read no id because both filename patterns anchor on a Unix epoch, and
   Nexus also writes `..._9902_1_2026-06-20T19-12Z_V1FxDq0Zh.rar`. 12 of 209
   downloads in one library; 8 of them `_Addons_` files.
+- **Every hero was renamed `Character 1015`.** Character names are read from the
+  game's `.locres` files, and the extractor built its scratch directory from a
+  *relative* path — so it landed wherever the process happened to be running,
+  and the backend is spawned with no working directory of its own. From an
+  unwritable one it returns no names at all, and the combine step then names
+  every character after its id. `INSERT OR REPLACE` made that permanent: one
+  failed rebuild overwrote all 80 real names, and every rebuild after wrote the
+  same placeholders again. Skin names have the same fallback and are guarded
+  the same way; they survived only because they have a wiki fallback that
+  character names do not.
 
 ### Added
 
@@ -153,7 +163,7 @@ single rebuild used to exhaust the budget and start failing partway.
 
 ## Installation
 
-1. Download `RivalNxt_1.0.3_x64-setup.exe` from
+1. Download `RivalNxt_1.0.4_x64-setup.exe` from
    [Releases](../../releases/latest)
 2. Run it. Windows SmartScreen will warn about an unsigned installer — the build
    is not code-signed; choose **More info → Run anyway**, or build from source.
@@ -190,14 +200,14 @@ bundle before calling itself done.
 
 ```bash
 npm run typecheck && npm test        # 238 frontend tests
-python -m pytest tests/backend -q    # 677 backend tests
+python -m pytest tests/backend -q    # 688 backend tests
 ruff check core scripts src-python
 ```
 
 Seventeen further tests check that the shipped bundle is actually code-split.
 They read `dist/`, so they skip unless you have run `npm run build` first —
 deliberately, because a test that cannot see its subject should say so rather
-than pass. With a build present the total is 932.
+than pass. With a build present the total is 943.
 
 ---
 

@@ -58,6 +58,23 @@ export function isAlreadyDownloading(err: unknown): boolean {
   );
 }
 
+/**
+ * What "Cancel queued" should cancel at the moment it is clicked.
+ *
+ * The button lives in a toast that is only redrawn when the *number* waiting
+ * changes. One download starting while another arrives leaves the number as it
+ * was, so a list captured when the toast was drawn went stale: the click then
+ * cancelled a download that had since started, and missed the newcomer. The
+ * list is read at click time instead, and anything already running is left
+ * alone.
+ */
+export function stillWaiting<T extends { id: string }>(
+  latest: readonly T[],
+  running: ReadonlySet<string>,
+): T[] {
+  return latest.filter((handoff) => !running.has(handoff.id));
+}
+
 /** "3 downloads queued" / "1 download queued". */
 export function queueSummary(waiting: number): string {
   return `${waiting} download${waiting === 1 ? "" : "s"} queued`;

@@ -4766,31 +4766,33 @@ if _HAS_MULTIPART:
 				"downloads_root": str(downloads_root),
 			}
 		size = 0
+		# Written under a .part name and renamed when complete. An upload cut
+		# short by the app closing used to leave a truncated archive under the
+		# real name, and the check a few lines up then answered every later
+		# attempt with "already existed" -- handing back the broken file.
+		part_path = partial_path(dest_path, uuid.uuid4().hex[:8])
 		try:
-			with dest_path.open("wb") as out:
+			with part_path.open("wb") as out:
 				while True:
 					chunk = await file.read(UPLOAD_CHUNK_SIZE)
 					if not chunk:
 						break
 					out.write(chunk)
 					size += len(chunk)
+			if size > 0:
+				os.replace(part_path, dest_path)
 		except Exception as e:
-			if dest_path.exists():
-				try:
-					dest_path.unlink()
-				except Exception:
-					pass
 			raise HTTPException(status_code=500, detail=f"Failed to save upload: {e}")
 		finally:
+			try:
+				part_path.unlink()
+			except OSError:
+				pass
 			try:
 				await file.close()
 			except Exception:
 				pass
-		if size == 0 and dest_path.exists():
-			try:
-				dest_path.unlink()
-			except Exception:
-				pass
+		if size == 0:
 			raise HTTPException(status_code=400, detail="Uploaded file was empty")
 		try:
 			relative = str(dest_path.relative_to(downloads_root))
@@ -4898,11 +4900,21 @@ def copy_to_downloads(request: CopyToDownloadsRequest) -> Dict[str, Any]:
 			dest_path = downloads_root / f"{stem}-{counter}{suffix}"
 			counter += 1
 	
+	# Copied under a .part name and renamed when complete, for the same reason
+	# downloads are: a copy interrupted half-way must not leave something that
+	# looks like a finished archive in the downloads folder.
+	part_path = partial_path(dest_path, uuid.uuid4().hex[:8])
 	try:
-		shutil.copy2(source, dest_path)
+		shutil.copy2(source, part_path)
+		os.replace(part_path, dest_path)
 	except Exception as e:
 		logger.error(f"[copy_to_downloads] Failed to copy file: {e}")
 		raise HTTPException(status_code=500, detail=f"Failed to copy file: {e}")
+	finally:
+		try:
+			part_path.unlink()
+		except OSError:
+			pass
 	
 	size = dest_path.stat().st_size
 	try:
@@ -7153,6 +7165,10 @@ def upload_mod_images_by_url(mod_id: int, payload: UploadImageByUrlPayload) -> D
 					if content_type and not content_type.startswith("image/"):
 						failures.append({"url": url, "error": f"not an image ({content_type})"})
 						continue
+					try:
+						announced: Optional[int] = int(resp.headers.get("Content-Length") or 0) or None
+					except (TypeError, ValueError):
+						announced = None
 					# read one byte past the cap so an oversized body is detected
 					# rather than silently truncated.
 					blob = resp.read(max_bytes + 1)
@@ -7165,6 +7181,12 @@ def upload_mod_images_by_url(mod_id: int, payload: UploadImageByUrlPayload) -> D
 
 			if len(blob) > max_bytes:
 				failures.append({"url": url, "error": "image is larger than 32 MB"})
+				continue
+			# read(n) does not raise when the server hangs up early; it hands
+			# back what it has. Half a picture was stored as the picture.
+			cut_short = length_problem(len(blob), announced)
+			if cut_short:
+				failures.append({"url": url, "error": f"the image did not arrive whole: {cut_short}"})
 				continue
 
 			filename = os.path.basename(unquote(parsed.path)) or "image"
@@ -8363,6 +8385,11 @@ def _download_once_in_turn(
 		got_slot = _DOWNLOAD_SLOTS.acquire(is_cancelled=_cancelled, on_wait=_waiting)
 		if not got_slot:
 			raise DownloadCancelledError(f"Download cancelled while queued (handoff={handoff_id})")
+		if _cancelled():
+			# A free slot is handed over without asking, so a cancel that landed
+			# just before this request would otherwise open a connection to
+			# Nexus only for the transfer loop to drop it a moment later.
+			raise DownloadCancelledError(f"Download cancelled before it started (handoff={handoff_id})")
 		return _download_archive_via_nxm(record, game_domain, file_id, desired_filename=desired_filename)
 	finally:
 		if got_slot:

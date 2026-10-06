@@ -15,6 +15,7 @@ import {
   isAlreadyDownloading,
   planDownloads,
   queueSummary,
+  stillWaiting,
 } from "../downloadQueue";
 
 const pending = (n: number) =>
@@ -108,6 +109,31 @@ describe("queueSummary", () => {
   });
 });
 
+describe("stillWaiting", () => {
+  const h = (id: string) => ({ id });
+
+  it("drops what has started since the list was made", () => {
+    expect(stillWaiting([h("a"), h("b"), h("c")], new Set(["a"]))).toEqual([
+      h("b"),
+      h("c"),
+    ]);
+  });
+
+  it("keeps everything when nothing has started", () => {
+    expect(stillWaiting([h("a"), h("b")], new Set())).toHaveLength(2);
+  });
+
+  it("is empty when all of it has started", () => {
+    expect(stillWaiting([h("a")], new Set(["a", "z"]))).toEqual([]);
+  });
+
+  it("does not change the list it was given", () => {
+    const list = [h("a"), h("b")];
+    stillWaiting(list, new Set(["a"]));
+    expect(list).toHaveLength(2);
+  });
+});
+
 describe("the listener uses the queue", () => {
   const source = readFileSync(
     join(__dirname, "..", "..", "components", "NxmBackgroundListener.tsx"),
@@ -128,6 +154,34 @@ describe("the listener uses the queue", () => {
 
   it("offers a way to cancel what is waiting", () => {
     expect(source).toContain("Cancel queued");
+  });
+
+  it("cancels the queue as it is when clicked, not as it was when drawn", () => {
+    // The toast is only redrawn when the count changes. One download starting
+    // as another arrives keeps the count, and a captured list went stale:
+    // the click cancelled a running download and missed the new one.
+    const button = source.slice(
+      source.indexOf('label: "Cancel queued"'),
+      source.indexOf("const processHandoff"),
+    );
+    expect(button).toContain("stillWaiting(waitingRef.current, processingRef.current)");
+    expect(button).not.toContain("cancelWaiting(waiting)");
+  });
+
+  it("refreshes that list on every poll", () => {
+    const report = source.slice(
+      source.indexOf("const reportWaiting ="),
+      source.indexOf("// Keep the waiting ones alive"),
+    );
+    expect(report).toContain("waitingRef.current = waiting;");
+  });
+
+  it("says nothing when the queue emptied before the click", () => {
+    const cancel = source.slice(
+      source.indexOf("const cancelWaiting ="),
+      source.indexOf("const reportWaiting ="),
+    );
+    expect(cancel).toContain("if (waiting.length === 0)");
   });
 
   it("does not dismiss a handoff that is mid-download elsewhere", () => {

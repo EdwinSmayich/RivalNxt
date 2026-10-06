@@ -17,6 +17,7 @@ import {
   isAlreadyDownloading,
   planDownloads,
   queueSummary,
+  stillWaiting,
 } from "../lib/downloadQueue";
 
 const QUEUE_TOAST_ID = "nxm-download-queue";
@@ -61,6 +62,9 @@ export function NxmBackgroundListener({
   const failedHandoffsRef = useRef<Map<string, HandoffFailure>>(new Map());
   const lastKeepAliveRef = useRef<Map<string, number>>(new Map());
   const queueToastCountRef = useRef(0);
+  // The queue as of the latest poll. The toast's Cancel button reads this when
+  // clicked, not the list it was drawn with.
+  const waitingRef = useRef<ApiNxmHandoffSummary[]>([]);
   const toastDeduplicator = useRef(
     createToastDeduplicator(TOAST_DEDUPE_WINDOW_MS),
   );
@@ -178,6 +182,13 @@ export function NxmBackgroundListener({
     };
 
     const cancelWaiting = async (waiting: ApiNxmHandoffSummary[]) => {
+      waitingRef.current = [];
+      if (waiting.length === 0) {
+        // Everything that was waiting has started since the toast was drawn.
+        queueToastCountRef.current = 0;
+        toast.dismiss(QUEUE_TOAST_ID);
+        return;
+      }
       for (const handoff of waiting) {
         cancelledHandoffsRef.current.add(handoff.id);
         failedHandoffsRef.current.delete(handoff.id);
@@ -195,6 +206,7 @@ export function NxmBackgroundListener({
     };
 
     const reportWaiting = (waiting: ApiNxmHandoffSummary[]) => {
+      waitingRef.current = waiting;
       if (waiting.length === 0) {
         if (queueToastCountRef.current !== 0) {
           queueToastCountRef.current = 0;
@@ -226,7 +238,9 @@ export function NxmBackgroundListener({
         action: {
           label: "Cancel queued",
           onClick: () => {
-            void cancelWaiting(waiting);
+            void cancelWaiting(
+              stillWaiting(waitingRef.current, processingRef.current),
+            );
           },
         },
       });

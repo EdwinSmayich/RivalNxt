@@ -21,6 +21,7 @@ killed process left something indistinguishable from a real archive.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import threading
 import time
@@ -398,6 +399,130 @@ class TestOneTransferPerFile:
 
         assert not registry.is_active("handoff-a")
         assert server._DOWNLOAD_SLOTS.active == 0
+
+    def test_a_download_cancelled_before_its_turn_never_contacts_nexus(self, monkeypatch):
+        """A free slot is granted without asking; the cancel has to be checked after."""
+        registry = InflightRegistry()
+        cancelled = CancelledSet()
+        cancelled.add("handoff-a")
+        monkeypatch.setattr(server, "_INFLIGHT_DOWNLOADS", registry)
+        monkeypatch.setattr(server, "_DOWNLOAD_SLOTS", DownloadSlots(limit=2))
+        monkeypatch.setattr(server, "_CANCELLED_HANDOFFS", cancelled)
+        contacted: list[str] = []
+        monkeypatch.setattr(
+            server, "_download_archive_via_nxm", lambda *a, **k: contacted.append("nexus")
+        )
+
+        with pytest.raises(server.DownloadCancelledError):
+            server._download_once_in_turn({"id": "handoff-a"}, "marvelrivals", 6882, 9001)
+
+        assert contacted == []
+        assert not registry.is_active("handoff-a")
+        assert server._DOWNLOAD_SLOTS.active == 0
+
+
+class FakeUpload:
+    """An UploadFile reduced to what the upload route touches."""
+
+    def __init__(self, filename: str, chunks: list, *, die_on: int | None = None):
+        self.filename = filename
+        self._chunks = list(chunks)
+        self._calls = 0
+        self._die_on = die_on
+
+    async def read(self, _n: int) -> bytes:
+        self._calls += 1
+        if self._die_on is not None and self._calls >= self._die_on:
+            # What the route sees when the window is closed mid-upload.
+            raise asyncio.CancelledError()
+        return self._chunks.pop(0) if self._chunks else b""
+
+    async def close(self) -> None:
+        pass
+
+
+class TestFilesAddedByHand:
+    """Dropping a file onto the app, or picking one from disk.
+
+    Both wrote straight to the final name in the downloads folder. Stopped
+    half-way -- the app closed, the disk filled -- that left a truncated
+    archive which looked finished, and which every later attempt to add the
+    same file was answered with.
+    """
+
+    def test_an_upload_cut_short_leaves_nothing(self, downloads_dir):
+        upload = FakeUpload("Mod.zip", [b"PK the first part"], die_on=2)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(server.upload_mod_file(file=upload))
+
+        assert list(downloads_dir.iterdir()) == []
+
+    def test_so_the_next_attempt_is_not_told_it_already_exists(self, downloads_dir):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(server.upload_mod_file(file=FakeUpload("Mod.zip", [b"half"], die_on=2)))
+
+        whole = zip_bytes()
+        result = asyncio.run(server.upload_mod_file(file=FakeUpload("Mod.zip", [whole])))
+
+        assert "already_existed" not in result
+        assert result["size"] == len(whole)
+        assert (downloads_dir / "Mod.zip").read_bytes() == whole
+
+    def test_a_complete_upload_arrives_under_its_name_only(self, downloads_dir):
+        whole = zip_bytes()
+        asyncio.run(server.upload_mod_file(file=FakeUpload("Mod.zip", [whole[:100], whole[100:]])))
+        assert [p.name for p in downloads_dir.iterdir()] == ["Mod.zip"]
+
+    def test_an_empty_upload_is_refused_and_leaves_nothing(self, downloads_dir):
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(server.upload_mod_file(file=FakeUpload("Mod.zip", [])))
+        assert caught.value.status_code == 400
+        assert list(downloads_dir.iterdir()) == []
+
+    def test_a_copy_cut_short_leaves_nothing(self, downloads_dir, tmp_path, monkeypatch):
+        source = tmp_path / "Picked.zip"
+        source.write_bytes(zip_bytes())
+
+        def dies_halfway(src, dst, *a, **k):
+            Path(dst).write_bytes(Path(src).read_bytes()[:50])
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(server.shutil, "copy2", dies_halfway)
+
+        with pytest.raises(HTTPException) as caught:
+            server.copy_to_downloads(server.CopyToDownloadsRequest(source_path=str(source)))
+
+        assert caught.value.status_code == 500
+        assert list(downloads_dir.iterdir()) == []
+
+    def test_a_complete_copy_arrives_under_its_name_only(self, downloads_dir, tmp_path):
+        source = tmp_path / "Picked.zip"
+        source.write_bytes(zip_bytes())
+
+        result = server.copy_to_downloads(server.CopyToDownloadsRequest(source_path=str(source)))
+
+        assert [p.name for p in downloads_dir.iterdir()] == ["Picked.zip"]
+        assert result["size"] == source.stat().st_size
+
+    def test_the_copy_is_never_visible_under_its_real_name_while_in_flight(
+        self, downloads_dir, tmp_path, monkeypatch
+    ):
+        source = tmp_path / "Picked.zip"
+        source.write_bytes(zip_bytes())
+        seen_during: list[list[str]] = []
+        real = server.shutil.copy2
+
+        def watching(src, dst, *a, **k):
+            out = real(src, dst, *a, **k)
+            seen_during.append(sorted(p.name for p in downloads_dir.iterdir()))
+            return out
+
+        monkeypatch.setattr(server.shutil, "copy2", watching)
+        server.copy_to_downloads(server.CopyToDownloadsRequest(source_path=str(source)))
+
+        assert len(seen_during) == 1
+        assert all(name.endswith(PART_SUFFIX) for name in seen_during[0])
 
 
 class TestTheMessageAPersonSees:

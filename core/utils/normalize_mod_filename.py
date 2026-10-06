@@ -57,7 +57,11 @@ def normalize_mod_filename(
     
     # 1. Try parsing the existing filename
     name, parsed_mod_id, version = parse_mod_filename(path.name)
-    candidate_mod_id = parsed_mod_id or known_mod_id
+    # An id the caller already knows -- it came with the download link, or the
+    # user typed it -- outranks one guessed from the file name. The guess used
+    # to win, so a name the parser misread ("...-v1-1-6853-1.1-...", read as
+    # mod 1) replaced the right id with the wrong one on the way in.
+    candidate_mod_id = known_mod_id or parsed_mod_id
 
     # 2. If parsing failed, check the mod_id_overrides table
     if candidate_mod_id is None:

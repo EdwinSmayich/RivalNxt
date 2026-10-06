@@ -1090,7 +1090,6 @@ def replace_local_downloads(conn: sqlite3.Connection, rows: Iterable[Dict[str, A
             ON CONFLICT(path) DO UPDATE SET
                 id=excluded.id,
                 name=excluded.name,
-                mod_id=excluded.mod_id,
                 -- A rescan often cannot read an id out of the filename: the
                 -- download was renamed, or Nexus wrote it in a shape the parser
                 -- does not know. Overwriting a known id with NULL there
@@ -1152,6 +1151,66 @@ def replace_local_downloads(conn: sqlite3.Connection, rows: Iterable[Dict[str, A
 
     conn.commit()
     return inserted
+
+def repair_misparsed_mod_ids(conn: sqlite3.Connection) -> List[Tuple[int, int, int]]:
+    """Move downloads off a "mod id" that was really a number in their name.
+
+    The file-name parser used to take the first number it met, so
+    ``the-ting-v1-1-6853-1.1-1771860521.zip`` was filed under mod 1. The parser
+    is fixed, but rows written before that keep the wrong id until the library
+    is rebuilt, and meanwhile show another mod's name and picture -- or, since
+    mods 1 and 3 are long gone from Nexus, none.
+
+    A row is changed only when all of this holds:
+
+    * nobody assigned its id by hand (``mod_id_overrides``);
+    * the parser now reads a different id from the file name;
+    * the stored id is one of the numbers in the name *before* that id;
+    * Nexus has never given a name for the stored id.
+
+    The last is what separates a misreading from a real mod whose version
+    happens to contain a large number. Returns ``(download id, old, new)``.
+    """
+    from core.utils.mod_filename import parse_mod_filename
+
+    cur = conn.cursor()
+    try:
+        overridden = {str(r[0]) for r in cur.execute("SELECT local_path FROM mod_id_overrides")}
+    except sqlite3.OperationalError:
+        overridden = set()
+    try:
+        rows = cur.execute(
+            "SELECT id, path, mod_id FROM local_downloads WHERE mod_id IS NOT NULL AND mod_id > 0"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    changed: List[Tuple[int, int, int]] = []
+    for download_id, path, stored in rows:
+        if not isinstance(path, str) or not path:
+            continue
+        base = os.path.basename(path.replace("\\", "/"))
+        if path in overridden or base in overridden:
+            continue
+        _name, parsed, _version = parse_mod_filename(base)
+        if parsed is None or parsed == stored:
+            continue
+        tokens = re.split(r"[-_ ]+", Path(base).stem)
+        positions = [i for i, token in enumerate(tokens) if token == str(parsed)]
+        if not positions or str(stored) not in tokens[: positions[-1]]:
+            continue
+        named = cur.execute(
+            "SELECT 1 FROM mods WHERE mod_id = ? AND name IS NOT NULL AND TRIM(name) != ''",
+            (stored,),
+        ).fetchone()
+        if named:
+            continue
+        cur.execute("UPDATE local_downloads SET mod_id = ? WHERE id = ?", (parsed, download_id))
+        changed.append((int(download_id), int(stored), int(parsed)))
+    if changed:
+        conn.commit()
+    return changed
+
 
 def fetch_pak_version_status(
     conn: sqlite3.Connection,
@@ -1800,6 +1859,8 @@ __all__ = [
     "fetch_pak_version_status",
     "update_local_download_active_paks",
     "upsert_mod_info",
+    "fill_missing_mod_name",
+    "repair_misparsed_mod_ids",
 
     "replace_mod_files",
     "replace_mod_changelogs",

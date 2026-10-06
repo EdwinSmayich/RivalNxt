@@ -6,6 +6,87 @@ from typing import Optional, Tuple
 
 __all__ = ["parse_mod_filename", "parse_mod_filename_to_row"]
 
+# <anything>-<unix time>, with whatever a browser or this app adds to a second
+# copy: " (1)", "-1", "_1".
+_TIMESTAMPED = re.compile(r"^(?P<body>.+)-(?P<stamp>\d{9,11})(?:[\s\-_]+(?:\(\d+\)|\d+))?$")
+
+# One piece of a version number: 1, 12, 0b, v2, rc1, beta. A number of four
+# digits or more is deliberately not one -- that is what a mod id looks like,
+# and it is where reading backwards has to stop.
+_VERSION_PIECE = re.compile(
+    r"^(?:v?\d{1,3}[a-z]{0,2}|(?:a|b|alpha|beta|rc|pre|dev|final|fix|hotfix)\d{0,2})$",
+    re.IGNORECASE,
+)
+_ID_TOKEN = re.compile(r"^[0-9]{1,7}$")
+# A version that is a date: 2025-01-15. The year would otherwise be read as a
+# mod id, being four digits. Only zero-padded months count, so that an id in
+# the 2000s followed by an ordinary "1-0" is not mistaken for one.
+_YEAR = re.compile(r"^(?:19|20)[0-9]{2}$")
+_MONTH = re.compile(r"^(?:0[1-9]|1[0-2])$")
+_VERSION_TOKEN = re.compile(r"^[\w.]+$")
+
+
+def _split_timestamped_name(base: str) -> Optional[Tuple[str, int, str]]:
+    """``(name, mod id, version)`` from ``name-id-version-timestamp``, or None.
+
+    The id is found from the right. Taking the first number in the name, as
+    this used to, reads "the-ting-v1-1-7345-1.1-1774361896" as mod 1 and
+    "...-vol-3-8567-1.0-..." as mod 3: any number in the *name* wins. Taking the
+    last number instead mistakes the end of an ordinary "1-0" version for it.
+
+    What is certain is the far end: the timestamp, and before it the version.
+
+    * A version written with dots ("1.1", as this app writes them when it
+      renames a download) is a single token, so the id is the one before it.
+    * A version written with dashes ("1-0-2", as Nexus serves them) is a run of
+      short pieces; the id is the number standing immediately before that run.
+    * If nothing numeric stands before the run, the id was short enough to be
+      taken for part of it -- an early mod, id below 1000 -- and it is the
+      first number in the run, which is what the old rule would have said.
+    """
+    match = _TIMESTAMPED.match(base)
+    if not match:
+        return None
+    tokens = match.group("body").split("-")
+    if len(tokens) < 3:
+        return None
+    last = len(tokens) - 1
+
+    id_index: Optional[int] = None
+    if "." in tokens[last] and last - 1 >= 1 and _ID_TOKEN.match(tokens[last - 1]):
+        id_index = last - 1
+    else:
+        start = last  # the token before the timestamp is always version
+        while start - 1 >= 1:
+            previous = tokens[start - 1]
+            dated = _YEAR.match(previous) and _MONTH.match(tokens[start])
+            if not (_VERSION_PIECE.match(previous) or dated):
+                break
+            start -= 1
+        if start - 1 >= 1 and _ID_TOKEN.match(tokens[start - 1]):
+            id_index = start - 1
+        else:
+            for index in range(start, last):
+                if _ID_TOKEN.match(tokens[index]):
+                    id_index = index
+                    break
+    if id_index is None or id_index < 1:
+        return None
+
+    version_tokens = tokens[id_index + 1:]
+    if not version_tokens or not all(_VERSION_TOKEN.match(t) for t in version_tokens):
+        return None
+    # A download this app renamed twice carries the id twice:
+    #   <name>-12406-1-0-2026-08-25t12-16z-<random>-12406-1.0-<timestamp>
+    # The name ends where the id first appears, not where it appears last.
+    name_end = tokens.index(tokens[id_index])
+    if name_end < 1:
+        name_end = id_index
+    name_raw = "-".join(tokens[:name_end])
+    if not name_raw.strip():
+        return None
+    return name_raw, int(tokens[id_index]), ".".join(version_tokens)
+
 
 def parse_mod_filename(filename: str) -> Tuple[str, Optional[int], str]:
     """Extract name, mod_id, and version from a mod filename.
@@ -44,6 +125,14 @@ def parse_mod_filename(filename: str) -> Tuple[str, Optional[int], str]:
         r"(?:[\s\-_]+(?:\(\d+\)|\d+))?"   # Optional browser duplicate suffix like " (1)", "-1", "_1"
         r"$"
     )
+    split = _split_timestamped_name(base)
+    if split is not None:
+        name_raw, mod_id, version = split
+        name = re.sub(r"\s+", " ", name_raw.replace("_", " ").strip())
+        return name, mod_id, version
+
+    # Anything the reading above could not make sense of gets the pattern that
+    # was here before it.
     nexus_match = nexus_pattern.match(base)
     
     if nexus_match:

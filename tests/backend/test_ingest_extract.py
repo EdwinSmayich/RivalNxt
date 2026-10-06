@@ -213,4 +213,27 @@ def test_extraction_failure_is_reported_not_swallowed(
     )
     assert result["ok"] is True
     assert "ingest_warning" in result, result
-    assert "corrupt archive" in result["ingest_warning"]
+    # A damaged archive is named as one, with what to do about it, instead of
+    # in whatever words the archive library happened to use.
+    assert "Broken-11-1-0.zip is damaged or incomplete" in result["ingest_warning"]
+    assert "download it again" in result["ingest_warning"]
+
+
+def test_a_failure_that_is_not_damage_keeps_its_own_words(
+    monkeypatch, ingest_harness, tmp_path
+):
+    """Blaming the archive for a full disk would send the user the wrong way."""
+
+    def boom(archive_path, dest):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(server, "extract_archive", boom)
+
+    archive = tmp_path / "Fine-12-1-0.zip"
+    archive.write_bytes(b"garbage")
+
+    result = server._ingest_resolved_download(
+        archive, name="Fine", mod_id=12, version="1.0"
+    )
+    assert "No space left on device" in result["ingest_warning"]
+    assert "damaged" not in result["ingest_warning"]

@@ -137,9 +137,27 @@ export function CrashDetectorModal({
     const toastId = "crash-disable-all";
     toast.loading("Disabling all active mods...", { id: toastId });
     try {
-      await disableAllMods();
+      const result = await disableAllMods();
       await scanActive();
-      toast.success("All active mods disabled", { id: toastId });
+      // The backend moves mods it did not install out of the game's folder
+      // instead of deleting them, and names anything it could not take out.
+      // Both have to be said: one is where the user's files went, the other
+      // is that the game may still crash.
+      if (result.still_on && result.still_on.length > 0) {
+        toast.warning("Not every mod could be disabled", {
+          id: toastId,
+          description: result.warning,
+          duration: 20_000,
+        });
+      } else if (result.moved_out && result.moved_out.length > 0) {
+        toast.success("All active mods disabled", {
+          id: toastId,
+          description: result.warning,
+          duration: 20_000,
+        });
+      } else {
+        toast.success("All active mods disabled", { id: toastId });
+      }
       setDone(true);
       onDeactivated();
     } catch (err: any) {

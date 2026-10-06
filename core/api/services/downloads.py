@@ -28,6 +28,7 @@ from __future__ import annotations
 import threading
 import time
 import zipfile
+import zlib
 from collections import deque
 from pathlib import Path
 from typing import Callable, Deque, Dict, Hashable, Optional
@@ -239,15 +240,59 @@ _DAMAGE_MARKERS = (
     "unexpected end of archive",
     "checksum error",
     "crc check failed",
+    "bad crc",
     "file is not a zip file",
+    "not a 7z file",
+    "not a rar file",
     "bad magic number",
+    "invalid header data",
     "invalid distance",
     "invalid block type",
     "invalid stored block",
     "error -3 while decompressing",
+    "error -5 while decompressing",
+    "compressed file ended before",
     "truncated",
     "corrupt",
 )
+
+#: Exception classes that mean the same thing whatever their message says.
+#: py7zr's checksum failure, for one, has no message at all: its text is the
+#: tuple ``(297193375, 2584611980, 'Mod_P.ucas')``, which is what was shown.
+_DAMAGE_ERROR_NAMES = frozenset(
+    {
+        "BadZipFile",
+        "BadZipfile",
+        "Bad7zFile",
+        "BadRarFile",
+        "NotRarFile",
+        "CrcError",
+        "RarCRCError",
+        "LZMAError",
+        "DecompressionError",
+        "EOFError",
+    }
+)
+
+
+def _is_damage(error: object) -> bool:
+    seen = 0
+    current: object = error
+    while current is not None and seen < 6:
+        if any(cls.__name__ in _DAMAGE_ERROR_NAMES for cls in type(current).__mro__):
+            return True
+        if isinstance(current, zlib.error):
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in _DAMAGE_MARKERS):
+            return True
+        if not isinstance(current, BaseException):
+            return False
+        # A wrapper such as "Archive extract failed: ..." keeps the real error
+        # underneath it.
+        current = current.__cause__ or current.__context__
+        seen += 1
+    return False
 
 
 def describe_archive_failure(error: object, archive_name: str = "") -> Optional[str]:
@@ -258,8 +303,7 @@ def describe_archive_failure(error: object, archive_name: str = "") -> Optional[
     read enough data: req=1048576 got=1018368". That names no cause and no
     remedy. Returns None for errors that are about something else.
     """
-    text = str(error).lower()
-    if not any(marker in text for marker in _DAMAGE_MARKERS):
+    if not _is_damage(error):
         return None
     subject = f"{archive_name} is" if archive_name else "This archive is"
     return (

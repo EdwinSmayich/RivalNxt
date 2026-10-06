@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 import unicodedata
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
@@ -247,97 +249,109 @@ def resolve_entry(lookup: Dict[str, str], desired: str) -> Optional[str]:
     return None
 
 
-def _cleanup_empty_parents(child: Path, stop: Path) -> None:
-    """Remove empty directories from child up to (but not including) stop."""
-    current = child
-    while current != stop and current.parent != current:
-        try:
-            if current.is_dir() and not any(current.iterdir()):
-                current.rmdir()
-            else:
-                break
-        except Exception:
-            break
-        current = current.parent
+def _same_member(candidate: str, wanted: str) -> bool:
+    """Archive entries are matched by full path, then by file name alone."""
+    return (
+        candidate.lower() == wanted.lower()
+        or os.path.basename(candidate).lower() == os.path.basename(wanted).lower()
+    )
 
 
-def extract_member(archive_path: str, member_path: str, dest_path: str) -> None:
-    """Extract a single member to dest_path. Works for zip, 7z, and rar using pure Python libs."""
-    dstdir = Path(dest_path).parent
-    dstdir.mkdir(parents=True, exist_ok=True)
+def _extract_via_scratch_dir(extract, member: str, out_path: Path, kind: str) -> None:
+    """Run a library's extract-to-folder into a throwaway folder, then move the file out.
+
+    py7zr and rarfile only extract to ``<folder>/<path inside the archive>``.
+    Pointing them at the destination's own folder put half-extracted ``.pak``
+    files, under whatever folders the archive happened to contain, inside the
+    game's mods folder -- which the game reads recursively.
+    """
+    scratch = tempfile.mkdtemp(prefix="rivalnxt-extract-")
+    try:
+        extract(scratch)
+        produced = Path(scratch) / member
+        if not produced.is_file():
+            raise RuntimeError(f"extracted member not found in {kind}")
+        shutil.move(str(produced), str(out_path))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _extract_member_to(archive_path: str, member_path: str, out_path: Path) -> None:
+    """Write one archive member to ``out_path``. May leave a partial file on failure."""
     typ = _archive_type(archive_path)
-    target_base = os.path.basename(member_path)
     if typ == "zip":
         with zipfile.ZipFile(archive_path, "r") as zf:
             member = None
-            target_lower = member_path.lower()
             for zi in zf.infolist():
                 if zi.is_dir():
                     continue
-                if zi.filename.lower() == target_lower or os.path.basename(zi.filename).lower() == os.path.basename(target_lower):
+                if _same_member(zi.filename, member_path):
                     member = zi.filename
                     break
             if not member:
                 raise RuntimeError("member not found in zip")
-            with zf.open(member, 'r') as src, open(dest_path, 'wb') as dst:
-                shutil.copyfileobj(src, dst)
+            with zf.open(member, 'r') as src, open(out_path, 'wb') as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
             return
     elif typ == "7z":
         with py7zr.SevenZipFile(archive_path, mode="r") as zf:
-            names = zf.getnames()
             member = None
-            for name in names:
-                if name.lower() == member_path.lower() or os.path.basename(name).lower() == target_base.lower():
+            for name in zf.getnames():
+                if _same_member(name, member_path):
                     member = name
                     break
             if not member:
                 raise RuntimeError("member not found in 7z")
-            zf.extract(targets=[member], path=dstdir)
-            src_path = dstdir / member
-            if not src_path.exists():
-                raise RuntimeError("extracted member not found in 7z")
-            shutil.move(str(src_path), dest_path)
-            # Clean up empty intermediate directories created by archive extraction
-            _cleanup_empty_parents(src_path.parent, dstdir)
+            _extract_via_scratch_dir(
+                lambda folder: zf.extract(targets=[member], path=folder), member, out_path, "7z"
+            )
             return
     elif typ == "rar":
-        with rarfile.RarFile(archive_path, "r") as rf:
-            member = None
-            try:
+        def _attempt(note: str) -> None:
+            with rarfile.RarFile(archive_path, "r") as rf:
+                member = None
                 for f in rf.infolist():
-                    if f.filename.lower() == member_path.lower() or os.path.basename(f.filename).lower() == target_base.lower():
+                    if _same_member(f.filename, member_path):
                         member = f.filename
                         break
                 if not member:
-                    raise RuntimeError("member not found in rar")
-                rf.extract(member, dstdir)
-                src_path = dstdir / member
-                if not src_path.exists():
-                    raise RuntimeError("extracted member not found in rar")
-                shutil.move(str(src_path), dest_path)
-                # Clean up empty intermediate directories created by archive extraction
-                _cleanup_empty_parents(src_path.parent, dstdir)
+                    raise RuntimeError(f"member not found in rar{note}")
+                _extract_via_scratch_dir(
+                    lambda folder: rf.extract(member, folder), member, out_path, f"rar{note}"
+                )
+
+        try:
+            _attempt("")
+            return
+        except Exception:
+            # Reconfigure rarfile and retry
+            _configure_rarfile()
+            try:
+                _attempt(" after reconfiguration")
                 return
-            except Exception:
-                # Reconfigure rarfile and retry
-                _configure_rarfile()
-                try:
-                    with rarfile.RarFile(archive_path, "r") as rf:
-                        for f in rf.infolist():
-                            if f.filename.lower() == member_path.lower() or os.path.basename(f.filename).lower() == target_base.lower():
-                                member = f.filename
-                                break
-                        if not member:
-                            raise RuntimeError("member not found in rar after reconfiguration")
-                        rf.extract(member, dstdir)
-                        src_path = dstdir / member
-                        if not src_path.exists():
-                            raise RuntimeError("extracted member not found in rar after reconfiguration")
-                        shutil.move(str(src_path), dest_path)
-                        # Clean up empty intermediate directories created by archive extraction
-                        _cleanup_empty_parents(src_path.parent, dstdir)
-                        return
-                except Exception as e2:
-                    raise RuntimeError(f"rar member extraction failed after reconfiguration: {e2}")
+            except Exception as e2:
+                raise RuntimeError(f"rar member extraction failed after reconfiguration: {e2}")
     else:
         raise RuntimeError(f"Unsupported archive type for member extraction: {archive_path}")
+
+
+def extract_member(archive_path: str, member_path: str, dest_path: str) -> None:
+    """Extract a single member to dest_path. Works for zip, 7z, and rar using pure Python libs.
+
+    ``dest_path`` either receives the complete file or is left exactly as it
+    was. The member is written under a temporary name beside it and renamed
+    only once the archive library has finished without complaint -- a damaged
+    archive fails its checksum at the very end, by which time writing straight
+    to ``dest_path`` had already replaced a working file with a broken one.
+    """
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staged = dest.with_name(f"{dest.name}.{uuid.uuid4().hex[:8]}.part")
+    try:
+        _extract_member_to(archive_path, member_path, staged)
+        os.replace(staged, dest)
+    finally:
+        try:
+            staged.unlink()
+        except OSError:
+            pass

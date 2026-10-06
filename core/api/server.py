@@ -100,6 +100,20 @@ from core.version import APP_VERSION, USER_AGENT
 from core.nexus.nxm import NXMParseError, parse_nxm_uri
 from core.utils.archive import build_entry_lookup, extract_archive, extract_member, list_entries, resolve_entry
 from core.utils.download_paths import normalize_download_path, resolve_absolute_download_path
+from core.utils.mod_files import (
+	BUNDLE_EXTS,
+	MODS_FOLDER_LOCK,
+	FileInUseError,
+	StagedInstall,
+	find_mod_files,
+	in_use_message,
+	move_bundle,
+	recover_interrupted,
+	remove_mod_files,
+	set_aside,
+	stems_of,
+	sweep_orphan_companions,
+)
 from core.utils.pak_files import collapse_pak_bundle
 
 from core.utils.mod_filename import parse_mod_filename
@@ -112,7 +126,20 @@ from field_prefs import filter_aggregate_payload, load_prefs
 # Global cache for Nexus preferences
 _NEXUS_PREFS_CACHE = None
 
-app = FastAPI(title="Mod Manager Backend", version=APP_VERSION)
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+	"""Housekeeping when the server starts serving, rather than on import.
+
+	_startup_housekeeping is defined further down and looked up when this runs.
+	"""
+	try:
+		_startup_housekeeping()
+	except Exception as exc:  # never keep the server from starting
+		logging.getLogger("modmanager.api").warning("[startup] housekeeping failed: %s", exc)
+	yield
+
+
+app = FastAPI(title="Mod Manager Backend", version=APP_VERSION, lifespan=_lifespan)
 
 # Register character API routes
 from core.api.characters import router as characters_router
@@ -171,6 +198,12 @@ DOWNLOAD_CHUNK_BYTES = 64 * 1024
 DOWNLOAD_READ_TIMEOUT_SECONDS = 60
 
 
+# A transfer still being written has a modification time of a moment ago. Only
+# the backend that owns it should be running, but a second copy started by
+# hand must not take a live download's file for an abandoned one.
+PARTIAL_DOWNLOAD_MIN_AGE_SECONDS = 120.0
+
+
 def _sweep_partial_downloads() -> int:
 	"""Remove transfers a previous run left unfinished.
 
@@ -181,7 +214,9 @@ def _sweep_partial_downloads() -> int:
 		root = load_settings().marvel_rivals_local_downloads_root
 		if not root:
 			return 0
-		removed = cleanup_partial_downloads(Path(root))
+		removed = cleanup_partial_downloads(
+			Path(root), older_than_seconds=PARTIAL_DOWNLOAD_MIN_AGE_SECONDS
+		)
 		if removed:
 			logger.warning("[download] Removed %s unfinished download(s) left by a previous run", removed)
 		return removed
@@ -190,7 +225,71 @@ def _sweep_partial_downloads() -> int:
 		return 0
 
 
-_sweep_partial_downloads()
+def _recover_interrupted_installs() -> Dict[str, List[str]]:
+	"""Put the mods folder right after an install the app did not live to finish."""
+	empty: Dict[str, List[str]] = {"restored": [], "discarded": []}
+	try:
+		from core.config.settings import get_mods_dir
+
+		mods_dir = get_mods_dir(load_settings().marvel_rivals_root)
+		if mods_dir is None or not mods_dir.is_dir():
+			return empty
+		with MODS_FOLDER_LOCK:
+			report = recover_interrupted(mods_dir)
+		if report["restored"]:
+			logger.warning(
+				"[activate] Put back %s mod file(s) an interrupted install had moved aside: %s",
+				len(report["restored"]),
+				", ".join(report["restored"][:5]),
+			)
+		if report["discarded"]:
+			logger.info("[activate] Removed %s leftover file(s) from an interrupted install", len(report["discarded"]))
+		return report
+	except Exception as exc:
+		logger.debug("[activate] Could not check for interrupted installs: %s", exc)
+		return empty
+
+
+def _startup_housekeeping() -> None:
+	"""Runs once when the server starts serving. Never raises.
+
+	This was a call at import time, so anything that merely imported this
+	module -- a test, a maintenance script -- swept the downloads folder of
+	whichever installation the settings pointed at.
+	"""
+	_sweep_partial_downloads()
+	_recover_interrupted_installs()
+	_repair_misparsed_mod_ids()
+
+
+def _repair_misparsed_mod_ids() -> int:
+	"""Re-file downloads whose mod id was a number out of their own name."""
+	try:
+		from core.db.db import repair_misparsed_mod_ids
+
+		conn = get_db()
+		try:
+			changed = repair_misparsed_mod_ids(conn)
+		finally:
+			try:
+				conn.close()
+			except Exception:
+				pass
+		if changed:
+			logger.warning(
+				"[startup] Corrected the Nexus id of %s download(s): %s",
+				len(changed),
+				", ".join(f"#{dl} {old}->{new}" for dl, old, new in changed[:10]),
+			)
+			_log_activity(
+				"repaired",
+				f"Corrected the Nexus id of {len(changed)} download(s)",
+				"; ".join(f"download {dl}: mod {old} -> {new}" for dl, old, new in changed[:20]),
+			)
+		return len(changed)
+	except Exception as exc:
+		logger.debug("[startup] Could not check for misread mod ids: %s", exc)
+		return 0
 
 
 class DownloadCancelledError(Exception):
@@ -630,6 +729,20 @@ async def _handle_download_cancelled(request: Request, exc: DownloadCancelledErr
 			"error": "download_cancelled",
 			"message": str(exc) or "Download cancelled by user",
 			"endpoint": request.url.path,
+		},
+	)
+
+
+@app.exception_handler(FileInUseError)
+async def _handle_file_in_use(request: Request, exc: FileInUseError):
+	"""A file the game has open is for the user to release; it is not a server fault."""
+	logger.warning("[in use] %s %s: %s", request.method, request.url.path, exc.path)
+	return JSONResponse(
+		status_code=423,
+		content={
+			"error": "file_in_use",
+			"detail": in_use_message([exc.path.name], doing="nothing was changed"),
+			"file": exc.path.name,
 		},
 	)
 
@@ -2336,6 +2449,12 @@ def _ingest_resolved_download(
 		conn.commit()
 
 		if ingest_prep_error is not None:
+			# Say "the archive is damaged" when that is what happened. The
+			# library's own text for it can be as unhelpful as a bare tuple.
+			ingest_warning = (
+				describe_archive_failure(ingest_prep_error, path.name)
+				or f"Asset extraction failed: {ingest_prep_error}"
+			)
 			result = {
 				"ok": True,
 				"inserted": 1,
@@ -2344,7 +2463,7 @@ def _ingest_resolved_download(
 				"version": version,
 				"path": normalized_path,
 				"contents": contents,
-				"ingest_warning": f"Asset extraction failed: {ingest_prep_error}",
+				"ingest_warning": ingest_warning,
 				"download_id": local_download_id,
 			}
 			if source_url:
@@ -8475,45 +8594,6 @@ def _ensure_dir(p: Path) -> None:
 ## zip member extraction helper removed (use core.utils.archive.extract_member)
 
 
-def _remove_in_mods_by_names(mods_dir: Path, names: List[str]) -> List[str]:
-	"""Remove any files in mods_dir (recursively) whose basename is in names (case-insensitive)."""
-	names_lower = {str(n).lower() for n in names if isinstance(n, str) and n}
-	removed: List[str] = []
-	try:
-		for p in mods_dir.rglob("*"):
-			if p.is_file() and p.name.lower() in names_lower:
-				try:
-					p.unlink()
-					removed.append(p.name)
-				except Exception:
-					pass
-	except Exception:
-		pass
-	return removed
-
-
-def _remove_in_mods_by_stems(mods_dir: Path, stems: List[str]) -> List[str]:
-	"""Remove any files in mods_dir (recursively) with basename matching stem + (.pak|.utoc|.ucas)."""
-	targets = set()
-	for st in stems:
-		if not st:
-			continue
-		for ext in (".pak", ".utoc", ".ucas"):
-			targets.add(f"{st}{ext}".lower())
-	removed: List[str] = []
-	try:
-		for p in mods_dir.rglob("*"):
-			if p.is_file() and p.name.lower() in targets:
-				try:
-					p.unlink()
-					removed.append(p.name)
-				except Exception:
-					pass
-	except Exception:
-		pass
-	return removed
-
-
 @app.post("/api/local_downloads/delete")
 def delete_local_downloads_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 	"""Remove one or more local_downloads rows and cascade associated data."""
@@ -8620,28 +8700,81 @@ def delete_local_downloads_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict
 			pass
 
 
+DISABLED_MODS_FOLDER_NAME = "RivalNxt disabled mods"
+
+
+def _holding_dir_for_unmanaged_mods(mods_dir: Path) -> Path:
+	"""Where mod files this app did not install are moved when everything is switched off.
+
+	Beside the game, not inside it: the game mounts every .pak under
+	Content/Paks whatever folder it is in, so a holding folder there would
+	switch nothing off.
+	"""
+	from datetime import datetime
+
+	root = _get_current_settings().marvel_rivals_root
+	base = Path(root) if root else mods_dir.parent.parent.parent.parent.parent
+	return base / DISABLED_MODS_FOLDER_NAME / datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+
+
 @app.post("/api/mods/disable-all")
 def disable_all_mods() -> Dict[str, Any]:
-	"""Disable all active mods and clear the ~mods folder."""
+	"""Switch every mod off.
+
+	Files this app installed are deleted; their archives are still in the
+	downloads folder and switching the mod back on restores them.
+
+	Mod files it knows nothing about -- dropped into ~mods by hand -- are moved
+	to a folder beside the game instead. This used to delete every file under
+	~mods without asking, and for those there was no archive to get them back
+	from.
+	"""
 	conn = get_db()
 	try:
-		# 1. Clear ~mods directory
 		mods_dir = _mods_folder_from_env()
-		if mods_dir.exists():
-			# Delete all files to clear the active mods
-			for p in mods_dir.rglob("*"):
-				if p.is_file():
-					try:
-						p.unlink()
-					except Exception as e:
-						logger.warning(f"Failed to delete {p}: {e}")
-			# Try to remove empty subdirectories
-			for p in sorted(mods_dir.rglob("*"), key=lambda x: len(str(x)), reverse=True):
-				if p.is_dir():
-					try:
-						p.rmdir()
-					except Exception:
-						pass
+		removed: List[str] = []
+		blocked: List[str] = []
+		still_locked: List[str] = []
+		moved_out: List[str] = []
+		stuck: List[str] = []
+		holding_dir: Optional[Path] = None
+		with MODS_FOLDER_LOCK:
+			if mods_dir.exists():
+				known = _known_mod_file_stems(conn.cursor())
+				ours: List[Path] = []
+				strangers: List[Path] = []
+				for p in mods_dir.rglob("*"):
+					# Only what the game would load. A readme switches nothing
+					# on, and neither does a signature file left on its own --
+					# which this app could not put back if it took it away.
+					if not p.is_file() or p.suffix.lower() not in BUNDLE_EXTS:
+						continue
+					(ours if p.stem.lower() in known else strangers).append(p)
+
+				outcome = remove_mod_files(ours)
+				removed = [p.name for p in outcome.removed]
+				blocked = sorted({p.name for p in outcome.blocked})
+				still_locked = sorted({p.name for p in outcome.left_behind})
+				for name in blocked + still_locked:
+					logger.warning("[disable_all] %s is in use and was left in place", name)
+
+				if strangers:
+					holding_dir = _holding_dir_for_unmanaged_mods(mods_dir)
+					moved, left = set_aside(strangers, mods_dir, holding_dir)
+					moved_out = [p.name for p in moved]
+					stuck = sorted({p.name for p in left})
+					if not moved_out:
+						holding_dir = None
+					for name in stuck:
+						logger.warning("[disable_all] %s could not be moved out and is still in ~mods", name)
+
+				# Try to remove empty subdirectories
+				for p in sorted(mods_dir.rglob("*"), key=lambda x: len(str(x)), reverse=True):
+					if p.is_dir():
+						try:
+							p.rmdir()
+						except Exception:
+							pass
 		try:
 			mods_dir.mkdir(parents=True, exist_ok=True)
 		except Exception:
@@ -8652,16 +8785,44 @@ def disable_all_mods() -> Dict[str, Any]:
 		now_iso = datetime.now(timezone.utc).isoformat()
 		conn.execute(
 			"""
-			UPDATE local_downloads 
+			UPDATE local_downloads
 			SET last_deactivated_at = ?, active_paks = '[]'
 			WHERE active_paks != '[]' AND active_paks IS NOT NULL
 			""",
 			(now_iso,)
 		)
 		conn.commit()
+		if blocked:
+			# Those mods are still on. Let the scan put that back on record.
+			try:
+				scan_active_main(_get_scan_active_args())
+			except Exception:
+				pass
 		_safe_rebuild_conflicts(conn, active_only=True, purpose="disable_all_mods")
-		
-		return {"ok": True}
+
+		response: Dict[str, Any] = {
+			"ok": True,
+			"removed": len(removed),
+			"moved_out": moved_out,
+			"holding_dir": str(holding_dir) if holding_dir else None,
+			"still_on": sorted({*blocked, *stuck}),
+			"locked": still_locked,
+		}
+		notes: List[str] = []
+		if moved_out:
+			notes.append(
+				f"{len(moved_out)} file(s) that RivalNxt did not install were moved to {holding_dir}."
+			)
+		if response["still_on"]:
+			notes.append(in_use_message(response["still_on"], doing="they are still in the mods folder"))
+		if notes:
+			response["warning"] = " ".join(notes)
+		_log_activity(
+			"deactivated",
+			"Disabled all mods",
+			f"{len(removed)} file(s) removed" + (f", {len(moved_out)} moved to {holding_dir}" if moved_out else ""),
+		)
+		return response
 	finally:
 		try:
 			conn.close()
@@ -9380,6 +9541,29 @@ def remove_download_file(
 			pass
 
 
+def _known_mod_file_stems(cur: Any) -> Set[str]:
+	"""Stems of every pak this app has an archive for.
+
+	The orphan sweep only ever touches these: a file whose stem is here can be
+	put back by switching its mod on again.
+	"""
+	stems: Set[str] = set()
+	try:
+		rows = cur.execute(
+			"SELECT contents FROM local_downloads WHERE contents IS NOT NULL AND contents != ''"
+		).fetchall()
+	except Exception:
+		return stems
+	for (raw,) in rows:
+		try:
+			entries = json.loads(raw)
+		except Exception:
+			continue
+		if isinstance(entries, list):
+			stems |= stems_of(entries)
+	return stems
+
+
 @app.post("/api/local_downloads/{download_id}/set-active")
 def set_active_paks(download_id: int, payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 	"""Set the active pak list for a local_downloads row and mirror files into the game's ~mods folder.
@@ -9388,7 +9572,16 @@ def set_active_paks(download_id: int, payload: Dict[str, Any] = Body(...)) -> Di
 	- Copies requested paks from the local download source (.zip/.pak) into the ~mods folder.
 	- Removes previously active paks for this download that are no longer requested.
 	- Updates SQLite (active_paks plus last_activated/last_deactivated timestamps).
+
+	One at a time. Switching a collection on sends a request per mod, and two of
+	them moving files in and out of the same folder at once is how a file ends
+	up belonging to neither.
 	"""
+	with MODS_FOLDER_LOCK:
+		return _set_active_paks_locked(download_id, payload)
+
+
+def _set_active_paks_locked(download_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
 	req_active = payload.get("active_paks")
 	if not isinstance(req_active, list):
 		raise HTTPException(status_code=400, detail="active_paks must be an array of strings")
@@ -9665,121 +9858,140 @@ def set_active_paks(download_id: int, payload: Dict[str, Any] = Body(...)) -> Di
 	copied: List[str] = []
 	companions: List[str] = []
 	applied_set: set[str] = set()
-	if is_zip or is_rar or is_7z:
-		try:
-			entries = list_entries(src_path)
-			lookup = build_entry_lookup(entries)
-			for item in desired:
-				stem, _ext = os.path.splitext(item)
-				# For each stem, try to extract .pak, .utoc, .ucas if present
-				for ext in (".pak", ".utoc", ".ucas"):
-					fname = f"{stem}{ext}"
-					entry = resolve_entry(lookup, fname)
-					if not entry:
-						continue
-					dest_base = char_folder if char_folder else mods_dir
-					dest_fname = os.path.basename(fname)
-					dest = dest_base / dest_fname
-					if dest.exists():
-						try:
-							dest.unlink()
-						except Exception:
-							pass
-					extract_member(src_path, entry, str(dest))
-					applied_set.add(dest_fname)
-					if dest_fname.lower() == os.path.basename(item).lower():
-						copied.append(dest_fname)
-					else:
-						companions.append(dest_fname)
-		except HTTPException:
-			raise
-		except Exception as e:
-			damaged = describe_archive_failure(e, os.path.basename(src_path))
-			if damaged:
-				logger.warning("[activate] %s (%s)", damaged, e)
-				raise HTTPException(status_code=422, detail=damaged)
-			raise HTTPException(status_code=500, detail=f"Archive extract failed: {e}")
-	elif is_pak:
-		# Single pak source; also copy sibling .utoc/.ucas if present alongside
-		base = os.path.basename(src_path)
-		if base in desired_basenames:
-			dest_base = char_folder if char_folder else mods_dir
-			dest = dest_base / base
+	# Nothing is written onto a final name here. Each file is staged beside its
+	# destination and the whole set goes in together at commit(), or not at all.
+	# This used to delete the working file and then extract over it, so a
+	# damaged archive -- or a container the running game had open -- left a mod
+	# made of files from two different versions.
+	install = StagedInstall()
+	placed: List[Path] = []
+	try:
+		if is_zip or is_rar or is_7z:
 			try:
-				if dest.exists():
-					dest.unlink()
-				shutil.copy2(src_path, dest)
+				entries = list_entries(src_path)
+				lookup = build_entry_lookup(entries)
+				for item in desired:
+					stem, _ext = os.path.splitext(item)
+					# For each stem, try to extract .pak, .utoc, .ucas if present
+					for ext in (".pak", ".utoc", ".ucas"):
+						fname = f"{stem}{ext}"
+						entry = resolve_entry(lookup, fname)
+						if not entry:
+							continue
+						dest_base = char_folder if char_folder else mods_dir
+						dest_fname = os.path.basename(fname)
+						dest = dest_base / dest_fname
+						extract_member(src_path, entry, str(install.reserve(dest)))
+						applied_set.add(dest_fname)
+						if dest_fname.lower() == os.path.basename(item).lower():
+							copied.append(dest_fname)
+						else:
+							companions.append(dest_fname)
+			except HTTPException:
+				raise
 			except Exception as e:
-				raise HTTPException(status_code=500, detail=f"Copy failed: {e}")
-			copied.append(base)
-			applied_set.add(base)
-			# Try siblings for IoStore
-			stem, _ = os.path.splitext(base)
-			for ext in (".utoc", ".ucas"):
-				cand = Path(src_path).with_suffix(ext)
-				if cand.exists():
-					dest_base = char_folder if char_folder else mods_dir
-					d = dest_base / cand.name
-					try:
-						if d.exists():
-							d.unlink()
-						shutil.copy2(str(cand), d)
-					except Exception as e:
-						raise HTTPException(status_code=500, detail=f"Copy failed: {e}")
-					companions.append(cand.name)
-					applied_set.add(cand.name)
-	elif is_folder:
-		# Folder source: copy files directly from folder (using variant-aware lookup)
-		src_folder = Path(src_path)
+				damaged = describe_archive_failure(e, os.path.basename(src_path))
+				if damaged:
+					logger.warning("[activate] %s (%s)", damaged, e)
+					raise HTTPException(status_code=422, detail=damaged)
+				raise HTTPException(status_code=500, detail=f"Archive extract failed: {e}")
+		elif is_pak:
+			# Single pak source; also copy sibling .utoc/.ucas if present alongside
+			base = os.path.basename(src_path)
+			if base in desired_basenames:
+				dest_base = char_folder if char_folder else mods_dir
+				dest = dest_base / base
+				try:
+					shutil.copy2(src_path, install.reserve(dest))
+				except Exception as e:
+					raise HTTPException(status_code=500, detail=f"Copy failed: {e}")
+				copied.append(base)
+				applied_set.add(base)
+				# Try siblings for IoStore
+				stem, _ = os.path.splitext(base)
+				for ext in (".utoc", ".ucas"):
+					cand = Path(src_path).with_suffix(ext)
+					if cand.exists():
+						dest_base = char_folder if char_folder else mods_dir
+						d = dest_base / cand.name
+						try:
+							shutil.copy2(str(cand), install.reserve(d))
+						except Exception as e:
+							raise HTTPException(status_code=500, detail=f"Copy failed: {e}")
+						companions.append(cand.name)
+						applied_set.add(cand.name)
+		elif is_folder:
+			# Folder source: copy files directly from folder (using variant-aware lookup)
+			src_folder = Path(src_path)
+			try:
+				for item in desired_basenames:
+					stem, _ext = os.path.splitext(item)
+					# Check if we have a relative path from the user's variant selection
+					rel_path = desired_source_map.get(item.lower(), "")
+					rel_stem = os.path.splitext(rel_path)[0] if rel_path else ""
+					# For each stem, try to copy .pak, .utoc, .ucas if present
+					for ext in (".pak", ".utoc", ".ucas"):
+						fname = f"{stem}{ext}"
+						src_file = None
+						# 1. Try exact relative path from the selected variant
+						if rel_stem:
+							variant_file = src_folder / f"{rel_stem}{ext}".replace("/", os.sep)
+							if variant_file.exists() and variant_file.is_file():
+								src_file = variant_file
+						# 2. Try direct path at folder root
+						if src_file is None:
+							direct = src_folder / fname
+							if direct.exists() and direct.is_file():
+								src_file = direct
+						# 3. Fallback: search recursively by basename
+						if src_file is None:
+							basename = os.path.basename(fname)
+							for candidate in src_folder.rglob(basename):
+								if candidate.is_file():
+									src_file = candidate
+									break
+						if src_file is None:
+							continue
+						dest_base = char_folder if char_folder else mods_dir
+						dest = dest_base / os.path.basename(fname)
+						try:
+							shutil.copy2(str(src_file), str(install.reserve(dest)))
+						except Exception as e:
+							raise HTTPException(status_code=500, detail=f"Copy failed: {e}")
+						applied_set.add(os.path.basename(fname))
+						if os.path.basename(fname).lower() == item.lower():
+							copied.append(os.path.basename(fname))
+						else:
+							companions.append(os.path.basename(fname))
+			except HTTPException:
+				raise
+			except Exception as e:
+				raise HTTPException(status_code=500, detail=f"Folder copy failed: {e}")
+		else:
+			# For unknown sources, cannot auto-apply
+			raise HTTPException(status_code=400, detail="Unsupported source type for auto-apply. Use .zip/.rar/.7z/.pak or folder containing .pak files.")
+
+		placed = install.commit()
+	except FileInUseError as exc:
+		install.discard()
 		try:
-			for item in desired_basenames:
-				stem, _ext = os.path.splitext(item)
-				# Check if we have a relative path from the user's variant selection
-				rel_path = desired_source_map.get(item.lower(), "")
-				rel_stem = os.path.splitext(rel_path)[0] if rel_path else ""
-				# For each stem, try to copy .pak, .utoc, .ucas if present
-				for ext in (".pak", ".utoc", ".ucas"):
-					fname = f"{stem}{ext}"
-					src_file = None
-					# 1. Try exact relative path from the selected variant
-					if rel_stem:
-						variant_file = src_folder / f"{rel_stem}{ext}".replace("/", os.sep)
-						if variant_file.exists() and variant_file.is_file():
-							src_file = variant_file
-					# 2. Try direct path at folder root
-					if src_file is None:
-						direct = src_folder / fname
-						if direct.exists() and direct.is_file():
-							src_file = direct
-					# 3. Fallback: search recursively by basename
-					if src_file is None:
-						basename = os.path.basename(fname)
-						for candidate in src_folder.rglob(basename):
-							if candidate.is_file():
-								src_file = candidate
-								break
-					if src_file is None:
-						continue
-					dest_base = char_folder if char_folder else mods_dir
-					dest = dest_base / os.path.basename(fname)
-					try:
-						if dest.exists():
-							dest.unlink()
-						shutil.copy2(str(src_file), str(dest))
-					except Exception as e:
-						raise HTTPException(status_code=500, detail=f"Copy failed: {e}")
-					applied_set.add(os.path.basename(fname))
-					if os.path.basename(fname).lower() == item.lower():
-						copied.append(os.path.basename(fname))
-					else:
-						companions.append(os.path.basename(fname))
-		except HTTPException:
-			raise
-		except Exception as e:
-			raise HTTPException(status_code=500, detail=f"Folder copy failed: {e}")
-	else:
-		# For unknown sources, cannot auto-apply
-		raise HTTPException(status_code=400, detail="Unsupported source type for auto-apply. Use .zip/.rar/.7z/.pak or folder containing .pak files.")
+			conn.close()
+		except Exception:
+			pass
+		logger.warning("[activate] %s is in use; nothing was changed", exc.path)
+		raise HTTPException(
+			status_code=423,
+			detail=in_use_message(
+				[exc.path.name], doing="the mod could not be installed and nothing was changed"
+			),
+		) from exc
+	except BaseException:
+		install.discard()
+		try:
+			conn.close()
+		except Exception:
+			pass
+		raise
 
 	# If nothing was newly extracted but files already existed, ensure they are considered applied
 	if not applied_set and (is_zip or is_rar or is_7z):
@@ -9799,34 +10011,9 @@ def set_active_paks(download_id: int, payload: Dict[str, Any] = Body(...)) -> Di
 	# Compare by basename since prev_active may have basenames (legacy) or relative paths
 	applied_basenames_set = {os.path.basename(p).lower() for p in applied}
 	to_remove = [p for p in prev_active if os.path.basename(p).lower() not in applied_basenames_set]
-	removed: List[str] = []
-	# Try direct path first, then recursive search by basename (handles char subfolders)
-	for pak in to_remove:
-		base = os.path.basename(pak)
-		deleted = False
-		# 1. Try direct path
-		fp = mods_dir / pak
-		try:
-			if fp.exists():
-				fp.unlink()
-				removed.append(pak)
-				deleted = True
-		except Exception:
-			pass
-		# 2. Recursive search by basename in all subfolders
-		if not deleted:
-			try:
-				for found in _index_lookup(mods_index, base):
-					if found.is_file():
-						try:
-							found.unlink()
-							removed.append(pak)
-						except Exception:
-							pass
-			except Exception:
-				pass
-
-	# Additionally, ensure IoStore companions are removed by stem when a pak gets deactivated
+	# Everything under ~mods belonging to a pak that is no longer wanted: the
+	# entry itself wherever it sits (at its recorded path, or by name inside a
+	# hero folder) and its IoStore companions, found by stem.
 	def _stem_of(fname: str) -> Optional[str]:
 		try:
 			st, ext = os.path.splitext(os.path.basename(fname))
@@ -9835,26 +10022,59 @@ def set_active_paks(download_id: int, payload: Dict[str, Any] = Body(...)) -> Di
 			return None
 		except Exception:
 			return None
+	doomed: List[Path] = []
+	for pak in to_remove:
+		direct = mods_dir / pak
+		try:
+			if direct.is_file():
+				doomed.append(direct)
+				continue
+		except Exception:
+			pass
+		doomed.extend(_index_lookup(mods_index, os.path.basename(pak)))
 	prev_stems = {s for s in (_stem_of(x) for x in prev_active) if s}
 	applied_stems = {s for s in (_stem_of(x) for x in applied) if s}
 	stems_to_remove = prev_stems - applied_stems
-	# Remove companions by stems in any subfolder
 	for stem in stems_to_remove:
 		for ext in (".pak", ".utoc", ".ucas"):
-			target_name = f"{stem}{ext}"
-			try:
-				for found in _index_lookup(mods_index, target_name):
-					if found.is_file():
-						try:
-							found.unlink()
-							removed.append(target_name)
-						except Exception:
-							pass
-			except Exception:
-				pass
+			doomed.extend(_index_lookup(mods_index, f"{stem}{ext}"))
+	# Every one of these deletes used to sit in its own `except: pass`. A file
+	# the game had open stayed put, the mod was recorded as off, and the first
+	# anyone knew of it was a mod that would not go away.
+	outcome = remove_mod_files(doomed)
+	removed: List[str] = [p.name for p in outcome.removed]
+	still_locked: List[str] = sorted({p.name for p in outcome.left_behind})
+	blocked: List[str] = sorted({p.name for p in outcome.blocked})
+	if blocked:
+		# These mods are still installed and whole. Keep them recorded as on,
+		# which is what they are; the request fails further down, once the
+		# database agrees with the disk.
+		blocked_stems = {os.path.splitext(name)[0].lower() for name in blocked}
+		still_on = [
+			a for a in prev_active
+			if isinstance(a, str) and (_stem_of(a) or "").lower() in blocked_stems
+		]
+		applied = sorted({*applied, *still_on})
+	for name in still_locked:
+		logger.warning("[activate] %s is still open in the game and was left behind", name)
+
+	# Containers left by an earlier removal that was made while the game was
+	# running. By now it may have let go of them.
+	swept: List[str] = []
+	try:
+		# The index predates this request, so what was just installed is added
+		# by hand -- and its stems are excluded outright, belt and braces.
+		present = [found for paths in mods_index.values() for found in paths if found.is_file()]
+		present.extend(placed)
+		sweepable = _known_mod_file_stems(cur) - stems_of(applied)
+		swept = [p.name for p in sweep_orphan_companions(present, sweepable)]
+		if swept:
+			logger.info("[activate] removed %s leftover container file(s): %s", len(swept), ", ".join(swept[:5]))
+	except Exception as exc:
+		logger.debug("[activate] orphan sweep skipped: %s", exc)
 
 	# Clean up empty subdirectories left behind after file removal
-	if removed:
+	if removed or swept:
 		try:
 			for dirpath, dirnames, filenames in os.walk(str(mods_dir), topdown=False):
 				dp = Path(dirpath)
@@ -9924,14 +10144,27 @@ def set_active_paks(download_id: int, payload: Dict[str, Any] = Body(...)) -> Di
 				f"+{len(copied)} / -{len(removed)}",
 			)
 
-	return {
+	if blocked:
+		raise HTTPException(
+			status_code=423,
+			detail=in_use_message(blocked, doing="it could not be removed and its mod is still on"),
+		)
+
+	response: Dict[str, Any] = {
 		"ok": True,
 		"download_id": download_id,
 		"active_paks": applied,
 		"copied": copied,
 		"removed": removed,
 		"mods_dir": str(mods_dir),
+		"locked": still_locked,
 	}
+	if still_locked:
+		response["warning"] = (
+			f"The mod is off, but the game still has {len(still_locked)} of its files open. "
+			"They take no part in the game and will be removed once it is closed."
+		)
+	return response
 
 
 @app.post("/api/local_downloads/activate-by-name")
@@ -10083,15 +10316,19 @@ def deactivate_by_name(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 	except Exception:
 		pak_names = []
 	mods_dir = _mods_folder_from_env()
-	removed: List[str] = []
-	# Remove by stems (handles .pak/.utoc/.ucas and nested folders)
+	# By stem (the .pak with its .utoc/.ucas, in whichever folder) and by name.
 	stems = [os.path.splitext(p)[0] for p in pak_names]
-	removed += _remove_in_mods_by_stems(mods_dir, stems)
-	# Also attempt direct/name-based removal as a safety (in case of unusual extensions)
-	removed += _remove_in_mods_by_names(mods_dir, pak_names)
+	with MODS_FOLDER_LOCK:
+		outcome = remove_mod_files(find_mod_files(mods_dir, stems=stems, names=pak_names))
+	removed: List[str] = [p.name for p in outcome.removed]
+	blocked = sorted({p.name for p in outcome.blocked})
+	still_locked = sorted({p.name for p in outcome.left_behind})
 	# Update DB active_paks and rescan
 	try:
-		update_local_download_active_paks(conn, dl_id, [])
+		if not blocked:
+			# A mod whose .pak would not go is still on; the scan below records
+			# whatever is really there.
+			update_local_download_active_paks(conn, dl_id, [])
 	except Exception:
 		pass
 	try:
@@ -10102,7 +10339,12 @@ def deactivate_by_name(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 			conn.close()
 		except Exception:
 			pass
-	return {"ok": True, "name": name, "removed": removed}
+	if blocked:
+		raise HTTPException(
+			status_code=423,
+			detail=in_use_message(blocked, doing="it could not be removed and its mod is still on"),
+		)
+	return {"ok": True, "name": name, "removed": removed, "locked": still_locked}
 
 
 @app.post("/api/scan/active")
@@ -11053,6 +11295,7 @@ def _refile_active_paks(*, dry_run: bool = False) -> Dict[str, Any]:
 	touched_downloads = 0
 	unresolved = 0
 	conflicts: List[str] = []
+	in_use: List[str] = []
 	missing_downloads: List[int] = []
 
 	conn = get_db()
@@ -11109,31 +11352,40 @@ def _refile_active_paks(*, dry_run: bool = False) -> Dict[str, Any]:
 					if dl_id not in missing_downloads:
 						missing_downloads.append(int(dl_id))
 					continue
-				# A pak travels with its IoStore companions or the game ignores it.
+				# A pak travels with its IoStore companions or the game ignores it
+				# -- so the three move together or all stay. Moving them one by one
+				# and skipping failures could deliver the .pak without the .ucas
+				# the running game was holding.
+				by_folder: Dict[Path, List[Path]] = {}
 				for ext in (".pak", ".utoc", ".ucas"):
-					fname = f"{stem}{ext}"
-					for current in _index_lookup(index, fname):
-						if current.parent == target:
-							continue
-						dest = target / fname
-						if dest.exists():
-							# Two files with one name: moving would destroy one of
-							# them, and guessing which is wrong is not this pass's
-							# job. Report it and leave both alone.
-							conflicts.append(fname)
-							continue
-						if dry_run:
-							moved.append({"file": fname, "to": target.name})
-							download_moved = True
-							continue
-						try:
-							_ensure_dir(target)
-							shutil.move(str(current), str(dest))
-						except Exception as exc:
-							logger.warning("[refile] could not move %s: %s", fname, exc)
-							continue
-						moved.append({"file": fname, "to": target.name})
+					for current in _index_lookup(index, f"{stem}{ext}"):
+						if current.parent != target:
+							by_folder.setdefault(current.parent, []).append(current)
+				for members in by_folder.values():
+					taken = [m.name for m in members if (target / m.name).exists()]
+					if taken:
+						# Two files with one name: moving would destroy one of
+						# them, and guessing which is wrong is not this pass's
+						# job. Report it and leave both alone.
+						conflicts.extend(taken)
+						continue
+					if dry_run:
+						moved.extend({"file": m.name, "to": target.name} for m in members)
 						download_moved = True
+						continue
+					try:
+						_ensure_dir(target)
+						with MODS_FOLDER_LOCK:
+							move_bundle(members, target)
+					except FileInUseError as exc:
+						in_use.append(exc.path.name)
+						logger.warning("[refile] %s is in use; its mod stays where it is for now", exc.path.name)
+						continue
+					except Exception as exc:
+						logger.warning("[refile] could not move %s: %s", stem, exc)
+						continue
+					moved.extend({"file": m.name, "to": target.name} for m in members)
+					download_moved = True
 
 			if download_moved:
 				touched_downloads += 1
@@ -11164,6 +11416,8 @@ def _refile_active_paks(*, dry_run: bool = False) -> Dict[str, Any]:
 		"details": moved[:200],
 		"conflicting_files": conflicts[:50],
 		"missing_downloads": missing_downloads,
+		"in_use": len(in_use),
+		"in_use_files": in_use[:50],
 	}
 
 

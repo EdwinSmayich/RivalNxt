@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { showModFileWarning } from "./modFileNotices";
 
 export class ApiError extends Error {
   status: number;
@@ -1334,15 +1335,40 @@ export async function getDownloadsSummary(): Promise<ApiDownloadsSummary> {
   return getJson<ApiDownloadsSummary>(`/api/downloads/summary`);
 }
 
+export interface SetActivePaksResult {
+  ok: boolean;
+  active_paks?: string[];
+  copied?: string[];
+  removed?: string[];
+  /** Files of a mod that is now off which the game still has open. */
+  locked?: string[];
+  warning?: string;
+}
+
 export async function setActivePaks(downloadId: number, active_paks: string[]) {
-  return postJson<{ active_paks: string[] }, { ok: boolean }>(
+  const result = await postJson<{ active_paks: string[] }, SetActivePaksResult>(
     `/api/local_downloads/${downloadId}/set-active`,
     { active_paks },
   );
+  // Shown here rather than by each of the twenty callers.
+  showModFileWarning(result);
+  return result;
 }
 
-export async function disableAllMods(): Promise<{ ok: boolean }> {
-  return postJson<{}, { ok: boolean }>(`/api/mods/disable-all`, {});
+export interface DisableAllModsResult {
+  ok: boolean;
+  removed?: number;
+  /** Mod files RivalNxt did not install, moved out of the game's folder. */
+  moved_out?: string[];
+  holding_dir?: string | null;
+  /** Files that could not be taken out and are still loaded by the game. */
+  still_on?: string[];
+  locked?: string[];
+  warning?: string;
+}
+
+export async function disableAllMods(): Promise<DisableAllModsResult> {
+  return postJson<{}, DisableAllModsResult>(`/api/mods/disable-all`, {});
 }
 
 export async function scanActive(): Promise<{ ok: boolean }> {
@@ -1391,11 +1417,11 @@ export async function activateByName(
 
 export async function deactivateByName(
   name: string,
-): Promise<{ ok: boolean } & { removed?: string[] }> {
-  return postJson<{ name: string }, { ok: boolean; removed?: string[] }>(
-    `/api/local_downloads/deactivate-by-name`,
-    { name },
-  );
+): Promise<{ ok: boolean } & { removed?: string[]; locked?: string[] }> {
+  return postJson<
+    { name: string },
+    { ok: boolean; removed?: string[]; locked?: string[] }
+  >(`/api/local_downloads/deactivate-by-name`, { name });
 }
 
 export async function getPakAssets(

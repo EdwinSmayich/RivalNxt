@@ -1301,47 +1301,21 @@ def _get_mods_folder_for_deletion() -> Optional[Path]:
 
 def _remove_in_mods_by_names(mods_dir: Path, names: List[str]) -> List[str]:
     """Remove any files in mods_dir (recursively) whose basename is in names (case-insensitive)."""
-    removed: List[str] = []
+    from core.utils.mod_files import find_mod_files, remove_mod_files
+
     if not mods_dir.exists():
-        return removed
-    
-    names_lower = [n.lower() for n in names]
-    try:
-        for file_path in mods_dir.rglob("*"):
-            if file_path.is_file():
-                file_name = file_path.name.lower()
-                if file_name in names_lower:
-                    try:
-                        file_path.unlink()
-                        removed.append(str(file_path))
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    return removed
+        return []
+    return [str(p) for p in remove_mod_files(find_mod_files(mods_dir, names=names)).removed]
 
 
 def _remove_in_mods_by_stems(mods_dir: Path, stems: List[str]) -> List[str]:
     """Remove any files in mods_dir (recursively) with basename matching stem + (.pak|.utoc|.ucas)."""
-    removed: List[str] = []
+    from core.utils.mod_files import MOD_FILE_EXTS, find_mod_files, remove_mod_files
+
     if not mods_dir.exists():
-        return removed
-    
-    stems_lower = [s.lower() for s in stems]
-    extensions = ['.pak', '.utoc', '.ucas', '.sig']
-    try:
-        for file_path in mods_dir.rglob("*"):
-            if file_path.is_file():
-                stem = file_path.stem.lower()
-                if stem in stems_lower and file_path.suffix.lower() in extensions:
-                    try:
-                        file_path.unlink()
-                        removed.append(str(file_path))
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    return removed
+        return []
+    found = find_mod_files(mods_dir, stems=stems, exts=MOD_FILE_EXTS)
+    return [str(p) for p in remove_mod_files(found).removed]
 
 
 def delete_local_downloads(
@@ -1391,39 +1365,50 @@ def delete_local_downloads(
         tuple(unique_ids),
     ).fetchall()
     
-    for download_id, active_paks_json, contents_json, download_name in active_rows:
-        if active_paks_json:
-            try:
-                active_paks = json.loads(active_paks_json)
-                if isinstance(active_paks, list) and active_paks:
-                    # Remove files from ~mods folder - use active_paks to know what's actually active
-                    mods_dir = _get_mods_folder_for_deletion()
-                    if mods_dir is None:
-                        # No game root configured; nothing to remove from disk.
-                        continue
+    # Everything these downloads have in ~mods goes first, and it goes together
+    # or not at all. This used to delete file by file inside `except: pass`,
+    # then remove the rows and the archive regardless: with the game running
+    # that left a mod still in the game's folder that the app no longer had any
+    # record of, and so no way to switch off or clean up.
+    from core.utils.mod_files import (
+        MOD_FILE_EXTS,
+        MODS_FOLDER_LOCK,
+        find_mod_files,
+        remove_all_or_nothing,
+    )
 
-                    # Use the ACTIVE pak names (what's actually in ~mods), not contents
-                    # active_paks contains the basenames of files that are currently active
-                    pak_names = [os.path.basename(p) for p in active_paks if isinstance(p, str)]
-                    
-                    # Remove files by stems (handles .pak/.utoc/.ucas)
-                    removed_files = []
-                    if pak_names:
-                        stems = [os.path.splitext(p)[0] for p in pak_names]
-                        removed_files.extend(_remove_in_mods_by_stems(mods_dir, stems))
-                        # Also attempt direct/name-based removal as a safety
-                        removed_files.extend(_remove_in_mods_by_names(mods_dir, pak_names))
-                    
-                    # Update database to mark as inactive
-                    update_local_download_active_paks(conn, download_id, [])
-                    print(f"[delete_local_downloads] Deactivated download_id={download_id}, removed {len(removed_files)} files from ~mods")
-            except Exception:
-                # If we can't parse the active paks, try to deactivate anyway
-                try:
-                    update_local_download_active_paks(conn, download_id, [])
-                    print(f"[delete_local_downloads] Deactivated download_id={download_id} before deletion (best effort)")
-                except Exception as e2:
-                    print(f"[delete_local_downloads] Warning: Failed to deactivate download_id={download_id}: {e2}")
+    active_ids: List[int] = []
+    doomed_names: List[str] = []
+    for download_id, active_paks_json, _contents_json, _download_name in active_rows:
+        if not active_paks_json:
+            continue
+        active_ids.append(int(download_id))
+        try:
+            active_paks = json.loads(active_paks_json)
+        except Exception:
+            continue
+        if isinstance(active_paks, list):
+            # The ACTIVE names are what is actually in ~mods, not `contents`.
+            doomed_names.extend(os.path.basename(p) for p in active_paks if isinstance(p, str) and p)
+
+    if doomed_names:
+        mods_dir = _get_mods_folder_for_deletion()
+        # No game root configured means there is nothing on disk to remove.
+        if mods_dir is not None and mods_dir.exists():
+            stems = [os.path.splitext(name)[0] for name in doomed_names]
+            with MODS_FOLDER_LOCK:
+                # Raises FileInUseError, with nothing changed, if the game has
+                # any of them open. Nothing below has run yet.
+                removed_files = remove_all_or_nothing(
+                    find_mod_files(mods_dir, stems=stems, names=doomed_names, exts=MOD_FILE_EXTS)
+                )
+            print(f"[delete_local_downloads] removed {len(removed_files)} file(s) from ~mods")
+
+    for download_id in active_ids:
+        try:
+            update_local_download_active_paks(conn, download_id, [])
+        except Exception as exc:
+            print(f"[delete_local_downloads] Warning: Failed to deactivate download_id={download_id}: {exc}")
 
     mods_to_check: Set[int] = set()
     source_zips: Set[str] = set()

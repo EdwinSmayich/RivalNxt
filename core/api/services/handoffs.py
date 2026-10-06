@@ -84,25 +84,85 @@ def _purge_benign_duplicate_failures() -> int:
             pass
 
 
+#: Stages after which a handoff is finished with, one way or another. A new
+#: click on the same file must get a fresh handoff rather than be folded into
+#: one of these.
+_FINISHED_STAGES = frozenset({"failed", "cancelling", "cancelled", "complete"})
+
+
+def _live_handoff_for_locked(
+    nxm: NXMRequest, failed_ids: Optional[set] = None
+) -> Optional[Dict[str, Any]]:
+    """An unfinished handoff for the same file, if there is one. Lock held.
+
+    A handoff that has a failure on record is not one to join. The frontend
+    counts failures per handoff id and gives up after three, so folding a new
+    click into such an id would make the click do nothing -- and the failure
+    record that blocks it would never be cleared.
+    """
+    if nxm.file_id is None:
+        return None
+    for record in _HANDOFFS.values():
+        if record.get("consumed"):
+            continue
+        if failed_ids and record.get("id") in failed_ids:
+            continue
+        request = record.get("request") or {}
+        if (
+            request.get("game") != nxm.game_domain
+            or request.get("mod_id") != nxm.mod_id
+            or request.get("file_id") != nxm.file_id
+        ):
+            continue
+        stage = (record.get("progress") or {}).get("stage")
+        if stage in _FINISHED_STAGES:
+            continue
+        return record
+    return None
+
+
 def register_handoff(nxm: NXMRequest, *, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    # Read outside _HANDOFF_LOCK so the two locks are never held together.
+    with _FAILURE_LOCK:
+        failed_ids = {
+            hid for hid, failure in _HANDOFF_FAILURES.items()
+            if int((failure or {}).get("count", 0) or 0) > 0
+        }
     with _HANDOFF_LOCK:
         _purge_expired_locked()
-        identifier = str(uuid.uuid4())
-        created_at = time.time()
-        record = {
-            "id": identifier,
-            "created_at": created_at,
-            "expires_at": created_at + NXM_HANDOFF_TTL_SECONDS,
-            "request": {
-                "raw": nxm.raw,
-                "game": nxm.game_domain,
-                "mod_id": nxm.mod_id,
-                "file_id": nxm.file_id,
-                "query": dict(nxm.query),
-            },
-            "metadata": metadata,
-        }
-        _HANDOFFS[identifier] = record
+        # The same link can arrive more than once: the shell has three paths
+        # that can each deliver a click, and "nothing seems to be happening" is
+        # an invitation to click again. Every arrival used to mint a new id, and
+        # every id started its own download of the same file -- one archive was
+        # found downloading six times over. A repeat now joins the handoff that
+        # is already there, taking the newer link's key and expiry.
+        existing = _live_handoff_for_locked(nxm, failed_ids)
+        if existing is not None:
+            now = time.time()
+            request = existing.setdefault("request", {})
+            request["raw"] = nxm.raw
+            request["query"] = dict(nxm.query)
+            existing["expires_at"] = max(
+                existing.get("expires_at") or 0, now + NXM_HANDOFF_TTL_SECONDS
+            )
+            record = existing
+        else:
+            identifier = str(uuid.uuid4())
+            created_at = time.time()
+            record = {
+                "id": identifier,
+                "created_at": created_at,
+                "expires_at": created_at + NXM_HANDOFF_TTL_SECONDS,
+                "request": {
+                    "raw": nxm.raw,
+                    "game": nxm.game_domain,
+                    "mod_id": nxm.mod_id,
+                    "file_id": nxm.file_id,
+                    "query": dict(nxm.query),
+                },
+                "metadata": metadata,
+            }
+            _HANDOFFS[identifier] = record
 
     # Clear any previous persistent failure record for this file_id when a new handoff is registered
     if nxm.file_id is not None:
@@ -285,6 +345,13 @@ def update_handoff_progress(
         progress = record.setdefault("progress", {})
         progress["stage"] = stage
         progress["updated_at"] = now
+        # A handoff that is being worked on, or waiting its turn, must not
+        # expire underneath that work. The TTL is ten minutes from registration,
+        # which a queue of large files easily outlasts.
+        if stage not in _FINISHED_STAGES:
+            record["expires_at"] = max(
+                record.get("expires_at") or 0, now + NXM_HANDOFF_TTL_SECONDS
+            )
         if bytes_downloaded is not None:
             progress["bytes_downloaded"] = int(bytes_downloaded)
         if bytes_total is not None:

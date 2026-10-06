@@ -1611,6 +1611,23 @@ export async function cancelNxmHandoff(
   );
 }
 
+/**
+ * Tell the backend a download is waiting its turn.
+ *
+ * A handoff expires ten minutes after it is registered unless something is
+ * happening to it. One waiting behind a queue of large files would otherwise
+ * be gone by the time a slot came free.
+ */
+export async function markNxmHandoffQueued(
+  handoffId: string,
+): Promise<{ ok: boolean }> {
+  const encoded = encodeURIComponent(handoffId);
+  return postJson<Record<string, never>, { ok: boolean }>(
+    `/api/nxm/handoff/${encoded}/queued`,
+    {},
+  );
+}
+
 export async function submitNxmHandoff(
   nxmUri: string,
 ): Promise<ApiSubmitNxmHandoffResponse> {

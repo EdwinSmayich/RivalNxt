@@ -5,11 +5,21 @@ import {
   ingestNxmHandoff,
   cancelNxmHandoff,
   dismissNxmHandoff,
+  markNxmHandoffQueued,
   deleteLocalDownloads,
   type ApiNxmHandoffSummary,
 } from "../lib/api";
 import { createNxmProgressController, getModLabel } from "../lib/nxmHelpers";
 import { createToastDeduplicator, calculateBackoff } from "../lib/toastHelpers";
+import {
+  MAX_CONCURRENT_DOWNLOADS,
+  QUEUE_KEEPALIVE_MS,
+  isAlreadyDownloading,
+  planDownloads,
+  queueSummary,
+} from "../lib/downloadQueue";
+
+const QUEUE_TOAST_ID = "nxm-download-queue";
 
 interface NxmBackgroundListenerProps {
   enabled: boolean;
@@ -49,6 +59,8 @@ export function NxmBackgroundListener({
   const cancelledHandoffsRef = useRef<Set<string>>(new Set());
   const processingRef = useRef<Set<string>>(new Set());
   const failedHandoffsRef = useRef<Map<string, HandoffFailure>>(new Map());
+  const lastKeepAliveRef = useRef<Map<string, number>>(new Map());
+  const queueToastCountRef = useRef(0);
   const toastDeduplicator = useRef(
     createToastDeduplicator(TOAST_DEDUPE_WINDOW_MS),
   );
@@ -67,6 +79,7 @@ export function NxmBackgroundListener({
       try {
         const handoffs = await listNxmHandoffs();
         let hasWork = false;
+        const eligible: ApiNxmHandoffSummary[] = [];
 
         for (const handoff of handoffs) {
           // Skip if the handoff has expired (TTL exceeded) to avoid false-positive auto-process errors on startup
@@ -125,13 +138,23 @@ export function NxmBackgroundListener({
             }
           }
 
-          // Mark as processing to prevent duplicate processing
+          eligible.push(handoff);
+        }
+
+        // Start only as many as there are free slots, oldest first. Starting
+        // everything at once is what froze the app: each download holds a
+        // connection open, the webview allows six per host, and past that the
+        // progress polls and the Cancel button queue behind the downloads.
+        const plan = planDownloads(eligible, processingRef.current.size);
+        for (const handoff of plan.start) {
           processingRef.current.add(handoff.id);
           hasWork = true;
-
-          // Process this handoff in the background
           void processHandoff(handoff);
         }
+        if (plan.wait.length > 0) {
+          hasWork = true;
+        }
+        reportWaiting(plan.wait);
 
         // Use slower polling if no work to do
         const nextInterval = hasWork
@@ -154,7 +177,63 @@ export function NxmBackgroundListener({
       }
     };
 
+    const cancelWaiting = async (waiting: ApiNxmHandoffSummary[]) => {
+      for (const handoff of waiting) {
+        cancelledHandoffsRef.current.add(handoff.id);
+        failedHandoffsRef.current.delete(handoff.id);
+        lastKeepAliveRef.current.delete(handoff.id);
+      }
+      queueToastCountRef.current = 0;
+      toast.dismiss(QUEUE_TOAST_ID);
+      await Promise.allSettled(
+        waiting.map((handoff) => cancelNxmHandoff(handoff.id)),
+      );
+      toast.info(
+        `Cancelled ${waiting.length} queued download${waiting.length === 1 ? "" : "s"}`,
+        { duration: 3000 },
+      );
+    };
+
+    const reportWaiting = (waiting: ApiNxmHandoffSummary[]) => {
+      if (waiting.length === 0) {
+        if (queueToastCountRef.current !== 0) {
+          queueToastCountRef.current = 0;
+          toast.dismiss(QUEUE_TOAST_ID);
+        }
+        return;
+      }
+
+      // Keep the waiting ones alive on the backend until their turn comes.
+      const now = Date.now();
+      for (const handoff of waiting) {
+        const last = lastKeepAliveRef.current.get(handoff.id) ?? 0;
+        if (now - last >= QUEUE_KEEPALIVE_MS) {
+          lastKeepAliveRef.current.set(handoff.id, now);
+          void markNxmHandoffQueued(handoff.id).catch(() => {
+            // Gone already; the next poll will simply not list it.
+          });
+        }
+      }
+
+      if (queueToastCountRef.current === waiting.length) {
+        return;
+      }
+      queueToastCountRef.current = waiting.length;
+      toast.message(queueSummary(waiting.length), {
+        id: QUEUE_TOAST_ID,
+        description: `${MAX_CONCURRENT_DOWNLOADS} run at a time; the rest start as these finish.`,
+        duration: Infinity,
+        action: {
+          label: "Cancel queued",
+          onClick: () => {
+            void cancelWaiting(waiting);
+          },
+        },
+      });
+    };
+
     const processHandoff = async (handoff: ApiNxmHandoffSummary) => {
+      lastKeepAliveRef.current.delete(handoff.id);
       const modLabel = await getModLabel(handoff);
 
       const controller = createNxmProgressController(handoff.id, {
@@ -290,6 +369,20 @@ export function NxmBackgroundListener({
             `[NxmBackgroundListener] Handoff ${handoff.id} cancelled — suppressing error.`,
           );
           toast.info(`Download cancelled: ${modLabel}`, {
+            id: controller.toastId,
+            duration: 3000,
+          });
+          processedHandoffsRef.current.add(handoff.id);
+          processingRef.current.delete(handoff.id);
+          return;
+        }
+
+        // The same file is already mid-download under another request. Not a
+        // failure and not a finished duplicate: leave the running one alone.
+        // Dismissing here would delete the record the live download reports
+        // its progress through.
+        if (isAlreadyDownloading(err)) {
+          toast.info(`${modLabel} is already downloading`, {
             id: controller.toastId,
             duration: 3000,
           });

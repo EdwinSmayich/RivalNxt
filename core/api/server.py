@@ -61,6 +61,16 @@ from core.api.services.handoffs import (
 	update_handoff_progress,
 	mark_handoff_consumed,
 )
+from core.api.services.downloads import (
+	CancelledSet,
+	DownloadSlots,
+	InflightRegistry,
+	archive_problem,
+	cleanup_partial_downloads,
+	describe_archive_failure,
+	length_problem,
+	partial_path,
+)
 from core.db import (
 	bulk_upsert_pak_assets,
 	delete_local_downloads,
@@ -135,11 +145,52 @@ UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MiB chunks for uploads
 # Store the last received NXM URL for testing/debugging purposes
 _LAST_NXM_URL: Optional[Dict[str, Any]] = None
 
-# Set of handoff IDs that the user has requested to cancel.
-# Checked every chunk inside _download_remote_archive so the download
-# stops as soon as possible after the cancel request arrives.
-_CANCELLED_HANDOFFS: set = set()
+# Handoff IDs the user has asked to cancel. Checked between chunks inside
+# _download_remote_archive and while a download waits for a slot.
+#
+# This was a plain set that the first thread to notice a cancel removed its id
+# from. With the same handoff downloading more than once that stopped one
+# transfer and left the others running. Entries now expire on their own.
+_CANCELLED_HANDOFFS = CancelledSet()
 _CANCELLED_HANDOFFS_LOCK = threading.Lock()
+
+# At most this many transfers run at once; the rest wait their turn and say so.
+_DOWNLOAD_SLOTS = DownloadSlots()
+
+# (mod_id, file_id) -> handoff id, for every file being fetched right now.
+_INFLIGHT_DOWNLOADS = InflightRegistry()
+
+# Serialises the final rename, so two transfers that finish together cannot
+# both decide the same name is free.
+_FINALISE_DOWNLOAD_LOCK = threading.Lock()
+
+# Read size for the transfer loop. It was 1 MiB, and read(n) blocks until n
+# bytes arrive -- so on a slow link the progress bar and the cancel check both
+# moved once every several seconds, which read as "nothing is downloading".
+DOWNLOAD_CHUNK_BYTES = 64 * 1024
+DOWNLOAD_READ_TIMEOUT_SECONDS = 60
+
+
+def _sweep_partial_downloads() -> int:
+	"""Remove transfers a previous run left unfinished.
+
+	Nothing can be mid-download when the backend starts, so any .part file in
+	the downloads folder belongs to a run that was closed or killed part-way.
+	"""
+	try:
+		root = load_settings().marvel_rivals_local_downloads_root
+		if not root:
+			return 0
+		removed = cleanup_partial_downloads(Path(root))
+		if removed:
+			logger.warning("[download] Removed %s unfinished download(s) left by a previous run", removed)
+		return removed
+	except Exception as exc:
+		logger.debug("[download] Could not sweep partial downloads: %s", exc)
+		return 0
+
+
+_sweep_partial_downloads()
 
 
 class DownloadCancelledError(Exception):
@@ -3362,6 +3413,26 @@ def delete_nxm_handoff(handoff_id: str) -> Dict[str, Any]:
 	return {"ok": True, "handoff": serialize_handoff(record, include_metadata=True)}
 
 
+@app.post("/api/nxm/handoff/{handoff_id}/queued")
+def mark_nxm_handoff_queued(handoff_id: str) -> Dict[str, Any]:
+	"""Record that a download is waiting its turn, which keeps it from expiring.
+
+	The frontend runs a couple of downloads at a time and holds the rest back.
+	A handoff expires ten minutes after registration unless its progress moves,
+	and one waiting behind a queue of large files would be gone before a slot
+	came free.
+	"""
+	if not handoff_id:
+		raise HTTPException(status_code=400, detail="handoff_id is required")
+	get_handoff_or_404(handoff_id)
+	update_handoff_progress(
+		handoff_id,
+		stage="queued",
+		message="Queued — waiting for a free download slot",
+	)
+	return {"ok": True, "handoff_id": handoff_id}
+
+
 @app.post("/api/nxm/handoff/{handoff_id}/cancel")
 def cancel_nxm_handoff(handoff_id: str) -> Dict[str, Any]:
 	"""Signal an in-progress NXM download to stop.
@@ -3387,7 +3458,19 @@ def cancel_nxm_handoff(handoff_id: str) -> Dict[str, Any]:
 	except Exception:
 		pass  # Record may already be gone
 
-	return {"ok": True, "cancelled": True, "handoff_id": handoff_id}
+	# The flag above is only ever read by a transfer that is running or waiting
+	# for a slot. A handoff nobody has started on has no such reader, so it used
+	# to stay in the list and get picked up again -- cancel appeared to do
+	# nothing. Retire it here instead.
+	in_flight = _INFLIGHT_DOWNLOADS.is_active(handoff_id)
+	if not in_flight:
+		try:
+			update_handoff_progress(handoff_id, stage="cancelled", message="Cancelled by user")
+			mark_handoff_consumed(handoff_id)
+		except Exception:
+			pass
+
+	return {"ok": True, "cancelled": True, "handoff_id": handoff_id, "was_in_flight": in_flight}
 
 
 def _clear_handoff_failure_by_file_id(file_id: Optional[int]) -> None:
@@ -3822,7 +3905,9 @@ def ingest_nxm_handoff(handoff_id: str, payload: Optional[Dict[str, Any]] = Body
 				except Exception:
 					pass
 		
-		download_path, resolved_url = _download_archive_via_nxm(record, game_domain, file_id, desired_filename=remote_name)
+		download_path, resolved_url = _download_once_in_turn(
+			record, game_domain, mod_id, file_id, desired_filename=remote_name
+		)
 		logger.info(
 			"[nxm_handoff] download complete path=%s mod_id=%s file_id=%s", download_path, mod_id, file_id
 		)
@@ -7762,9 +7847,23 @@ def _download_remote_archive(
 		with _CANCELLED_HANDOFFS_LOCK:
 			return handoff_id in _CANCELLED_HANDOFFS
 
+	# The transfer is written beside its destination under a .part name and only
+	# renamed once it has been checked. It used to be written straight to the
+	# final name, so a transfer cut short -- or a process killed mid-download --
+	# left a file that looked exactly like a finished archive.
+	part = partial_path(dest, uuid.uuid4().hex[:8])
+
+	def _discard_part() -> None:
+		try:
+			part.unlink(missing_ok=True)
+		except Exception as del_err:
+			logger.warning("[download] Failed to delete partial file %s: %s", part, del_err)
+
+	total_bytes: Optional[int] = None
+	downloaded = 0
 	try:
-		with urllib.request.urlopen(req, timeout=120) as response, dest.open("wb") as out:
-			total_bytes: Optional[int] = getattr(response, "length", None)
+		with urllib.request.urlopen(req, timeout=DOWNLOAD_READ_TIMEOUT_SECONDS) as response, part.open("wb") as out:
+			total_bytes = getattr(response, "length", None)
 			if total_bytes is None:
 				try:
 					headers = getattr(response, "headers", None)
@@ -7773,8 +7872,7 @@ def _download_remote_archive(
 						total_bytes = int(header_value) if header_value else None
 				except Exception:
 					total_bytes = None
-			downloaded = 0
-			chunk_size = 1024 * 1024
+			last_emit = 0.0
 			_emit_progress(downloaded, total_bytes)
 			while True:
 				# Check for cancellation before reading each chunk
@@ -7782,39 +7880,58 @@ def _download_remote_archive(
 					logger.info("[download] Cancellation detected mid-download for handoff=%s, aborting", handoff_id)
 					# Close the socket by breaking — the with-block will handle cleanup
 					break
-				chunk = response.read(chunk_size)
+				chunk = response.read(DOWNLOAD_CHUNK_BYTES)
 				if not chunk:
 					break
 				out.write(chunk)
 				downloaded += len(chunk)
-				_emit_progress(downloaded, total_bytes)
+				now = time.monotonic()
+				if now - last_emit >= 0.2:
+					last_emit = now
+					_emit_progress(downloaded, total_bytes)
+			_emit_progress(downloaded, total_bytes)
 	except Exception as e:
-		if dest.exists():
-			try:
-				dest.unlink()
-			except Exception:
-				pass
+		_discard_part()
 		raise HTTPException(status_code=400, detail=f"Failed to download {url}: {e}")
 
 	# After the with-block (and its try-except), file handles are guaranteed closed.
 	# Check if we stopped because of cancellation
 	if _is_cancelled():
-		# Remove partial file now that it is no longer locked by the process
-		try:
-			if dest.exists():
-				dest.unlink()
-				logger.info("[download] Partial file deleted: %s", dest)
-		except Exception as del_err:
-			logger.warning("[download] Failed to delete partial file %s: %s", dest, del_err)
+		_discard_part()
 		raise DownloadCancelledError(f"Download cancelled by user (handoff={handoff_id})")
 
-	try:
-		if dest.stat().st_size <= 0:
-			dest.unlink(missing_ok=True)
-			raise HTTPException(status_code=400, detail=f"Downloaded file was empty: {url}")
-	except FileNotFoundError:
-		raise HTTPException(status_code=400, detail=f"Downloaded file missing after fetch: {url}")
-	return dest.resolve()
+	# read(n) does not raise when the server hangs up early: it returns b"" and
+	# the loop above ends exactly as it does at a real end of file. Without this
+	# comparison a dropped connection produced a "successful" truncated archive,
+	# which later failed with "Unexpected end of archive" on activation.
+	problem = length_problem(downloaded, total_bytes)
+	if problem is None and downloaded <= 0:
+		problem = "the server sent no data"
+	if problem is None:
+		reason = archive_problem(part, suffix=dest.suffix)
+		if reason:
+			problem = f"what arrived {reason}"
+	if problem:
+		_discard_part()
+		raise HTTPException(status_code=502, detail=f"Incomplete download of {dest.name}: {problem}")
+
+	# Another transfer may have finished under this name in the meantime.
+	with _FINALISE_DOWNLOAD_LOCK:
+		final = dest
+		if final.exists():
+			counter = 1
+			while True:
+				candidate = dest.with_name(f"{dest.stem}-{counter}{dest.suffix}")
+				if not candidate.exists():
+					final = candidate
+					break
+				counter += 1
+		try:
+			os.replace(part, final)
+		except Exception as move_err:
+			_discard_part()
+			raise HTTPException(status_code=500, detail=f"Could not store {dest.name}: {move_err}")
+	return final.resolve()
 
 
 def _resolve_nexus_download_candidates(
@@ -8064,6 +8181,61 @@ def _download_archive_via_nxm(
 			message="Failed to download from Nexus CDN",
 		)
 	raise HTTPException(status_code=502, detail=f"Failed to download from Nexus CDN: {message}")
+
+
+def _download_once_in_turn(
+	record: Dict[str, Any],
+	game_domain: str,
+	mod_id: Any,
+	file_id: int,
+	desired_filename: Optional[str] = None,
+) -> Tuple[Path, str]:
+	"""Fetch a file, but only once at a time and only a couple at once.
+
+	Two things went wrong together. Nothing recorded that a file was already
+	being fetched, so a second request for it started a second transfer -- one
+	archive was found downloading six times over, named ...-1 to ...-5. And every
+	waiting download started immediately, so on a bandwidth-capped account they
+	all crawled and none finished.
+	"""
+	handoff_id = record.get("id") if isinstance(record.get("id"), str) else None
+	owner = handoff_id or f"anon-{uuid.uuid4().hex}"
+	key = (mod_id, file_id)
+
+	holder = _INFLIGHT_DOWNLOADS.claim(key, owner)
+	if holder is not None:
+		raise HTTPException(
+			status_code=409,
+			detail={
+				"message": "This file is already being downloaded",
+				"in_progress": True,
+				"mod_id": mod_id,
+				"file_id": file_id,
+			},
+		)
+
+	def _cancelled() -> bool:
+		if handoff_id is None:
+			return False
+		with _CANCELLED_HANDOFFS_LOCK:
+			return handoff_id in _CANCELLED_HANDOFFS
+
+	def _waiting(ahead: int) -> None:
+		if handoff_id is None:
+			return
+		message = "Queued — next in line" if ahead <= 0 else f"Queued — {ahead} ahead"
+		update_handoff_progress(handoff_id, stage="queued", message=message, bytes_downloaded=0)
+
+	got_slot = False
+	try:
+		got_slot = _DOWNLOAD_SLOTS.acquire(is_cancelled=_cancelled, on_wait=_waiting)
+		if not got_slot:
+			raise DownloadCancelledError(f"Download cancelled while queued (handoff={handoff_id})")
+		return _download_archive_via_nxm(record, game_domain, file_id, desired_filename=desired_filename)
+	finally:
+		if got_slot:
+			_DOWNLOAD_SLOTS.release()
+		_INFLIGHT_DOWNLOADS.release(key, owner)
 
 
 def _to_folder_name(tag: str) -> str:
@@ -9509,6 +9681,10 @@ def set_active_paks(download_id: int, payload: Dict[str, Any] = Body(...)) -> Di
 		except HTTPException:
 			raise
 		except Exception as e:
+			damaged = describe_archive_failure(e, os.path.basename(src_path))
+			if damaged:
+				logger.warning("[activate] %s (%s)", damaged, e)
+				raise HTTPException(status_code=422, detail=damaged)
 			raise HTTPException(status_code=500, detail=f"Archive extract failed: {e}")
 	elif is_pak:
 		# Single pak source; also copy sibling .utoc/.ucas if present alongside

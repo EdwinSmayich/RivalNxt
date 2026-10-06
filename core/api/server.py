@@ -1253,6 +1253,19 @@ def _apply_settings_update(payload: SettingsUpdatePayload) -> Dict[str, Any]:
 		return _serialize_settings(current)
 	updated = configure(**overrides)
 	_seed_env_from_settings()
+	from core.config import settings as _settings_module
+
+	save_error = _settings_module.LAST_SAVE_ERROR
+	if save_error:
+		# The change is live for this run but is not on disk. Saying "Settings
+		# updated" here meant finding the key and the folders gone next launch.
+		raise HTTPException(
+			status_code=500,
+			detail=(
+				"The settings are in use but could not be written to disk, so they "
+				f"will be lost when the app closes ({save_error})"
+			),
+		)
 	validation = _collect_settings_validation(updated)
 	
 	# Don't block saving settings even if validation fails

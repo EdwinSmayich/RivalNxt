@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
+import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
@@ -115,8 +118,127 @@ def _normalize_path(value: Optional[str | Path]) -> Optional[Path]:
 		return value.expanduser().resolve()
 	return Path(value).expanduser().resolve()
 
-def save_settings(settings: AppSettings) -> None:
+BACKUP_SUFFIX = ".bak"
+CORRUPT_SUFFIX = ".corrupt"
+
+# One writer at a time: two saves sharing a temp name would trample each other.
+_SAVE_LOCK = threading.Lock()
+
+# Why the most recent save failed, or None if it went through. The settings
+# route reads this so that "Settings updated" is not shown for a change that
+# will be gone after a restart.
+LAST_SAVE_ERROR: Optional[str] = None
+
+
+def _read_settings_file(path: Path) -> dict:
+	"""Parse one settings file, raising on anything that is not usable."""
 	import json
+
+	with open(path, "r", encoding="utf-8") as f:
+		data = json.load(f)
+	if not isinstance(data, dict):
+		raise ValueError(f"{path.name} does not hold a JSON object")
+	return data
+
+
+def _replace_with_retry(src: Path, dst: Path, attempts: int = 100, delay: float = 0.01) -> None:
+	"""os.replace that waits out a reader.
+
+	On Windows a file cannot be replaced while another handle has it open, and
+	settings.json is read from several threads. Each reader holds it for a
+	moment only, so a short wait is all it takes.
+	"""
+	for attempt in range(attempts):
+		try:
+			os.replace(src, dst)
+			return
+		except PermissionError:
+			if attempt == attempts - 1:
+				raise
+			time.sleep(delay)
+
+
+def _keep_backup(path: Path) -> None:
+	"""Copy the settings file being replaced to settings.json.bak, if it is good.
+
+	An unreadable file is never copied: that would put rubbish over the one
+	good copy left.
+	"""
+	backup = path.with_name(path.name + BACKUP_SUFFIX)
+	scratch = backup.with_name(backup.name + ".tmp")
+	try:
+		_read_settings_file(path)
+		shutil.copyfile(path, scratch)
+		_replace_with_retry(scratch, backup)
+	except Exception:
+		try:
+			scratch.unlink()
+		except OSError:
+			pass
+
+
+def _write_settings_atomically(path: Path, text: str) -> bool:
+	"""Put ``text`` in place of the settings file in one step.
+
+	Writing straight onto settings.json empties it first. Another thread
+	reading during that instant saw an empty file, and a process killed during
+	it left one behind. Either way the next load fell back to the defaults and
+	the save after that wrote those defaults over the real file -- the Nexus
+	key and both folders gone.
+
+	Returns False when the file already said exactly this and was left alone.
+	"""
+	with _SAVE_LOCK:
+		existing_is_good = False
+		if path.exists():
+			try:
+				_read_settings_file(path)
+				existing_is_good = True
+			except Exception:
+				existing_is_good = False
+			if existing_is_good:
+				backup = path.with_name(path.name + BACKUP_SUFFIX)
+				try:
+					unchanged = path.read_text(encoding="utf-8") == text
+				except Exception:
+					unchanged = False
+				if unchanged:
+					if not backup.exists():
+						_keep_backup(path)
+					return False
+
+		scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+		try:
+			with open(scratch, "w", encoding="utf-8") as f:
+				f.write(text)
+				f.flush()
+				try:
+					os.fsync(f.fileno())
+				except OSError:
+					pass
+			if path.exists():
+				if existing_is_good:
+					_keep_backup(path)
+				else:
+					# Whatever this is, it is the only copy of something the
+					# user had. Set it aside instead of writing over it.
+					try:
+						_replace_with_retry(path, path.with_name(path.name + CORRUPT_SUFFIX))
+					except OSError:
+						pass
+			_replace_with_retry(scratch, path)
+		finally:
+			try:
+				scratch.unlink()
+			except OSError:
+				pass
+		return True
+
+
+def save_settings(settings: AppSettings) -> bool:
+	"""Write the settings to disk. Returns False if they could not be saved."""
+	import json
+	global LAST_SAVE_ERROR
 	path = _settings_file_path(settings.data_dir)
 	try:
 		# Ensure the directory exists
@@ -132,19 +254,53 @@ def save_settings(settings: AppSettings) -> None:
 			"allow_direct_api_downloads": settings.allow_direct_api_downloads,
 			"seven_zip_bin": str(settings.seven_zip_bin) if settings.seven_zip_bin else None,
 		}
-		with open(path, "w", encoding="utf-8") as f:
-			json.dump(data, f, indent=2)
-		print(f"[Settings] Saved settings to {path}")
-		print(f"[Settings] marvel_rivals_root: {data.get('marvel_rivals_root')}")
-		print(f"[Settings] marvel_rivals_local_downloads_root: {data.get('marvel_rivals_local_downloads_root')}")
+		written = _write_settings_atomically(path, json.dumps(data, indent=2))
+		if written:
+			print(f"[Settings] Saved settings to {path}")
+			print(f"[Settings] marvel_rivals_root: {data.get('marvel_rivals_root')}")
+			print(f"[Settings] marvel_rivals_local_downloads_root: {data.get('marvel_rivals_local_downloads_root')}")
+		LAST_SAVE_ERROR = None
+		return True
 	except Exception as e:
+		LAST_SAVE_ERROR = f"{path}: {e}"
 		print(f"[Settings] ERROR saving settings: {e}")
 		import traceback
 		traceback.print_exc()
+		return False
+
+
+def _load_settings_data(path: Path) -> tuple[Optional[dict], Optional[Path], Optional[Exception]]:
+	"""Read settings.json, or the last good copy of it if it cannot be read.
+
+	Returns ``(data, file it came from, error)``. A file that is simply not
+	there gives ``(None, None, None)`` -- deleting settings.json is how the app
+	is reset, and the backup must not undo that.
+	"""
+	if not path.exists():
+		return None, None, None
+	error: Optional[Exception] = None
+	for attempt in range(3):
+		try:
+			return _read_settings_file(path), path, None
+		except OSError as e:
+			# Locked by a scanner or mid-replace: worth another look.
+			error = e
+			time.sleep(0.05)
+		except Exception as e:
+			error = e
+			break
+	backup = path.with_name(path.name + BACKUP_SUFFIX)
+	if backup.exists():
+		try:
+			data = _read_settings_file(backup)
+			print(f"[Settings] {path.name} could not be read ({error}); using {backup.name}")
+			return data, backup, error
+		except Exception as e:
+			print(f"[Settings] {backup.name} could not be read either: {e}")
+	return None, None, error
+
 
 def load_settings() -> AppSettings:
-	import json
-
 	candidates = _candidate_data_dirs()
 	last_error: Exception | None = None
 
@@ -157,12 +313,14 @@ def load_settings() -> AppSettings:
 
 	for data_dir in candidates:
 		path = _settings_file_path(data_dir)
-		if not path.exists():
+		data, source, error = _load_settings_data(path)
+		if error is not None:
+			last_error = error
+			print(f"[Settings] ERROR loading settings from {path}: {error}")
+		if data is None:
 			continue
 		try:
-			with open(path, "r", encoding="utf-8") as f:
-				data = json.load(f)
-			print(f"[Settings] Loaded settings from {path}")
+			print(f"[Settings] Loaded settings from {source}")
 			print(f"[Settings] marvel_rivals_root: {data.get('marvel_rivals_root')}")
 			print(f"[Settings] marvel_rivals_local_downloads_root: {data.get('marvel_rivals_local_downloads_root')}")
 			if data.get("nexus_api_key"):
@@ -196,7 +354,9 @@ def load_settings() -> AppSettings:
 		print(f"[Settings] No settings file found. Using defaults with data_dir={fallback_dir}")
 		return AppSettings(data_dir=fallback_dir)
 
-	# If we failed to load due to persistent error, return defaults but surface via print
+	# Nothing readable, not even a backup. The file itself is left where it is;
+	# the next save sets it aside as settings.json.corrupt rather than writing
+	# over it.
 	print("[Settings] Falling back to default settings due to previous errors")
 	return AppSettings()
 

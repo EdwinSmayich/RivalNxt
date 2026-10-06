@@ -1456,13 +1456,41 @@ def update_local_download_active_paks(
     )
     conn.commit()
 
+def _is_failed_nexus_answer(status: Any, payload: Any) -> bool:
+    """True for what nexus_api returns when a request did not succeed.
+
+    That is ``(http status, {"error": True, "message": ..., "body": ...})``.
+    A status of 0 or None means the caller built the payload itself.
+    """
+    if isinstance(payload, dict) and payload.get("error"):
+        return True
+    try:
+        return int(status) >= 400
+    except (TypeError, ValueError):
+        return False
+
+
 def upsert_mod_info(
     conn: sqlite3.Connection,
     game: str,
     mod_id: int,
-    mod_info_status: int,  # kept for signature compatibility even if unused now
+    mod_info_status: int,
     mod_info: Any,
 ) -> None:
+    """Store what Nexus says about a mod, without forgetting what it said before.
+
+    Every column used to be overwritten with whatever this call was given, and
+    ``mod_info_status`` was ignored. So a 403, a 429 during a long sync, or a
+    mod that Nexus had put under moderation -- which answers 200 with a status
+    and nothing else -- replaced the name, the picture and the description with
+    NULL. One library had 33 of its 200 mods reduced to a bare id that way.
+
+    A failed answer now changes nothing, and in a good one a missing field
+    leaves the stored value alone: ``status`` and ``available`` still move, so
+    a hidden mod is recorded as hidden and keeps its name.
+    """
+    if _is_failed_nexus_answer(mod_info_status, mod_info):
+        mod_info = None
     name = summary = author = version = updated_at = None
     created_time = created_timestamp = updated_timestamp = picture_url = None
     contains_adult_content = status = available = category_id = None
@@ -1534,26 +1562,26 @@ def upsert_mod_info(
         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(mod_id) DO UPDATE SET
             game=excluded.game,
-            name=excluded.name,
-            summary=excluded.summary,
-            description_bbcode=excluded.description_bbcode,
-            description_html=excluded.description_html,
-            author=excluded.author,
-            version=excluded.version,
-            updated_at=excluded.updated_at,
-            created_time=excluded.created_time,
-            created_timestamp=excluded.created_timestamp,
-            updated_timestamp=excluded.updated_timestamp,
-            picture_url=excluded.picture_url,
-            contains_adult_content=excluded.contains_adult_content,
-            status=excluded.status,
-            available=excluded.available,
-            category_id=excluded.category_id,
-            mod_downloads=excluded.mod_downloads,
-            mod_unique_downloads=excluded.mod_unique_downloads,
-            endorsement_count=excluded.endorsement_count,
-            author_profile_url=excluded.author_profile_url,
-            author_member_id=excluded.author_member_id;
+            name=COALESCE(NULLIF(excluded.name, ''), mods.name),
+            summary=COALESCE(excluded.summary, mods.summary),
+            description_bbcode=COALESCE(excluded.description_bbcode, mods.description_bbcode),
+            description_html=COALESCE(excluded.description_html, mods.description_html),
+            author=COALESCE(NULLIF(excluded.author, ''), mods.author),
+            version=COALESCE(excluded.version, mods.version),
+            updated_at=COALESCE(excluded.updated_at, mods.updated_at),
+            created_time=COALESCE(excluded.created_time, mods.created_time),
+            created_timestamp=COALESCE(excluded.created_timestamp, mods.created_timestamp),
+            updated_timestamp=COALESCE(excluded.updated_timestamp, mods.updated_timestamp),
+            picture_url=COALESCE(NULLIF(excluded.picture_url, ''), mods.picture_url),
+            contains_adult_content=COALESCE(excluded.contains_adult_content, mods.contains_adult_content),
+            status=COALESCE(excluded.status, mods.status),
+            available=COALESCE(excluded.available, mods.available),
+            category_id=COALESCE(excluded.category_id, mods.category_id),
+            mod_downloads=COALESCE(excluded.mod_downloads, mods.mod_downloads),
+            mod_unique_downloads=COALESCE(excluded.mod_unique_downloads, mods.mod_unique_downloads),
+            endorsement_count=COALESCE(excluded.endorsement_count, mods.endorsement_count),
+            author_profile_url=COALESCE(excluded.author_profile_url, mods.author_profile_url),
+            author_member_id=COALESCE(excluded.author_member_id, mods.author_member_id);
         """,
         (
             mod_id,
@@ -1614,18 +1642,43 @@ def upsert_mod_info(
 
     conn.commit()
 
+def fill_missing_mod_name(conn: sqlite3.Connection, mod_id: int, name: Optional[str]) -> bool:
+    """Give a mod a name only if it has none. Returns whether it was set."""
+    if not isinstance(name, str) or not name.strip():
+        return False
+    cur = conn.execute(
+        "UPDATE mods SET name = ? WHERE mod_id = ? AND (name IS NULL OR TRIM(name) = '')",
+        (name.strip(), mod_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def replace_mod_files(
     conn: sqlite3.Connection,
     mod_id: int,
     files_payload: Any,
 ) -> None:
+    """Replace the stored file list for a mod with the one Nexus just returned.
+
+    Only when it returned one. An error answer has no ``files`` list, and this
+    used to read that as "the mod has no files" and delete every row -- which
+    is what a mod under moderation answers (403) for its files, every sync.
+    """
     cur = conn.cursor()
     if isinstance(files_payload, dict):
-        file_list = files_payload.get("files") or []
+        if files_payload.get("error") or not isinstance(files_payload.get("files"), list):
+            # The refusal for a hidden mod happens to say what the mod is
+            # called. If its name has been lost, this is where to get it back.
+            from core.utils.nexus_metadata import name_from_unavailable_message
+
+            fill_missing_mod_name(conn, mod_id, name_from_unavailable_message(files_payload, mod_id))
+            return
+        file_list = files_payload["files"]
     elif isinstance(files_payload, list):
         file_list = files_payload
     else:
-        file_list = []
+        return
     cur.execute("DELETE FROM mod_files WHERE mod_id = ?;", (mod_id,))
     for f in file_list:
         if not isinstance(f, dict):
@@ -1687,7 +1740,6 @@ def replace_mod_changelogs(
     changelogs_payload: Any,
 ) -> None:
     cur = conn.cursor()
-    cur.execute("DELETE FROM mod_changelogs WHERE mod_id = ?;", (mod_id,))
     items: List[Tuple[str, str, Optional[str]]] = []
     if isinstance(changelogs_payload, dict):
         if "changelogs" in changelogs_payload and isinstance(changelogs_payload["changelogs"], list):
@@ -1706,6 +1758,12 @@ def replace_mod_changelogs(
         uploaded_at = ch.get("uploaded_time") or ch.get("uploaded_at")
         if version:
             items.append((version, text, uploaded_at))
+    if not items:
+        # Nothing to put in their place: an error answer, or a files request
+        # that failed so no changelog could be derived from it. Keep what is
+        # stored rather than wipe it.
+        return
+    cur.execute("DELETE FROM mod_changelogs WHERE mod_id = ?;", (mod_id,))
     for version, text, uploaded_at in items:
         cur.execute(
             """

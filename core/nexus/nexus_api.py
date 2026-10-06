@@ -32,6 +32,9 @@ def get_api_key(*_, **__) -> Optional[str]:
     value = _coerce_key(getattr(refreshed, "nexus_api_key", ""))
     return value or None
 
+REQUEST_TIMEOUT_SECONDS = 30
+
+
 def _get(api_key: str, path: str) -> Tuple[int, Any]:
     url = f"{BASE_URL}{path}"
     headers = {
@@ -41,7 +44,9 @@ def _get(api_key: str, path: str) -> Tuple[int, Any]:
     }
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(req, context=SSL_CONTEXT) as resp:
+        # Without a timeout a connection that stalls is waited on for ever, and
+        # this runs inside the request that is ingesting a download.
+        with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
             status = resp.getcode()
             data = resp.read()
             try:
@@ -57,6 +62,9 @@ def _get(api_key: str, path: str) -> Tuple[int, Any]:
         return e.code, {"error": True, "message": str(e), "body": parsed}
     except urllib.error.URLError as e:
         return 0, {"error": True, "message": str(e)}
+    except (TimeoutError, OSError) as e:
+        # A stall or a reset while reading the body is not a URLError.
+        return 0, {"error": True, "message": str(e) or type(e).__name__}
 
 def get_mod_info(api_key: str, game: str, mod_id: int) -> Tuple[int, Any]:
     return _get(api_key, f"/games/{game}/mods/{mod_id}.json")

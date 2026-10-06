@@ -10,8 +10,8 @@ A desktop app to install, organise and switch Marvel Rivals mods, with conflict
 detection, Nexus Mods integration and a local database.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#installation)
-[![Version](https://img.shields.io/badge/version-1.0.4-success?style=for-the-badge)](#)
-[![Tests](https://img.shields.io/badge/tests-926%20passing-brightgreen?style=for-the-badge)](#verification)
+[![Version](https://img.shields.io/badge/version-1.0.5-success?style=for-the-badge)](#)
+[![Tests](https://img.shields.io/badge/tests-1%2C309%20passing-brightgreen?style=for-the-badge)](#verification)
 
 </div>
 
@@ -31,12 +31,12 @@ was taken:
 | | |
 |---|---|
 | Files in the upstream tree | 344 |
-| Modified | 51 |
+| Modified | 59 |
 | Deleted | 45 |
 | Moved | 20 |
-| **Left exactly as the author wrote them** | **228 (66%)** |
-| Files this fork adds | 54 |
-| Diff | +19,213 / −13,806 across 170 files |
+| **Left exactly as the author wrote them** | **220 (64%)** |
+| Files this fork adds | 73 |
+| Diff | +25,780 / −14,197 across 197 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
 rewrite, and it would not exist without the original. Check the numbers rather
@@ -124,6 +124,50 @@ back to match the disk. The restore now puts the files back too.
   same placeholders again. Skin names have the same fallback and are guarded
   the same way; they survived only because they have a wiki fallback that
   character names do not.
+- **Downloads cut short were kept as finished archives.**
+  `HTTPResponse.read(n)` does not raise when the server hangs up early; it
+  returns `b""`, and the transfer loop took that for the end of the file. Six
+  archives in one library were truncated that way, which surfaced only on
+  activation, as `Failed the read enough data: req=1048576 got=1018368`.
+  Transfers now go to a `.part` file, are checked against the announced length
+  and for an archive signature, and only then renamed. Files added by hand and
+  images added by address had the same hole and are closed the same way.
+- **One file downloaded six times over, and Cancel did nothing.** Every arrival
+  of a download link started its own transfer, and every pending transfer
+  started at once — past the webview's six connections per host, so the
+  progress polls and the Cancel request queued behind the downloads
+  themselves. A repeated link now joins the transfer already running, two run
+  at a time, and what is waiting can be cancelled.
+- **A mod could be left made of two versions.** A mod is three files — `.pak`,
+  `.utoc`, `.ucas` — that only work together, and the game keeps the `.ucas`
+  open while it runs. Installing replaced them one at a time, deleting each
+  working file first, so a damaged archive or a running game left a new `.pak`
+  beside an old or half-written `.ucas`. The set now goes in together or not at
+  all, and when the game has a file open the app says so — "close the game and
+  try again" — instead of half-finishing. Switching off, sorting into folders
+  and deleting a download follow the same rule; each used to swallow the
+  failure, which is how `.ucas` files with nothing left to load them piled up.
+- **"Disable all" deleted mods it could not restore.** The crash dialog's
+  button removed every file under `~mods`, including mods the app did not
+  install and so had no archive for. Those are now moved to a
+  `RivalNxt disabled mods` folder beside the game, and the dialog says where.
+- **`settings.json` could come back empty** — the file holding the Nexus key
+  and both folders. It was written in place, so a reader in another thread
+  could catch it empty (59 times in 150 saves, measured), fall back to the
+  defaults, and have the next save write those to disk. It is now replaced in
+  one step, with the previous version kept as `settings.json.bak`.
+- **Mods lost their name and picture when Nexus hid them.** The sync wrote a
+  mod's whole row from each answer, so a 403, a rate limit, no network, or a
+  mod under moderation replaced everything with `NULL` — 33 of 200 mods in one
+  library. A failed answer now changes nothing, and a migration recovers the
+  names from the refusals Nexus sent: 29 of the 33. Pictures cannot be had back
+  that way.
+- **A number in a mod's name was taken for its Nexus id.**
+  `the-ting-v1-1-6853-1.1-1771860521.zip` was filed under mod 1. The id is now
+  located from the timestamp and version at the end of the name: on one
+  library's 283 file names, 260 parse as before, 4 get the right id and 19 lose
+  a version that had half the file name in it. Rows already misfiled are
+  corrected at start-up.
 
 ### Added
 
@@ -163,7 +207,7 @@ single rebuild used to exhaust the budget and start failing partway.
 
 ## Installation
 
-1. Download `RivalNxt_1.0.4_x64-setup.exe` from
+1. Download `RivalNxt_1.0.5_x64-setup.exe` from
    [Releases](../../releases/latest)
 2. Run it. Windows SmartScreen will warn about an unsigned installer — the build
    is not code-signed; choose **More info → Run anyway**, or build from source.
@@ -199,15 +243,15 @@ bundle before calling itself done.
 ### Verification
 
 ```bash
-npm run typecheck && npm test        # 238 frontend tests
-python -m pytest tests/backend -q    # 688 backend tests
+npm run typecheck && npm test        # 271 frontend tests
+python -m pytest tests/backend -q    # 1,038 backend tests
 ruff check core scripts src-python
 ```
 
 Seventeen further tests check that the shipped bundle is actually code-split.
 They read `dist/`, so they skip unless you have run `npm run build` first —
 deliberately, because a test that cannot see its subject should say so rather
-than pass. With a build present the total is 943.
+than pass. With a build present the total is 1,326.
 
 ---
 

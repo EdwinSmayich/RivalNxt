@@ -220,6 +220,34 @@ def build_download_row(
     }
 
 
+def register_new_downloads(root: Path, conn) -> List[str]:
+    """Add what is in the downloads folder but not yet in the library; nothing else is touched.
+
+    New files reached the library only through a full "Initial Database Build",
+    which re-reads every archive and asks Nexus about every mod. A file the app
+    puts in the folder itself -- a subtitle mod made for a voice mod -- needs
+    only its own row. Returns the names added.
+    """
+    root = Path(root).expanduser().resolve()
+    known = {str(path) for (path,) in conn.execute("SELECT path FROM local_downloads") if path}
+    rows: List[Dict[str, Any]] = []
+    for filename, rel in list_files_level_one_including_root(str(root)):
+        rel_path = (Path(rel) / filename).as_posix() if rel else filename
+        if rel_path in known:
+            continue
+        try:
+            row = build_download_row(root / rel_path, relative_to=root)
+        except (FileNotFoundError, ValueError):
+            continue
+        # Text files, pictures and half-finished downloads have no .pak in them.
+        if not row.get("contents") or row["path"] in known:
+            continue
+        rows.append(row)
+    if rows:
+        replace_local_downloads(conn, rows, prune=False)
+    return [str(row["name"]) for row in rows]
+
+
 def _fetch_existing_download_rows(conn) -> List[Dict[str, Any]]:
     cur = conn.cursor()
     rows: List[Dict[str, Any]] = []

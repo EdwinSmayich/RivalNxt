@@ -961,7 +961,8 @@ def versions_equivalent(local: Optional[str], reference: Optional[str]) -> bool:
 
     return True
 
-def replace_local_downloads(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]]) -> int:
+def replace_local_downloads(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]], *, prune: bool = True) -> int:
+    """Write download rows; with prune, rows not given are taken out of the library."""
     cur = conn.cursor()
     existing: Dict[str, int] = {}
     for path, ident in cur.execute("SELECT path, id FROM local_downloads;"):
@@ -1108,7 +1109,7 @@ def replace_local_downloads(conn: sqlite3.Connection, rows: Iterable[Dict[str, A
         )
         existing[path] = assigned_id
         inserted += 1
-    stale_paths = [p for p in existing.keys() if p not in seen_paths]
+    stale_paths = [p for p in existing.keys() if p not in seen_paths] if prune else []
     if stale_paths:
         placeholders = ",".join("?" for _ in stale_paths)
         cur.execute(f"DELETE FROM local_downloads WHERE path IN ({placeholders});", tuple(stale_paths))

@@ -79,6 +79,7 @@ def test_names():
     assert is_generated(archive) and is_generated(pak) and is_generated(COMBINED_NAME)
     assert not is_generated("LunaVoiceS9Fix_9999999_P.pak")
     assert not is_generated("FX_Subtitles_Overhaul_P.pak")  # not a language this app writes
+    assert is_generated("RU_Subtitles_-_Luna_Snow_-_LunaVoiceS9Fix.zip")  # as the library stores it when added
 
 
 def test_every_language_has_its_own_name():

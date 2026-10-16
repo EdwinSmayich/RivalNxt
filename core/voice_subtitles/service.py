@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -22,11 +26,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 from . import components as comps
 from . import pipeline
-from .discover import Finder, VoiceMod, is_generated
+from .discover import SUBTITLE_PAK, Finder, VoiceMod, is_generated
 from .game import DEFAULT_AES, LANGUAGES, Game, game_language
 from .hardware import Hardware, detect
 from .recognize import WhisperServer
-from .subtitles import GameHasItOpen, build_combined, leave_as_is, subtitle_lines, \
+from .subtitles import GameHasItOpen, build_combined, leave_as_is, read_subtitle_mod, subtitle_lines, \
     subtitle_mod_names, translation_files, variant_name, write_subtitle_mod
 from .translate import LlamaServer
 
@@ -35,6 +39,8 @@ GAME_PROCESS = "marvel.exe"
 REBUILD_DELAY = 4.0
 GAME_POLL = 30.0
 SPARE_BYTES = 1_000_000_000  # left free on the drive after a download
+ACTIVE = ("queued", "running", "waiting")
+SUBFOLDER = "RivalNxt Voice Subtitles"  # made inside a chosen folder that already holds other things
 
 
 def _now() -> str:
@@ -58,7 +64,7 @@ def game_is_running() -> bool:
 
 @dataclass
 class Job:
-    kind: str                     # "make" or "install"
+    kind: str                     # "make", "install" or "move"
     title: str
     target: str                   # a voice mod's key, or component ids joined by ","
     language: Optional[str] = None
@@ -113,7 +119,9 @@ class VoiceSubtitles:
         hardware: Callable[[], Hardware] = detect,
         rebuild_delay: float = REBUILD_DELAY,
         game_poll: float = GAME_POLL,
+        activate: Optional[Callable[[int, List[str]], Any]] = None,
     ):
+        """activate(download_id, paks) switches a library download's paks on (an empty list: off)."""
         self._data_dir = data_dir
         self._settings = settings
         self._library = library
@@ -136,6 +144,9 @@ class VoiceSubtitles:
         self._combined: Dict[str, Any] = {}
         self._counts: Dict[tuple, tuple] = {}   # (work, language) -> (files' dates, summary)
         self._running: tuple = (0.0, False)     # (when looked, the game is running)
+        self._activate = activate
+        self._voice_on: Optional[Dict[str, VoiceMod]] = None  # voice mods switched on at the last look
+        self._shared: Dict[str, tuple] = {}     # archive -> (its date and size, line counts)
 
     # ------------------------------------------------------------ settings
     def _config_file(self) -> Path:
@@ -150,20 +161,13 @@ class VoiceSubtitles:
                 "gpu_recognition": bool(data.get("gpu_recognition", False))}
 
     def set_config(self, **changes) -> dict:
+        """Change settings. A new folder is moved to before this returns; move_folder does it in the background."""
+        folder = changes.pop("folder", None)
+        if folder is not None:
+            self._relocate(self.check_folder(folder))
         with self._lock:
             data = _read(self._config_file(), {})
             data = data if isinstance(data, dict) else {}
-            if "folder" in changes and changes["folder"] is not None:
-                new = Path(str(changes["folder"])).expanduser()
-                if self._busy():
-                    raise ValueError("Wait for the current work to finish before moving the folder")
-                old = self.folder()
-                if new.resolve() != old.resolve():
-                    new.mkdir(parents=True, exist_ok=True)
-                    _move_contents(old, new)
-                data["folder"] = str(new)
-                self._game = None
-                self._voice_mods = None
             for key in ("model", "language", "gpu_recognition"):
                 if key in changes:
                     data[key] = changes[key]
@@ -171,12 +175,84 @@ class VoiceSubtitles:
                 raise ValueError(f"unknown model {data['model']!r}")
             if data.get("language") and data["language"] not in LANGUAGES:
                 raise ValueError(f"unknown language {data['language']!r}")
-            path = self._config_file()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            staged = path.with_name(path.name + ".new")
-            staged.write_text(json.dumps(data, indent=1), encoding="utf-8")
-            staged.replace(path)
+            self._save_config(data)
         return self.config()
+
+    def _save_config(self, data: dict) -> None:
+        path = self._config_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staged = path.with_name(path.name + ".new")
+        staged.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        staged.replace(path)
+
+    # ------------------------------------------------------------ moving the folder
+    def check_folder(self, folder) -> Path:
+        """Where the files go for a folder the user picked; refused where they must not go."""
+        new = Path(str(folder)).expanduser().resolve()
+        old = self.folder().resolve()
+        if new == old:
+            return new
+        if _inside(new, old):
+            raise ValueError("That folder is inside the current one")
+        settings = self._settings()
+        forbidden = (
+            (_install_dir(), "RivalNxt is installed there, and uninstalling it would delete the models"),
+            (getattr(settings, "marvel_rivals_root", None), "that is the game's folder"),
+            (self.downloads_dir(), "that is the mod downloads folder, and the library would take the files for mods"),
+        )
+        for place, why in forbidden:
+            if place and _inside(new, Path(place).expanduser().resolve()):
+                raise ValueError(f"Choose another folder: {why}")
+        if new.is_dir() and any(new.iterdir()) and not _holds_voice_subtitles(new):
+            new = new / SUBFOLDER  # not among someone's other files
+        return new
+
+    def move_folder(self, folder) -> Job:
+        """Move the models and work to another folder in the background; the old one stays whole until then."""
+        new = self.check_folder(folder)
+        if self._busy():
+            raise ValueError("Wait for the current work to finish before moving the folder")
+        job = Job(kind="move", title="Moving the voice subtitle files", target=str(new), state="running")
+        with self._lock:
+            self._jobs.append(job)
+
+        def run() -> None:
+            try:
+                self._relocate(new, job)
+                self._finish(job, "done")
+                self._log("subtitles", "Moved the voice subtitle files", str(new))
+            except Exception as exc:
+                self._finish(job, "failed", str(exc))
+
+        threading.Thread(target=run, name="voice-subtitles-move", daemon=True).start()
+        return job
+
+    def _relocate(self, new: Path, job: Optional[Job] = None) -> None:
+        old = self.folder()
+        if new.resolve() == old.resolve():
+            return
+        if self._busy(but=job):
+            raise ValueError("Wait for the current work to finish before moving the folder")
+        progress = job.progress if job else (lambda stage, done, total: None)
+        leftovers = _move_folder(old, new, progress)
+        # The settings point at the new folder before anything of the old one goes.
+        with self._lock:
+            data = _read(self._config_file(), {})
+            data = data if isinstance(data, dict) else {}
+            data["folder"] = str(new)
+            self._save_config(data)
+            self._game = None
+            self._voice_mods = None
+            self._voice_on = None
+        for item in leftovers:
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+        try:
+            old.rmdir()
+        except OSError:
+            pass  # something else is in it
 
     def folder(self) -> Path:
         return Path(self.config()["folder"])
@@ -242,6 +318,7 @@ class VoiceSubtitles:
                     self._voice_mods = mods
                     again = getattr(self, "_rescan_again", False)
                     self._rescan_again = False
+                self._follow_voice_mods(mods)
                 if not again:
                     break
         except Exception as exc:
@@ -277,6 +354,8 @@ class VoiceSubtitles:
 
     def install(self, what: str) -> Job:
         """what: "recognition", "gpu-recognition" or a model id (with the llama.cpp build it needs)."""
+        if self._moving():
+            raise ValueError("Wait for the voice subtitle files to finish moving")
         hw = self._hardware()
         if what == "recognition":
             ids, title = list(comps.RECOGNITION), "Speech recognition"
@@ -362,6 +441,8 @@ class VoiceSubtitles:
         if language not in LANGUAGES:
             raise ValueError(f"unknown language {language!r}")
         mod = self._find(key)
+        if self._moving():
+            raise ValueError("Wait for the voice subtitle files to finish moving")
         if pipeline.skipped(mod.hero):
             raise ValueError("Subtitles are not made for this hero's voice mods")
         if not self.recognition_ready():
@@ -388,15 +469,13 @@ class VoiceSubtitles:
             raise ValueError("Install speech recognition first")
         if language != "en" and not self.translation_ready():
             raise ValueError("Install a translation model first")
-        downloads = self.downloads_dir()
+        library, present = self._library_by_name(), self._present()
         jobs = []
         for mod in self.voice_mods():
             if pipeline.skipped(mod.hero):
                 continue
-            archive, _pak = subtitle_mod_names(self._hero_name(mod.hero), mod.name, language)
             work = pipeline.work_dir(self.folder(), mod.bank_id, mod.key)
-            summary = self._summary(work, language)
-            if downloads and (downloads / archive).exists() and summary and summary["counts"]["missing"] == 0:
+            if self._subtitle_state(work, mod, language, self._hero_name(mod.hero), library, present)["state"] == "ready":
                 continue
             jobs.append(self.make(mod.key, language))
         return jobs
@@ -409,6 +488,19 @@ class VoiceSubtitles:
             except Exception:
                 pass
         return hero
+
+    def _avatar(self, hero: str) -> str:
+        game = self.game()
+        if game is not None:
+            try:
+                return game.hero_avatar(hero)
+            except Exception:
+                pass
+        return f"{hero}0010"
+
+    def hero_icon(self, avatar: str) -> Optional[Path]:
+        game = self.game()
+        return game.hero_icon(avatar) if game is not None else None
 
     def _make_loop(self) -> None:
         while True:
@@ -483,6 +575,9 @@ class VoiceSubtitles:
         counts = result["counts"]
         self._log("subtitles", f"Made {LANGUAGES[language]} subtitles",
                   f"{result['archive'].stem}: {counts['subtitled']} lines, {counts['silenced']} silenced")
+        # Made for a voice mod that is on: on with it, as if the voice mod had just been switched on.
+        if language == self.target_language() and any(mods_dir and (mods_dir / rel).is_file() for rel in mod.installed):
+            self._switch_subtitles(mod, True, language)
 
     def _write_mod(self, work: Path, mod: VoiceMod, language: str) -> dict:
         result = write_subtitle_mod(work, language, self._hero_name(mod.hero), mod.name, self.downloads_dir(),
@@ -496,6 +591,134 @@ class VoiceSubtitles:
         if result["changed"] and result["active"]:
             self.request_rebuild("subtitles changed")
         return result
+
+    # ------------------------------------------------------------ subtitles follow their voice mod
+    def _library_by_name(self) -> Dict[str, dict]:
+        try:
+            return {_name_key(Path(str(row.get("path") or "")).name): row for row in self._library()}
+        except Exception:
+            return {}
+
+    def _archive(self, archive_name: str) -> Optional[Path]:
+        """A subtitle mod's archive in the downloads folder, under its name as made or as the library stored it.
+
+        Adding a file to the library renames "RU Subtitles - Storm - Voice.zip"
+        to "RU_Subtitles_-_Storm_-_Voice.zip": a subtitle mod someone passed on.
+        """
+        downloads = self.downloads_dir()
+        if downloads is None:
+            return None
+        exact = downloads / archive_name
+        if exact.exists():
+            return exact
+        try:
+            stamp = downloads.stat().st_mtime_ns
+        except OSError:
+            return None
+        cached = getattr(self, "_downloads_names", None)
+        if not cached or cached[0] != (str(downloads), stamp):
+            names = {_name_key(p.name): p for p in downloads.iterdir() if p.suffix.lower() == ".zip"}
+            cached = self._downloads_names = ((str(downloads), stamp), names)
+        return cached[1].get(_name_key(archive_name))
+
+    def _present(self) -> set:
+        mods_dir = self.mods_dir()
+        return {p.name.lower() for p in mods_dir.rglob("*.pak")} if mods_dir and mods_dir.is_dir() else set()
+
+    def _follow_voice_mods(self, mods: List[VoiceMod]) -> None:
+        """A voice mod switched on brings its subtitle mod, if one is made; switched off, it takes it away.
+
+        Only a change counts: a subtitle mod switched off by hand beside a voice
+        mod that stays on stays off.
+        """
+        on = {m.key: m for m in mods if m.installed}
+        with self._lock:
+            before, self._voice_on = self._voice_on, on
+        if before is None:
+            return  # the first look since the app started: nothing to compare with
+        for key in on.keys() - before.keys():
+            self._switch_subtitles(on[key], True)
+        for key in before.keys() - on.keys():
+            self._switch_subtitles(before[key], False)
+
+    def _switch_subtitles(self, mod: VoiceMod, on: bool, language: Optional[str] = None) -> None:
+        if self._activate is None:
+            return
+        try:
+            hero_name = self._hero_name(mod.hero)
+            library, present = self._library_by_name(), self._present()
+            if on:
+                if pipeline.skipped(mod.hero):
+                    return
+                work = pipeline.work_dir(self.folder(), mod.bank_id, mod.key)
+                state = self._subtitle_state(work, mod, language or self.target_language(), hero_name, library,
+                                             present)
+                if state["state"] == "ready" and not state["active"] and state["download_id"] is not None:
+                    self._activate(int(state["download_id"]), [state["pak"]])
+                    self._log("subtitles", "Switched subtitles on with their voice mod", state["archive"][:-4])
+                return
+            for code in LANGUAGES:
+                archive, pak = subtitle_mod_names(hero_name, mod.name, code)
+                row = library.get(_name_key(archive))
+                if pak.lower() in present and row and row.get("id") is not None:
+                    self._activate(int(row["id"]), [])
+                    self._log("subtitles", "Switched subtitles off with their voice mod", archive[:-4])
+        except Exception as exc:
+            self._log("subtitles", "Could not switch subtitles with their voice mod", f"{mod.name}: {exc}")
+
+    def not_ready_reason(self, language: str) -> Optional[str]:
+        if self.game() is None:
+            return "Set the Marvel Rivals folder in Settings first"
+        if self.downloads_dir() is None:
+            return "Set the mod downloads folder in Settings first"
+        if not self.recognition_ready():
+            return "Install speech recognition in the Voice Subtitles tab first"
+        if language != "en" and not self.translation_ready():
+            return "Install a translation model in the Voice Subtitles tab first"
+        return None
+
+    def for_downloads(self, ids: List[int]) -> dict:
+        """The voice mods inside some library downloads, by download and .pak name, with their subtitles."""
+        language = self.target_language()
+        wanted = set(ids)
+        library, present = self._library_by_name(), self._present()
+        with self._lock:
+            jobs = {j.target: j for j in self._jobs if j.kind == "make" and j.language == language and j.state in ACTIVE}
+        paks: Dict[str, Dict[str, dict]] = {}
+        for mod in self.voice_mods():
+            entries = [e for e in mod.library if e.get("download_id") in wanted]
+            if not entries:
+                continue
+            hero_name = self._hero_name(mod.hero)
+            work = pipeline.work_dir(self.folder(), mod.bank_id, mod.key)
+            job = jobs.get(mod.key)
+            info = {"key": mod.key, "name": mod.name, "hero_name": hero_name, "avatar": self._avatar(mod.hero),
+                    "skipped": pipeline.skipped(mod.hero),
+                    "subtitles": self._subtitle_state(work, mod, language, hero_name, library, present),
+                    "job": job.public() if job else None}
+            for entry in entries:
+                member = Path(str(entry.get("member") or mod.name).replace("\\", "/")).name
+                paks.setdefault(str(entry["download_id"]), {})[member.lower()] = info
+        return {"language": language, "language_name": LANGUAGES.get(language, language),
+                "not_ready": self.not_ready_reason(language), "scanning": self._scanning, "paks": paks}
+
+    def reveal(self, key: str, language: str, what: str) -> str:
+        """Show a voice mod's subtitle mod, or its translations, in Explorer."""
+        if language not in LANGUAGES:
+            raise ValueError(f"unknown language {language!r}")
+        mod = self._find(key)
+        if what == "subtitle-mod":
+            archive, _pak = subtitle_mod_names(self._hero_name(mod.hero), mod.name, language)
+            path = self._archive(archive) or (self.downloads_dir() or Path(".")) / archive
+        elif what == "translations":
+            work = pipeline.work_dir(self.folder(), mod.bank_id, mod.key)
+            path = translation_files(work, language)[0] if language != "en" else work / "transcript.json"
+        else:
+            raise ValueError(f"unknown file {what!r}")
+        if not path.exists():
+            raise FileNotFoundError(str(path))
+        _show_in_explorer(path)
+        return str(path)
 
     # ------------------------------------------------------------ job queue
     def _start(self, name: str, target: Callable[[], None], wake: threading.Event) -> None:
@@ -540,9 +763,13 @@ class VoiceSubtitles:
             if job.state == "queued":
                 self._finish(job, "cancelled")
 
-    def _busy(self) -> bool:
+    def _busy(self, but: Optional[Job] = None) -> bool:
         with self._lock:
-            return any(j.state in ("queued", "running", "waiting") for j in self._jobs)
+            return any(j.state in ACTIVE for j in self._jobs if j is not but)
+
+    def _moving(self) -> bool:
+        with self._lock:
+            return any(j.kind == "move" and j.state in ACTIVE for j in self._jobs)
 
     def jobs(self) -> List[dict]:
         with self._lock:
@@ -659,14 +886,8 @@ class VoiceSubtitles:
         installed = self._installed()
         language = cfg["language"] or self.game_language()
         recommended = comps.recommend(hw)
-        library = {}
-        try:
-            for row in self._library():
-                library[Path(str(row.get("path") or "")).name.lower()] = row
-        except Exception:
-            library = {}
+        library, present = self._library_by_name(), self._present()
         mods_dir = self.mods_dir()
-        present = {p.name.lower() for p in mods_dir.rglob("*.pak")} if mods_dir and mods_dir.is_dir() else set()
         game = self.game()
         voice = []
         for mod in self.voice_mods():
@@ -675,8 +896,8 @@ class VoiceSubtitles:
             subs = {}
             for lang in sorted({language, "en"} | _languages_made(work)):
                 subs[lang] = self._subtitle_state(work, mod, lang, hero_name, library, present)
-            voice.append({**mod.as_dict(), "hero_name": hero_name, "skipped": pipeline.skipped(mod.hero),
-                          "subtitles": subs})
+            voice.append({**mod.as_dict(), "hero_name": hero_name, "avatar": self._avatar(mod.hero),
+                          "skipped": pipeline.skipped(mod.hero), "work_path": str(work), "subtitles": subs})
         return {
             "folder": str(folder), "free_bytes": _free_bytes(folder),
             "game_found": game is not None, "game_running": self._game_is_running(),
@@ -707,18 +928,53 @@ class VoiceSubtitles:
     def _subtitle_state(self, work: Path, mod: VoiceMod, language: str, hero_name: str,
                         library: Dict[str, dict], present: set) -> dict:
         archive_name, pak_name = subtitle_mod_names(hero_name, mod.name, language)
-        downloads = self.downloads_dir()
-        made = bool(downloads and (downloads / archive_name).exists())
+        archive = self._archive(archive_name)
+        made = archive is not None
         summary = self._summary(work, language)
         counts = summary["counts"] if summary else None
-        row = library.get(archive_name.lower())
+        shared = False
+        if made and counts is None:
+            # Made on another computer and passed on: only its lines, nothing to review.
+            counts = self._shared_counts(archive)
+            shared = counts is not None
+        row = library.get(_name_key(archive.name if archive else archive_name))
         active = pak_name.lower() in present
         state = "none"
         if made and counts is not None:
             state = "ready" if counts["missing"] == 0 else "partial"
         return {"state": state, "counts": counts, "models": summary["models"] if summary else [],
-                "archive": archive_name, "pak": pak_name, "active": active,
-                "download_id": row.get("id") if row else None}
+                "archive": archive_name, "archive_path": str(archive) if made else None, "shared": shared,
+                "pak": pak_name, "active": active, "download_id": row.get("id") if row else None}
+
+    def _shared_counts(self, archive: Path) -> Optional[dict]:
+        """Line counts of a subtitle mod archive this computer did not make; None if it is not one."""
+        import zipfile
+
+        try:
+            st = archive.stat()
+        except OSError:
+            return None
+        stamp = (st.st_mtime_ns, st.st_size)
+        cached = self._shared.get(str(archive))
+        if cached and cached[0] == stamp:
+            return cached[1]
+        counts = None
+        try:
+            with zipfile.ZipFile(archive) as z, tempfile.TemporaryDirectory(prefix="rivalnxt_shared_") as tmp:
+                member = next((n for n in z.namelist() if SUBTITLE_PAK.match(Path(n).name)), None)
+                if member:
+                    pak = Path(tmp) / Path(member).name
+                    pak.write_bytes(z.read(member))
+                    data = read_subtitle_mod(pak, self._aes())
+                    if data:
+                        texts = [t for entries in data["lines"].values() if isinstance(entries, dict)
+                                 for t in entries.values() if isinstance(t, str)]
+                        counts = {"subtitled": sum(1 for t in texts if t), "silenced": sum(1 for t in texts if not t),
+                                  "kept": 0, "missing": 0}
+        except (OSError, zipfile.BadZipFile, ValueError):
+            counts = None
+        self._shared[str(archive)] = (stamp, counts)
+        return counts
 
     def _summary(self, work: Path, language: str) -> Optional[dict]:
         """How many lines of each kind, and the models that translated them; None before recognition.
@@ -753,6 +1009,15 @@ def _languages_made(work: Path) -> set:
     return {p.name.split(".")[1] for p in work.glob("translation.*.json") if p.name.count(".") == 2}
 
 
+def _show_in_explorer(path: Path) -> None:
+    """Open the file's folder with the file selected."""
+    if os.name == "nt":
+        # Explorer reads its own command line: "/select," and the quoted path are one argument.
+        subprocess.Popen(f'explorer /select,"{path}"')
+    else:
+        subprocess.Popen(["xdg-open", str(Path(path).parent)])
+
+
 def _free_bytes(folder: Path) -> Optional[int]:
     """Free space on the folder's drive (the folder itself may not exist yet)."""
     path = Path(folder)
@@ -772,16 +1037,92 @@ def _write_source(work: Path, mod: VoiceMod) -> None:
         path.write_text(json.dumps(data, indent=1), encoding="utf-8")
 
 
-def _move_contents(old: Path, new: Path) -> None:
-    """Move what the old folder holds into the new one (models are gigabytes: moved, not copied, on one drive)."""
+def _name_key(name: str) -> str:
+    """A file name without the spaces, dashes and case that renaming may change."""
+    return re.sub(r"[^a-z0-9.]+", "", name.lower())
+
+
+def _inside(path: Path, place: Path) -> bool:
+    return path == place or place in path.parents
+
+
+def _install_dir() -> Optional[Path]:
+    """The folder the app runs from, when it runs as the installed program."""
+    return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None
+
+
+def _holds_voice_subtitles(folder: Path) -> bool:
+    return (folder / "components.json").exists() or (folder / "voice-mods").is_dir()
+
+
+def _existing(path: Path) -> Path:
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def _same_drive(a: Path, b: Path) -> bool:
+    return os.stat(a).st_dev == os.stat(b).st_dev
+
+
+def _move_folder(old: Path, new: Path, progress) -> List[Path]:
+    """Bring the old folder's contents to the new one, never leaving them half in each.
+
+    On one drive the folder is renamed, in one step when the new one does not
+    exist yet. To another drive everything is copied first; what the old folder
+    held is returned, to be deleted once the settings point at the new one --
+    stopped halfway, the old folder is still whole and still the one in use.
+    """
     if not old.is_dir():
-        return
-    for item in old.iterdir():
-        target = new / item.name
-        if target.exists():
-            continue
-        shutil.move(str(item), str(target))
-    try:
-        old.rmdir()
-    except OSError:
-        pass
+        new.mkdir(parents=True, exist_ok=True)
+        return []
+    if _same_drive(old, _existing(new)):
+        if not new.exists() or (new.is_dir() and not any(new.iterdir())):
+            if new.exists():
+                new.rmdir()
+            new.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(old, new)
+            return []
+        moved = []
+        try:
+            for item in sorted(old.iterdir()):
+                target = new / item.name
+                if not target.exists():
+                    os.rename(item, target)
+                    moved.append((item, target))
+        except OSError:
+            for item, target in reversed(moved):
+                os.rename(target, item)
+            raise
+        return []
+    items = sorted(old.iterdir())
+    files = [p for item in items for p in ([item] if item.is_file() else item.rglob("*")) if p.is_file()]
+    total = sum(p.stat().st_size for p in files)
+    new.mkdir(parents=True, exist_ok=True)
+    free = _free_bytes(new)
+    if free is not None and free < total + SPARE_BYTES:
+        raise ValueError(f"Not enough free space there: {total / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free")
+    done = 0
+    for src in files:
+        dst = new / src.relative_to(old)
+        st = src.stat()
+        if not (dst.exists() and dst.stat().st_size == st.st_size and int(dst.stat().st_mtime) == int(st.st_mtime)):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            part = dst.with_name(dst.name + ".rivalnxt-copy")
+            with open(src, "rb") as fin, open(part, "wb") as fout:
+                while True:
+                    chunk = fin.read(8 << 20)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+                    done += len(chunk)
+                    progress("Copying the files to the new folder", done, total)
+            shutil.copystat(src, part)
+            os.replace(part, dst)
+        else:
+            done += st.st_size
+        progress("Copying the files to the new folder", done, total)
+    for item in items:
+        if item.is_dir():
+            (new / item.name).mkdir(exist_ok=True)  # an empty folder copies as no files
+    return items

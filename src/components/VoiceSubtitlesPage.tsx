@@ -27,6 +27,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/
 import { Input } from "./ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { Switch } from "./ui/switch";
+import { HeroIcon } from "./HeroIcon";
+import { VoiceFilesDialog } from "./VoiceFilesDialog";
 import { VoiceLinesDialog } from "./VoiceLinesDialog";
 import {
   cancelVoiceJob,
@@ -80,7 +82,7 @@ function JobProgress({ job, onCancel }: { job: VoiceJob; onCancel?: () => void }
   const pct = percent(job);
   const waiting = job.state === "waiting" || job.state === "queued";
   const running = job.state === "running";
-  const unit = job.kind === "install" ? `${gigabytes(job.done)} of ${gigabytes(job.total)}` : `${job.done} of ${job.total}`;
+  const unit = job.kind === "make" ? `${job.done} of ${job.total}` : `${gigabytes(job.done)} of ${gigabytes(job.total)}`;
   const label = job.state === "queued" && !job.stage ? "Waiting for its turn" : job.stage || "Starting";
   return (
     <div className="space-y-1.5" aria-label={`${job.title}: ${label}`}>
@@ -157,6 +159,7 @@ export default function VoiceSubtitlesPage() {
   const [choosingModel, setChoosingModel] = useState(false);
   const [search, setSearch] = useState("");
   const [review, setReview] = useState<{ mod: VoiceMod; language: string } | null>(null);
+  const [files, setFiles] = useState<{ mod: VoiceMod; language: string } | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -268,7 +271,8 @@ export default function VoiceSubtitlesPage() {
     try {
       const folder = await invoke<string>("select_folder_dialog", { defaultPath: status.folder });
       if (folder) {
-        await run("folder", () => setVoiceSubtitlesSettings({ folder }), "Moved");
+        // The move runs in the background; its progress shows under the folder.
+        await run("folder", () => setVoiceSubtitlesSettings({ folder }));
       }
     } catch (error) {
       if (error !== "Selection cancelled") toast.error(String(error));
@@ -533,6 +537,17 @@ export default function VoiceSubtitlesPage() {
             </Button>
           </span>
         </div>
+        {activeJobs
+          .filter((j) => j.kind === "move")
+          .map((j) => (
+            <div key={j.id} className="space-y-1">
+              <div className="text-sm">
+                Moving to <span className="font-mono text-xs">{j.target}</span>. Until it is done, the old folder
+                stays the one in use; closing the app now only means moving again later.
+              </div>
+              <JobProgress job={j} />
+            </div>
+          ))}
 
         <div className="space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -599,7 +614,9 @@ export default function VoiceSubtitlesPage() {
                       ? `: ${j.error}`
                       : j.kind === "make"
                         ? `: ${nameOf(j.language ?? "en")} subtitles made`
-                        : ": installed"}
+                        : j.kind === "move"
+                          ? ` to ${j.target}: done`
+                          : ": installed"}
                   </span>
                 </div>
               ))}
@@ -620,8 +637,11 @@ export default function VoiceSubtitlesPage() {
 
           {heroGroups.map(([hero, mods]) => (
             <Card key={hero} className="gap-0 py-0">
-              <div className="px-4 py-2 border-b text-sm font-medium flex items-center justify-between">
-                <span>{hero}</span>
+              <div className="px-4 py-2 border-b text-sm font-medium flex items-center justify-between gap-3">
+                <span className="flex items-center gap-2.5 min-w-0">
+                  <HeroIcon avatar={mods[0].avatar} name={hero} className="h-8 w-8" />
+                  <span className="truncate">{hero}</span>
+                </span>
                 {mods.length > 1 && <span className="text-xs text-muted-foreground">{mods.length} voice mods</span>}
               </div>
               {mods.map((mod) => {
@@ -658,6 +678,11 @@ export default function VoiceSubtitlesPage() {
                           {sub?.state === "partial" && counts && (
                             <span className="text-xs text-amber-500">{counts.missing} lines still to translate</span>
                           )}
+                          {sub?.shared && (
+                            <Badge variant="outline" title="Made on another computer and added to your library">
+                              Shared file
+                            </Badge>
+                          )}
                           {otherModels.length > 0 && (
                             <span className="text-xs text-muted-foreground">
                               Translated by {otherModels.map(modelTitle).join(", ")}
@@ -680,8 +705,18 @@ export default function VoiceSubtitlesPage() {
                               <RotateCcw className="h-4 w-4" /> Translate again
                             </Button>
                           )}
-                          <Button size="sm" variant="ghost" onClick={() => setReview({ mod, language })}>
-                            <Pencil className="h-4 w-4" /> Review
+                          {!sub.shared && (
+                            <Button size="sm" variant="ghost" onClick={() => setReview({ mod, language })}>
+                              <Pencil className="h-4 w-4" /> Review
+                            </Button>
+                          )}
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setFiles({ mod, language })}
+                            title="Where the subtitles are kept, and how to share them"
+                          >
+                            <FolderOpen className="h-4 w-4" /> Files
                           </Button>
                           <label
                             className="flex items-center gap-2 text-sm"
@@ -715,6 +750,16 @@ export default function VoiceSubtitlesPage() {
           ))}
         </div>
       </div>
+
+      {files && files.mod.subtitles[files.language] && (
+        <VoiceFilesDialog
+          mod={files.mod}
+          language={files.language}
+          languageName={nameOf(files.language)}
+          subtitles={files.mod.subtitles[files.language]}
+          onClose={() => setFiles(null)}
+        />
+      )}
 
       {review && (
         <VoiceLinesDialog

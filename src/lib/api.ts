@@ -2245,6 +2245,10 @@ export type VoiceSubtitleState = {
   /** The translation models that made its lines (none for English). */
   models: string[];
   archive: string;
+  /** Where the subtitle mod's archive is, once it is made. */
+  archive_path: string | null;
+  /** Made on another computer and passed on: its lines only, nothing to review. */
+  shared: boolean;
   pak: string;
   active: boolean;
   download_id: number | null;
@@ -2257,15 +2261,40 @@ export type VoiceMod = {
   bank_id: string;
   hero: string;
   hero_name: string;
+  /** The hero's portrait in the game ("10160011": Loki's second look). */
+  avatar: string;
   installed: string[];
   library: { download_id: number | null; download: string; member: string | null }[];
   skipped: string | null;
+  /** The folder with what was heard, the translations and the user's corrections. */
+  work_path: string;
   subtitles: Record<string, VoiceSubtitleState>;
+};
+
+/** A voice mod inside a library download, as the mod's Files tab shows it. */
+export type VoicePakSubtitles = {
+  key: string;
+  name: string;
+  hero_name: string;
+  avatar: string;
+  skipped: string | null;
+  subtitles: VoiceSubtitleState;
+  job: VoiceJob | null;
+};
+
+export type VoiceDownloadSubtitles = {
+  language: string;
+  language_name: string;
+  /** Why subtitles cannot be made yet, or null. */
+  not_ready: string | null;
+  scanning: boolean;
+  /** download id → lower-case .pak name → its voice mod. */
+  paks: Record<string, Record<string, VoicePakSubtitles>>;
 };
 
 export type VoiceJob = {
   id: string;
-  kind: "make" | "install";
+  kind: "make" | "install" | "move";
   title: string;
   target: string;
   language: string | null;
@@ -2370,6 +2399,27 @@ export function rescanVoiceMods(): Promise<{ ok: boolean }> {
 
 export function makeVoiceSubtitles(key: string, language?: string): Promise<VoiceJob> {
   return postJson<{ key: string; language?: string }, VoiceJob>("/api/voice-subtitles/make", { key, language });
+}
+
+export function getVoiceSubtitlesForDownloads(downloadIds: number[]): Promise<VoiceDownloadSubtitles> {
+  return getJson<VoiceDownloadSubtitles>(
+    `/api/voice-subtitles/downloads?ids=${encodeURIComponent(downloadIds.join(","))}`,
+  );
+}
+
+export async function heroIconUrl(avatar: string): Promise<string> {
+  return `${await getBaseUrl()}/api/voice-subtitles/hero-icons/${encodeURIComponent(avatar)}.png`;
+}
+
+export function revealVoiceFile(
+  key: string,
+  language: string,
+  what: "subtitle-mod" | "translations",
+): Promise<{ path: string }> {
+  return postJson<{ key: string; language: string; what: string }, { path: string }>(
+    "/api/voice-subtitles/reveal",
+    { key, language, what },
+  );
 }
 
 export function makeAllVoiceSubtitles(language?: string): Promise<{ jobs: VoiceJob[] }> {

@@ -38,14 +38,15 @@ def env(tmp_path, monkeypatch):
     data_dir.mkdir()
     settings = SimpleNamespace(marvel_rivals_root=game_root, marvel_rivals_local_downloads_root=downloads,
                                aes_key_hex=AES, data_dir=data_dir)
-    log, new_downloads = [], []
+    log, new_downloads, library, activations = [], [], [], []
     running = {"game": False}
     game = FakeGame(en={key("1"): "Hello!"}, local={"ru": {key("1"): "Привет!"}})
 
     service = svc_mod.VoiceSubtitles(
-        data_dir=lambda: data_dir, settings=lambda: settings, library=lambda: [],
+        data_dir=lambda: data_dir, settings=lambda: settings, library=lambda: list(library),
         on_new_downloads=lambda: new_downloads.append(1) or [], log=lambda *a: log.append(a),
-        game_running=lambda: running["game"], hardware=lambda: HW, rebuild_delay=0.05, game_poll=0.05)
+        game_running=lambda: running["game"], hardware=lambda: HW, rebuild_delay=0.05, game_poll=0.05,
+        activate=lambda download_id, paks: activations.append((download_id, list(paks))))
     service.set_config(folder=str(tmp_path / "voice"))
     monkeypatch.setattr(service, "game", lambda: game)
     monkeypatch.setattr(service, "game_language", lambda: "ru")
@@ -68,7 +69,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "ensure_map", lambda work, *a, **k: (work.mkdir(parents=True, exist_ok=True),
                                                                       (work / "map.json").write_text('{"hero": "1031", "lines": []}'))[1])
     return SimpleNamespace(service=service, mods=mods, downloads=downloads, data_dir=data_dir, log=log,
-                           new_downloads=new_downloads, running=running, tmp=tmp_path)
+                           new_downloads=new_downloads, running=running, tmp=tmp_path, library=library,
+                           activations=activations)
 
 
 def pretend_installed(folder: Path, *ids):
@@ -100,6 +102,71 @@ class TestSettings:
         env.service.set_config(folder=str(env.tmp / "elsewhere"))
         assert (env.tmp / "elsewhere" / "models" / "m.gguf").read_bytes() == b"model"
         assert not old.exists()
+
+    def test_on_one_drive_the_folder_is_renamed_in_one_step(self, env):
+        old = env.service.folder()
+        (old / "models").mkdir(parents=True)
+        (old / "models" / "m.gguf").write_bytes(b"model")
+        env.service.set_config(folder=str(env.tmp / "new place"))
+        assert env.service.folder() == (env.tmp / "new place").resolve()
+        assert (env.tmp / "new place" / "models" / "m.gguf").read_bytes() == b"model" and not old.exists()
+
+    def test_to_another_drive_it_is_copied_before_the_old_goes(self, env, monkeypatch):
+        monkeypatch.setattr(svc_mod, "_same_drive", lambda a, b: False)
+        old = env.service.folder()
+        (old / "models").mkdir(parents=True)
+        (old / "models" / "m.gguf").write_bytes(b"model" * 1000)
+        (old / "components.json").write_text("{}")
+        (old / "downloads").mkdir()
+        job = env.service.move_folder(str(env.tmp / "other drive"))
+        assert wait(lambda: job.state == "done"), job.error
+        new = env.tmp / "other drive"
+        assert (new / "models" / "m.gguf").read_bytes() == b"model" * 1000 and (new / "downloads").is_dir()
+        assert env.service.folder() == new.resolve() and not old.exists()
+        assert job.done == job.total == 5000 + 2
+
+    def test_a_copy_stopped_halfway_leaves_the_old_folder_whole_and_in_use(self, env, monkeypatch):
+        monkeypatch.setattr(svc_mod, "_same_drive", lambda a, b: False)
+        old = env.service.folder()
+        (old / "models").mkdir(parents=True)
+        for name in ("a.gguf", "b.gguf"):
+            (old / "models" / name).write_bytes(name.encode() * 100)
+        copies = []
+
+        def copystat(src, dst):
+            copies.append(src)
+            if len(copies) == 2:
+                raise OSError("the app was closed")
+
+        monkeypatch.setattr(svc_mod.shutil, "copystat", copystat)
+        job = env.service.move_folder(str(env.tmp / "other drive"))
+        assert wait(lambda: job.state == "failed")
+        assert env.service.folder() == old
+        assert sorted(p.name for p in (old / "models").iterdir()) == ["a.gguf", "b.gguf"]
+
+    def test_places_the_files_must_not_go(self, env, monkeypatch):
+        monkeypatch.setattr(svc_mod, "_install_dir", lambda: env.tmp / "app")
+        for place in (env.tmp / "app", env.tmp / "app" / "voice", env.downloads, env.tmp / "game" / "x",
+                      env.service.folder() / "inside"):
+            with pytest.raises(ValueError):
+                env.service.check_folder(place)
+
+    def test_a_folder_with_other_things_in_it_gets_a_subfolder(self, env):
+        shared = env.tmp / "Documents"
+        shared.mkdir()
+        (shared / "letter.txt").write_text("hi")
+        assert env.service.check_folder(shared) == (shared / svc_mod.SUBFOLDER).resolve()
+        assert env.service.check_folder(env.tmp / "empty") == (env.tmp / "empty").resolve()
+
+    def test_nothing_starts_while_the_files_move(self, env, monkeypatch):
+        pretend_installed(env.service.folder(), *comps.RECOGNITION)
+        mod = scanned(env.service)[0]
+        with env.service._lock:
+            env.service._jobs.append(svc_mod.Job(kind="move", title="m", target="x", state="running"))
+        with pytest.raises(ValueError, match="moving"):
+            env.service.make(mod.key, "en")
+        with pytest.raises(ValueError, match="moving"):
+            env.service.install("gemma-4-31b")
 
     def test_unknown_values_are_refused(self, env):
         with pytest.raises(ValueError):
@@ -202,6 +269,103 @@ class TestInstalling:
         assert env.service.jobs() == []
 
 
+ARCHIVE = "RU Subtitles - Luna Snow - Voice.zip"
+PAK = "RU_Subtitles_LunaSnow_Voice_9999999_P.pak"
+
+
+def make_ru(env):
+    """Russian subtitles for the voice mod switched on in ~mods, with the archive in the library as id 7."""
+    pretend_installed(env.service.folder(), *comps.RECOGNITION, "llama-cuda13", "gemma-4-31b")
+    env.service.set_config(model="gemma-4-31b")
+    env.library.append({"id": 7, "name": ARCHIVE[:-4], "path": str(env.downloads / ARCHIVE)})
+    mod = scanned(env.service)[0]
+    job = env.service.make(mod.key, "ru")
+    assert wait(lambda: job.state == "done"), job.error
+    return mod
+
+
+class TestFollowingTheVoiceMod:
+    def test_subtitles_made_for_a_voice_mod_that_is_on_come_on(self, env):
+        make_ru(env)
+        assert env.activations == [(7, [PAK])]
+
+    def test_they_go_off_and_on_with_the_voice_mod(self, env):
+        make_ru(env)
+        env.activations.clear()
+        voice = env.mods / "luna_snow" / "Voice_9999999_P.pak"
+        content = voice.read_bytes()
+        (env.mods / "luna_snow" / PAK).write_bytes(b"on")  # where switching it on put it
+        voice.unlink()
+        scanned(env.service)
+        assert env.activations == [(7, [])]
+
+        (env.mods / "luna_snow" / PAK).unlink()
+        voice.write_bytes(content)
+        scanned(env.service)
+        assert env.activations == [(7, []), (7, [PAK])]
+
+    def test_switched_off_by_hand_they_stay_off(self, env):
+        make_ru(env)
+        env.activations.clear()
+        scanned(env.service)  # the voice mod is still on, its subtitle mod off
+        assert env.activations == []
+
+    def test_the_first_look_after_starting_changes_nothing(self, env):
+        make_ru(env)
+        env.activations.clear()
+        env.service._voice_on = None  # as when the app has just started
+        scanned(env.service)
+        assert env.activations == []
+
+    def test_a_download_lists_its_voice_mods(self, env):
+        loose = env.downloads / "Voice_9999999_P.pak"
+        loose.write_bytes((env.mods / "luna_snow" / "Voice_9999999_P.pak").read_bytes())
+        env.library.append({"id": 3, "name": "Voice", "path": str(loose)})
+        scanned(env.service)
+        out = env.service.for_downloads([3, 99])
+        info = out["paks"]["3"]["voice_9999999_p.pak"]
+        assert info["hero_name"] == "Luna Snow" and info["avatar"] == "10310010"
+        assert info["subtitles"]["state"] == "none" and info["job"] is None
+        assert out["language"] == "ru" and out["not_ready"].startswith("Install speech recognition")
+        assert env.service.for_downloads([99])["paks"] == {}
+
+    def test_a_subtitle_mod_made_elsewhere_counts_as_made(self, env, tmp_path):
+        from core.voice_subtitles import subtitles as subs
+
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        rows = [{"namespace": NS, "key": key("1"), "line": "1", "en": "Hello!", "heard": "Hi.", "status": "changed"},
+                {"namespace": NS, "key": key("2"), "line": "2", "en": "Bye!", "heard": "", "status": "silent"}]
+        (other / "transcript.json").write_text(json.dumps(rows), encoding="utf-8")
+        (other / "map.json").write_text('{"hero": "1031"}', encoding="utf-8")
+        (other / "translation.ru.json").write_text(json.dumps({key("1"): "Привет."}), encoding="utf-8")
+        subs.write_subtitle_mod(other, "ru", "Luna Snow", "Voice_9999999_P.pak", env.downloads, None, AES)
+
+        # Added to the library by hand, it was renamed the way the app names added files.
+        renamed = env.downloads / ARCHIVE.replace(" ", "_")
+        (env.downloads / ARCHIVE).rename(renamed)
+        env.library.append({"id": 9, "name": "shared", "path": str(renamed)})
+
+        scanned(env.service)
+        state = env.service.status()["voice_mods"][0]["subtitles"]["ru"]
+        assert state["state"] == "ready" and state["shared"] is True and state["download_id"] == 9
+        assert state["counts"] == {"subtitled": 1, "silenced": 1, "kept": 0, "missing": 0}
+        assert state["archive_path"] == str(renamed)
+
+    def test_showing_the_files(self, env, monkeypatch):
+        shown = []
+        monkeypatch.setattr(svc_mod, "_show_in_explorer", shown.append)
+        mod = make_ru(env)
+        assert env.service.reveal(mod.key, "ru", "subtitle-mod") == str(env.downloads / ARCHIVE)
+        env.service.reveal(mod.key, "ru", "translations")
+        assert shown == [env.downloads / ARCHIVE,
+                         svc_mod.pipeline.work_dir(env.service.folder(), mod.bank_id, mod.key) / "translation.ru.json"]
+        with pytest.raises(FileNotFoundError):
+            env.service.reveal(mod.key, "de", "subtitle-mod")
+        with pytest.raises(ValueError):
+            env.service.reveal(mod.key, "ru", "everything")
+
+
 class TestEditing:
     def test_a_hand_edit_rewrites_the_subtitle_mod(self, env):
         pretend_installed(env.service.folder(), *comps.RECOGNITION, "llama-cuda13", "gemma-4-31b")
@@ -278,3 +442,20 @@ class TestRoutes:
         assert client.post("/api/voice-subtitles/make-all", json={"language": "xx"}).status_code == 400
         assert client.post("/api/voice-subtitles/make-all", json={}).status_code == 400  # no recognition yet
         assert client.get("/api/voice-subtitles/voice-mods/x/lines", params={"language": ""}).status_code == 400
+        assert client.get("/api/voice-subtitles/downloads", params={"ids": "1,x"}).status_code == 400
+        assert client.post("/api/voice-subtitles/reveal", json={"key": "none", "language": "ru",
+                                                                "what": "translations"}).status_code == 404
+
+    def test_a_new_folder_is_moved_to_in_the_background(self, client, env):
+        body = client.put("/api/voice-subtitles/settings", json={"folder": str(env.tmp / "elsewhere")}).json()
+        assert [j["kind"] for j in body["jobs"]] == ["move"]
+        assert wait(lambda: env.service.folder() == (env.tmp / "elsewhere").resolve())
+        assert client.put("/api/voice-subtitles/settings", json={"folder": str(env.downloads)}).status_code == 400
+
+    def test_hero_icons(self, client, env, monkeypatch):
+        png = env.tmp / "10310010.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        monkeypatch.setattr(env.service, "hero_icon", lambda avatar: png if avatar == "10310010" else None)
+        res = client.get("/api/voice-subtitles/hero-icons/10310010.png")
+        assert res.status_code == 200 and res.headers["content-type"] == "image/png"
+        assert client.get("/api/voice-subtitles/hero-icons/10420010.png").status_code == 404

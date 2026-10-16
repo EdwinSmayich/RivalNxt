@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -19,6 +20,11 @@ from typing import Dict, List, Optional, Tuple
 DEFAULT_AES = "0x0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74"
 LOCRES_PAK = "pakchunkLocres-Windows.pak"
 WWISE_UTOC = "pakchunkWwise-Windows.utoc"
+UI_UTOC = "pakchunkHQ-Windows.utoc"
+# The square hero heads of the hero select screen: <hero>001<form>, form 1 being
+# the other look a hero has (Lady Loki for Loki).
+HERO_ICONS = "*/HeroPortrait/SquareHeroHead/img_squarehead_*_avatar.uasset"
+_HERO_ICON = re.compile(r"img_squarehead_(\d+)_avatar\.uasset$", re.IGNORECASE)
 
 # UE culture codes the game ships subtitles for, and their English names (the
 # translator is told the language by name).
@@ -92,6 +98,7 @@ class Game:
         self.cache = Path(cache_dir)
         self.aes = aes_key or DEFAULT_AES
         self._locres: Dict[str, object] = {}
+        self._icons_lock = threading.Lock()
 
     # ------------------------------------------------------------ text
     def _locres_stamp(self) -> int:
@@ -155,6 +162,50 @@ class Game:
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(paths), encoding="utf-8")
         return json.loads(cache.read_text(encoding="utf-8"))
+
+    # ------------------------------------------------------------ hero icons
+    def hero_icon(self, avatar: str) -> Optional[Path]:
+        """A hero's square portrait as a PNG ("10160011": Loki, second look), read once per game version."""
+        if not re.fullmatch(r"\d{6,10}", avatar or ""):
+            return None
+        utoc = self.paks / UI_UTOC
+        if not utoc.exists():
+            return None
+        root = self.cache / f"hero-icons-{int(utoc.stat().st_mtime)}"
+        if not (root / ".done").exists():
+            with self._icons_lock:
+                if not (root / ".done").exists():
+                    self._extract_hero_icons(utoc, root)
+        png = root / f"{avatar}.png"
+        return png if png.exists() else None
+
+    def _extract_hero_icons(self, utoc: Path, root: Path) -> None:
+        import rust_ue_tools
+
+        from .textures import texture_png
+
+        root.mkdir(parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(prefix="rivalnxt_icons_"))
+        try:
+            _quiet(rust_ue_tools.PyUnpacker().unpack_pak, str(utoc), str(tmp), aes_key=self.aes, force=True,
+                   quiet=True, include_patterns=[HERO_ICONS])
+            for asset in tmp.rglob("*.uasset"):
+                match = _HERO_ICON.search(asset.name)
+                if match:
+                    try:
+                        texture_png(asset.read_bytes(), root / f"{match.group(1)}.png")
+                    except Exception:
+                        continue  # one unreadable picture leaves the rest
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        (root / ".done").write_text("", encoding="utf-8")
+        for old in self.cache.glob("hero-icons-*"):
+            if old != root:
+                shutil.rmtree(old, ignore_errors=True)
+
+    def hero_avatar(self, hero: str) -> str:
+        """Which portrait stands for a hero's voice mods: Lady Loki's for her voice."""
+        return f"{hero}001{1 if self.english_hero_name(hero) == 'Lady Loki' else 0}"
 
     # ------------------------------------------------------------ heroes
     def hero_name(self, hero: str, language: str = "en") -> str:

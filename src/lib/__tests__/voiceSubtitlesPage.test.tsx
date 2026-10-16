@@ -20,6 +20,8 @@ vi.mock("../api", () => ({
   setActivePaks: vi.fn(),
   getVoiceLines: vi.fn(),
   editVoiceLine: vi.fn(),
+  heroIconUrl: vi.fn(async (avatar: string) => `http://backend/hero-icons/${avatar}.png`),
+  revealVoiceFile: vi.fn(),
 }));
 
 import * as api from "../api";
@@ -33,11 +35,14 @@ function voiceMod(over: Partial<VoiceMod> = {}): VoiceMod {
     bank_id: "1031001",
     hero: "1031",
     hero_name: "Luna Snow",
+    avatar: "10310010",
     installed: ["luna_snow/LunaVoice_9999999_P.pak"],
     library: [],
     skipped: null,
+    work_path: "D:\\Voice\\voice-mods\\1031001-abc123",
     subtitles: {
       ru: { state: "none", counts: null, models: [], archive: "RU Subtitles - Luna Snow - LunaVoice.zip",
+            archive_path: null, shared: false,
             pak: "RU_Subtitles_LunaSnow_LunaVoice_9999999_P.pak", active: false, download_id: null },
     },
     ...over,
@@ -84,6 +89,7 @@ function job(over: Partial<VoiceJob> = {}): VoiceJob {
 const madeRu = (over: Partial<VoiceMod["subtitles"]["ru"]> = {}) =>
   voiceMod({
     subtitles: { ru: { ...voiceMod().subtitles.ru, state: "ready", download_id: 42, models: ["gemma-4-31b"],
+                       archive_path: "F:\\mods\\RU Subtitles - Luna Snow - LunaVoice.zip",
                        counts: { subtitled: 300, silenced: 120, kept: 2, missing: 0 }, ...over } },
   });
 
@@ -205,6 +211,16 @@ describe("VoiceSubtitlesPage", () => {
     await waitFor(() => expect(api.cancelVoiceJob).toHaveBeenCalledWith("j1"));
   });
 
+  it("shows the folder being moved, in gigabytes", async () => {
+    const move = job({ kind: "move", title: "Moving the voice subtitle files", target: "E:\\Voice",
+                       stage: "Copying the files to the new folder", done: 5e9, total: 10e9, language: null });
+    vi.mocked(api.getVoiceSubtitles).mockResolvedValue(ready({ jobs: [move] }));
+    render(<VoiceSubtitlesPage />);
+    expect(await screen.findByText(/Copying the files to the new folder · 5\.0 GB of 10 GB/)).toBeInTheDocument();
+    expect(screen.getByText("E:\\Voice")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Change" })).toBeDisabled();
+  });
+
   it("says when the game holds the work back", async () => {
     vi.mocked(api.getVoiceSubtitles).mockResolvedValue(
       ready({ game_running: true, jobs: [job({ state: "waiting", stage: "Waiting for the game to close" })] }),
@@ -218,6 +234,34 @@ describe("VoiceSubtitlesPage", () => {
     render(<VoiceSubtitlesPage />);
     expect(await screen.findByText(/English subtitle mods show in it as well/)).toBeInTheDocument();
     expect(screen.getByText(/Not needed: English subtitles are the words heard/)).toBeInTheDocument();
+  });
+
+  it("shows each hero with the game's own portrait", async () => {
+    vi.mocked(api.getVoiceSubtitles).mockResolvedValue(ready());
+    const { container } = render(<VoiceSubtitlesPage />);
+    await screen.findByText("Luna Snow");
+    await waitFor(() =>
+      expect(container.querySelector('img[src="http://backend/hero-icons/10310010.png"]')).not.toBeNull(),
+    );
+  });
+
+  it("says where the subtitles are kept and shows them in the folder", async () => {
+    vi.mocked(api.getVoiceSubtitles).mockResolvedValue(ready({ voice_mods: [madeRu()] }));
+    vi.mocked(api.revealVoiceFile).mockResolvedValue({ path: "x" });
+    render(<VoiceSubtitlesPage />);
+    fireEvent.click(await screen.findByRole("button", { name: /Files/ }));
+    expect(await screen.findByText("F:\\mods\\RU Subtitles - Luna Snow - LunaVoice.zip")).toBeInTheDocument();
+    expect(screen.getByText("D:\\Voice\\voice-mods\\1031001-abc123")).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: /Show in folder/ })[0]);
+    await waitFor(() => expect(api.revealVoiceFile).toHaveBeenCalledWith("abc123", "ru", "subtitle-mod"));
+  });
+
+  it("offers no review for a subtitle mod made on another computer", async () => {
+    vi.mocked(api.getVoiceSubtitles).mockResolvedValue(ready({ voice_mods: [madeRu({ shared: true, models: [] })] }));
+    render(<VoiceSubtitlesPage />);
+    expect(await screen.findByText("Shared file")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Review/ })).toBeNull();
+    expect(screen.getByRole("switch", { name: "Subtitle mod on" })).toBeInTheDocument();
   });
 
   it("says when a hero's voice mods get no subtitles", async () => {

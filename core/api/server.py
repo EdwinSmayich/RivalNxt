@@ -308,6 +308,9 @@ _VOICE_SUBS = VoiceSubtitles(
 	library=_library_downloads,
 	on_new_downloads=_pick_up_new_downloads,
 	log=lambda kind, title, detail=None: _log_activity(kind, title, detail),
+	# A subtitle mod is switched on and off like any mod; it conflicts with nothing.
+	activate=lambda download_id, paks: set_active_paks(
+		download_id, {"active_paks": paks, "rebuild_conflicts": False}),
 )
 voice_subtitles_routes.attach(_VOICE_SUBS)
 

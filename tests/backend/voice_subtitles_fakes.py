@@ -55,6 +55,12 @@ class FakeGame:
     def english_hero_name(self, hero: str) -> str:
         return "Luna Snow"
 
+    def hero_avatar(self, hero: str) -> str:
+        return f"{hero}0010"
+
+    def hero_icon(self, avatar: str):
+        return None
+
     def names(self, language: str) -> Dict[str, str]:
         return {"Luna Snow": "Луна Сноу (a woman)"}
 

@@ -7,6 +7,8 @@ describe("isSubtitleModArchive", () => {
     expect(isSubtitleModArchive("RU Subtitles - Luna Snow - LunaVoice.zip")).toBe(true);
     expect(isSubtitleModArchive("D:\\Mods\\LAS Subtitles - Storm - Voice S9.zip")).toBe(true);
     expect(isSubtitleModArchive("mods/CHS Subtitles - Hela - Voice.zip")).toBe(true);
+    // As the library stores a file someone passed on.
+    expect(isSubtitleModArchive("RU_Subtitles_-_Luna_Snow_-_LunaVoice.zip")).toBe(true);
   });
 
   it("leaves other mods alone", () => {

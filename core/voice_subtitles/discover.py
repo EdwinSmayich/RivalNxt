@@ -24,7 +24,8 @@ from .game import LANGUAGE_TAGS
 COMBINED_NAME = "zzz_RivalNxt_Subtitles_9999999_P.pak"
 _TAGS = "|".join(sorted(LANGUAGE_TAGS.values(), key=len, reverse=True))
 SUBTITLE_PAK = re.compile(rf"^({_TAGS})_subtitles_", re.IGNORECASE)
-_SUBTITLE_ARCHIVE = re.compile(rf"^({_TAGS}) subtitles - ", re.IGNORECASE)
+# As made ("RU Subtitles - ..."), or as the library stores an added file ("RU_Subtitles_-_...").
+_SUBTITLE_ARCHIVE = re.compile(rf"^({_TAGS})[ _]subtitles[ _]-[ _]", re.IGNORECASE)
 _ARCHIVES = (".zip", ".rar", ".7z")
 
 

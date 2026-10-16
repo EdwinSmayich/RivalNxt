@@ -110,6 +110,11 @@ import {
 } from "../lib/api";
 import { toast } from "sonner";
 import React from "react";
+import {
+  useVoicePakSubtitles,
+  VoicePakSubtitlesRow,
+  type VoicePakSubtitlesState,
+} from "./VoicePakSubtitles";
 
 type DownloadEntry = {
   id: number;
@@ -240,6 +245,8 @@ interface FileTreeProps {
   /** Notes keyed by pak basename. */
   notes: Record<string, string>;
   onEditNote: (downloadId: number, pakName: string) => void;
+  /** Subtitles of the voice mods among these files. */
+  voiceSubs?: VoicePakSubtitlesState;
 }
 
 /**
@@ -307,6 +314,7 @@ function FileTreeRenderer({
     onDeleteFile,
     notes,
     onEditNote,
+    voiceSubs,
   } = shared;
   return (
     <>
@@ -386,6 +394,7 @@ function FileTreeRenderer({
                 </div>
               </div>
               <FileNote note={note} />
+              {voiceSubs && <VoicePakSubtitlesRow state={voiceSubs} downloadId={entryId} pak={primary} />}
             </div>
           );
         }
@@ -1071,8 +1080,9 @@ export function ModModal({
         }),
     [downloadEntries],
   );
-
-
+  const voiceDownloadIds = useMemo(() => downloadSections.map((s) => s.entry.id), [downloadSections]);
+  // Asked again whenever files are switched: a voice mod switched on brings its subtitles.
+  const voiceSubs = useVoicePakSubtitles(voiceDownloadIds, isOpen, JSON.stringify(activeByDownload));
 
   const handleToggle = useCallback(
     async (downloadId: number, files: string[], willCheck: boolean) => {
@@ -4105,6 +4115,11 @@ export function ModModal({
                                                 </div>
                                               </div>
                                               <FileNote note={note} />
+                                              <VoicePakSubtitlesRow
+                                                state={voiceSubs}
+                                                downloadId={entry.id}
+                                                pak={primary}
+                                              />
                                             </div>
                                           );
                                         },
@@ -4127,6 +4142,7 @@ export function ModModal({
                                         onDeleteFile={requestDeleteFile}
                                         notes={fileNotes[entry.id] ?? {}}
                                         onEditNote={openNoteEditor}
+                                        voiceSubs={voiceSubs}
                                       />
                                     );
                                   })()}

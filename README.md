@@ -10,8 +10,8 @@ A desktop app to install, organise and switch Marvel Rivals mods, with conflict
 detection, Nexus Mods integration and a local database.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#installation)
-[![Version](https://img.shields.io/badge/version-1.0.5-success?style=for-the-badge)](#)
-[![Tests](https://img.shields.io/badge/tests-1%2C309%20passing-brightgreen?style=for-the-badge)](#verification)
+[![Version](https://img.shields.io/badge/version-1.0.6-success?style=for-the-badge)](#)
+[![Tests](https://img.shields.io/badge/tests-1%2C450%20passing-brightgreen?style=for-the-badge)](#verification)
 
 </div>
 
@@ -31,12 +31,12 @@ was taken:
 | | |
 |---|---|
 | Files in the upstream tree | 344 |
-| Modified | 59 |
+| Modified | 62 |
 | Deleted | 45 |
 | Moved | 20 |
-| **Left exactly as the author wrote them** | **220 (64%)** |
-| Files this fork adds | 73 |
-| Diff | +25,780 / −14,197 across 197 files |
+| **Left exactly as the author wrote them** | **217 (63%)** |
+| Files this fork adds | 105 |
+| Diff | +32,423 / −14,209 across 232 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
 rewrite, and it would not exist without the original. Check the numbers rather
@@ -168,6 +168,10 @@ back to match the disk. The restore now puts the files back too.
   library's 283 file names, 260 parse as before, 4 get the right id and 19 lose
   a version that had half the file name in it. Rows already misfiled are
   corrected at start-up.
+- **Every dialog closed without its fade, and logged a warning doing it.**
+  The dialog components were written for React 19, which hands a component
+  its ref as an ordinary prop; on React 18, which the app runs, the overlay
+  needs `forwardRef`, or Radix cannot follow its closing animation.
 
 ### Added
 
@@ -189,6 +193,65 @@ back to match the disk. The restore now puts the files back too.
   anything since are listed, so you are not opening 167 cards to find out who
   has rebuilt. Labelled "updated since the patch", not "fixed": an author may
   have changed a screenshot.
+- **Voice subtitles** — see below
+
+### Voice subtitles
+
+A voice mod changes what a hero says, but the subtitle on screen is still the
+game's line. The **Voice Subtitles** tab listens to each voice mod — the ones
+switched on and the ones only in your library — and writes subtitles for what
+it actually says: in English as heard, or translated into any language the game
+ships. Everything runs on your computer; nothing is sent anywhere.
+
+Nothing is installed until you ask for it:
+
+| Step | Download | Needed for |
+|---|---|---|
+| Speech recognition (Whisper large-v3-turbo, whisper.cpp, vgmstream) | 0.9 GB | any subtitles |
+| …on an NVIDIA card instead of the processor | +0.7 GB | optional |
+| A translation model (Gemma 4, llama.cpp) | 8–19 GB | subtitles in a language other than English |
+
+The tab reads your graphics card and memory, says which models fit, and
+recommends one:
+
+| Model | Download | Made for | Seconds a line, measured |
+|---|---|---|---|
+| Gemma 4 31B, 4-bit | 19 GB | NVIDIA cards with 24 GB | — |
+| Gemma 4 31B, 3-bit | 14 GB | NVIDIA cards with 16 GB | 2.1 |
+| Gemma 4 26B-A4B | 15 GB | 8–12 GB cards, or a processor with 32 GB of memory | 5.4 (12 GB card), 8.6 (8 GB), 1.3 (processor) |
+| Gemma 4 12B | 8 GB | 8 GB cards, or 16 GB of memory | 1.6 (processor) |
+
+Measured on one PC — a 16 GB RTX 5080 and a 16-core processor — with the
+smaller cards simulated by leaving memory unused; a voice mod changes from a
+few dozen lines to a few hundred. On a graphics card each line is reasoned over before it is written; on
+the processor alone it is not, which is quicker and slightly less careful. In
+Russian, the language tested, the 31B models read the most naturally, the
+26B-A4B is close behind, and the 12B is correct but more literal.
+
+Every download is a pinned version, checked against its SHA-256 before use, and
+resumes where it stopped.
+
+Each voice mod gets **its own subtitle mod** in your library — an ordinary
+archive named `RU Subtitles - <hero> - <voice mod>.zip`, filed under its hero
+and switched on and off like any other mod, so two variants of one voice can
+have their own subtitles and only the one you use is on. The game reads one
+text file per language, so the lines of every subtitle mod that is on are
+written into a single `zzz_RivalNxt_Subtitles_9999999_P.pak`, rebuilt a few
+seconds after mods change and removed when none is on. English subtitle mods
+show in a game set to any language; where a voice mod has subtitles in two
+languages switched on, the game's language wins.
+
+- **Review and correct** any line; the subtitle mod is rewritten at once, and
+  corrections are shown to the translator as examples for later lines
+- **A line the mod silences** gets no subtitle; a line it leaves alone keeps
+  the game's
+- **Stopping is safe** — cancelled, the app closed, or the game started: the
+  work so far is kept and the next run continues from there. While Marvel
+  Rivals is running, the work waits, so the game keeps the graphics card
+- **Content limits.** Voice mods for Peni Parker, a teenager, and Jeff the Land
+  Shark, an animal, get no subtitles. A sexual line in any other voice mod
+  keeps the game's own subtitle when it names or answers one of them, or names
+  a real animal
 
 ### Measured improvements
 
@@ -207,7 +270,7 @@ single rebuild used to exhaust the budget and start failing partway.
 
 ## Installation
 
-1. Download `RivalNxt_1.0.5_x64-setup.exe` from
+1. Download `RivalNxt_1.0.6_x64-setup.exe` from
    [Releases](../../releases/latest)
 2. Run it. Windows SmartScreen will warn about an unsigned installer — the build
    is not code-signed; choose **More info → Run anyway**, or build from source.
@@ -243,15 +306,15 @@ bundle before calling itself done.
 ### Verification
 
 ```bash
-npm run typecheck && npm test        # 271 frontend tests
-python -m pytest tests/backend -q    # 1,038 backend tests
+npm run typecheck && npm test        # 294 frontend tests
+python -m pytest tests/backend -q    # 1,156 backend tests
 ruff check core scripts src-python
 ```
 
 Seventeen further tests check that the shipped bundle is actually code-split.
 They read `dist/`, so they skip unless you have run `npm run build` first —
 deliberately, because a test that cannot see its subject should say so rather
-than pass. With a build present the total is 1,326.
+than pass. With a build present the total is 1,467.
 
 ---
 
@@ -281,3 +344,9 @@ and want any of this, take it — no attribution needed, no PR ceremony required
 - **[Rounak77382](https://github.com/Rounak77382)** — the application itself
 - **[repak](https://github.com/trumank/repak)** — Unreal `.pak` handling
 - **Nexus Mods** — the API this integrates with
+- **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)**,
+  **[llama.cpp](https://github.com/ggml-org/llama.cpp)**,
+  **[vgmstream](https://github.com/vgmstream/vgmstream)**, OpenAI's Whisper and
+  Google's Gemma (as quantised by [Unsloth](https://huggingface.co/unsloth)) —
+  voice subtitles. None of them is bundled: each is downloaded from its own
+  project when you ask for it, under its own licence

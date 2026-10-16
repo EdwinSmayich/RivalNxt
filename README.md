@@ -10,8 +10,8 @@ A desktop app to install, organise and switch Marvel Rivals mods, with conflict
 detection, Nexus Mods integration and a local database.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#installation)
-[![Version](https://img.shields.io/badge/version-1.0.6-success?style=for-the-badge)](#)
-[![Tests](https://img.shields.io/badge/tests-1%2C450%20passing-brightgreen?style=for-the-badge)](#verification)
+[![Version](https://img.shields.io/badge/version-1.0.7-success?style=for-the-badge)](#)
+[![Tests](https://img.shields.io/badge/tests-1%2C478%20passing-brightgreen?style=for-the-badge)](#verification)
 
 </div>
 
@@ -35,8 +35,8 @@ was taken:
 | Deleted | 45 |
 | Moved | 20 |
 | **Left exactly as the author wrote them** | **217 (63%)** |
-| Files this fork adds | 105 |
-| Diff | +32,423 / −14,209 across 232 files |
+| Files this fork adds | 111 |
+| Diff | +33,754 / −14,211 across 238 files |
 
 This fork fixes bugs and adds features on top of that foundation. It is not a
 rewrite, and it would not exist without the original. Check the numbers rather
@@ -172,6 +172,15 @@ back to match the disk. The restore now puts the files back too.
   The dialog components were written for React 19, which hands a component
   its ref as an ordinary prop; on React 18, which the app runs, the overlay
   needs `forwardRef`, or Radix cannot follow its closing animation.
+- **Moving the voice subtitles folder could leave it in two places** (1.0.6).
+  The move ran inside the request, item by item: to another drive the 14 GB
+  model took minutes, and closing the app meanwhile left the small files in the
+  new folder, the model half-copied, and the settings pointing at the old one.
+  The move now runs in the background with its progress; to another drive
+  everything is copied before the settings change and only then is the old
+  folder emptied, so a move stopped halfway leaves the old folder whole and in
+  use. The folder RivalNxt is installed in, the game's and the downloads folder
+  are refused, and a folder holding other things gets a subfolder of its own.
 
 ### Added
 
@@ -241,6 +250,16 @@ seconds after mods change and removed when none is on. English subtitle mods
 show in a game set to any language; where a voice mod has subtitles in two
 languages switched on, the game's language wins.
 
+- **Subtitles follow their voice mod.** Switching a voice mod on switches its
+  subtitle mod on with it, once one is made; switching it off takes the
+  subtitles away too. In a mod's Files tab every voice `.pak` shows its
+  subtitles — made or not, on or off, being made — and makes them from there
+- **Heroes by their portraits**, read from the game's own files: nothing is
+  downloaded for them
+- **Share what you made.** *Files* shows where a subtitle mod and its
+  translations are kept. The subtitle mod is a single archive: someone with the
+  same voice mod adds it with *Add Mods* and switches it on, with no speech
+  recognition or model of their own
 - **Review and correct** any line; the subtitle mod is rewritten at once, and
   corrections are shown to the translator as examples for later lines
 - **A line the mod silences** gets no subtitle; a line it leaves alone keeps
@@ -270,7 +289,7 @@ single rebuild used to exhaust the budget and start failing partway.
 
 ## Installation
 
-1. Download `RivalNxt_1.0.6_x64-setup.exe` from
+1. Download `RivalNxt_1.0.7_x64-setup.exe` from
    [Releases](../../releases/latest)
 2. Run it. Windows SmartScreen will warn about an unsigned installer — the build
    is not code-signed; choose **More info → Run anyway**, or build from source.
@@ -306,15 +325,15 @@ bundle before calling itself done.
 ### Verification
 
 ```bash
-npm run typecheck && npm test        # 294 frontend tests
-python -m pytest tests/backend -q    # 1,156 backend tests
+npm run typecheck && npm test        # 303 frontend tests
+python -m pytest tests/backend -q    # 1,175 backend tests
 ruff check core scripts src-python
 ```
 
 Seventeen further tests check that the shipped bundle is actually code-split.
 They read `dist/`, so they skip unless you have run `npm run build` first —
 deliberately, because a test that cannot see its subject should say so rather
-than pass. With a build present the total is 1,467.
+than pass. With a build present the total is 1,495.
 
 ---
 

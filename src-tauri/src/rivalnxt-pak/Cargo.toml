@@ -1,0 +1,19 @@
+[package]
+name = "rivalnxt-pak"
+version = "0.1.0"
+edition = "2021"
+description = "Writing and reading the small .pak files RivalNxt makes (subtitle mods)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "rivalnxt_pak"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["abi3-py38", "extension-module"] }
+# The same repak the app's other Rust library is built on, without Oodle:
+# what this module writes and reads is never compressed.
+repak = { path = "../rust-ue-tools/repak-rivals/repak", default-features = false, features = ["encryption"] }
+
+[workspace]

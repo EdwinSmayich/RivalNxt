@@ -191,6 +191,29 @@ class TestSwitchingOn:
         assert sorted(names) == sorted(TRIPLE)
 
 
+class TestVoiceSubtitles:
+    def test_switching_on_asks_for_a_rebuild(self, env, monkeypatch):
+        reasons = []
+        monkeypatch.setattr(server, "_voice_subtitles_changed", reasons.append)
+        switch_on()
+        assert reasons == ["mods switched on or off"]
+
+    def test_a_request_that_changes_nothing_does_not(self, env, monkeypatch):
+        """Switching off a mod that is already off moves no files."""
+        reasons = []
+        monkeypatch.setattr(server, "_voice_subtitles_changed", reasons.append)
+        switch_off()
+        assert reasons == []
+
+    def test_a_failed_install_does_not(self, env, monkeypatch):
+        reasons = []
+        monkeypatch.setattr(server, "_voice_subtitles_changed", reasons.append)
+        damage_the_container(env["archive"])
+        with pytest.raises(HTTPException):
+            switch_on()
+        assert reasons == []
+
+
 class TestADamagedArchive:
     def test_the_installed_version_is_untouched(self, env):
         """Was: new .pak and .utoc, and a broken .ucas between them."""

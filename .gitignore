@@ -42,3 +42,4 @@ Thumbs.db
 # ── Local scratch ────────────────────────────────────────────────────────────
 graphify-out/
 *.local
+src-tauri/src/rivalnxt-pak/target/

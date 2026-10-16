@@ -61,6 +61,7 @@ from core.api.services.handoffs import (
 	update_handoff_progress,
 	mark_handoff_consumed,
 )
+from core.voice_subtitles import VoiceSubtitles
 from core.api.services.downloads import (
 	CancelledSet,
 	DownloadSlots,
@@ -144,6 +145,8 @@ app = FastAPI(title="Mod Manager Backend", version=APP_VERSION, lifespan=_lifesp
 # Register character API routes
 from core.api.characters import router as characters_router
 app.include_router(characters_router)
+from core.api import voice_subtitles_routes
+app.include_router(voice_subtitles_routes.router)
 
 logger = logging.getLogger("modmanager.api")
 
@@ -250,6 +253,73 @@ def _recover_interrupted_installs() -> Dict[str, List[str]]:
 		return empty
 
 
+def _pick_up_new_downloads() -> List[str]:
+	"""Subtitle mods put in the downloads folder join the library.
+
+	A subtitle mod already switched on sits in ~mods; the active-mods scan that
+	follows marks it as on, so it shows as switched on, not as new.
+	"""
+	from core.ingestion.scan_mod_downloads import register_new_downloads
+
+	conn = get_db()
+	try:
+		added = register_new_downloads(_downloads_root_from_env(), conn)
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+	if added:
+		try:
+			scan_active_main(_get_scan_active_args())
+		except Exception as exc:
+			logger.debug("[voice-subtitles] active scan failed: %s", exc)
+		_log_activity("subtitles", "Added subtitle mods to the library", ", ".join(added))
+	return added
+
+
+def _library_downloads() -> List[Dict[str, Any]]:
+	"""Every download in the library, with the absolute path of its file or folder."""
+	from core.utils.download_paths import resolve_absolute_download_path
+
+	conn = get_db()
+	try:
+		rows = conn.execute("SELECT id, name, path FROM local_downloads").fetchall()
+	finally:
+		try:
+			conn.close()
+		except Exception:
+			pass
+	out: List[Dict[str, Any]] = []
+	for dl_id, name, path in rows:
+		if not path:
+			continue
+		try:
+			full = resolve_absolute_download_path(str(path))
+		except Exception:
+			continue
+		out.append({"id": dl_id, "name": name, "path": str(full)})
+	return out
+
+
+_VOICE_SUBS = VoiceSubtitles(
+	data_dir=lambda: _get_current_settings().data_dir,
+	settings=lambda: _get_current_settings(),
+	library=_library_downloads,
+	on_new_downloads=_pick_up_new_downloads,
+	log=lambda kind, title, detail=None: _log_activity(kind, title, detail),
+)
+voice_subtitles_routes.attach(_VOICE_SUBS)
+
+
+def _voice_subtitles_changed(reason: str) -> None:
+	"""Mods were switched on or off: the combined subtitle file follows the subtitle mods that are on."""
+	try:
+		_VOICE_SUBS.mods_changed(reason)
+	except Exception as exc:
+		logger.debug("[voice-subtitles] request failed: %s", exc)
+
+
 def _startup_housekeeping() -> None:
 	"""Runs once when the server starts serving. Never raises.
 
@@ -260,6 +330,8 @@ def _startup_housekeeping() -> None:
 	_sweep_partial_downloads()
 	_recover_interrupted_installs()
 	_repair_misparsed_mod_ids()
+	# Mods dropped in by hand while the app was closed are found here.
+	_voice_subtitles_changed("app started")
 
 
 def _repair_misparsed_mod_ids() -> int:
@@ -8656,6 +8728,8 @@ def delete_local_downloads_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict
 		if not id_values:
 			return {"ok": True, "deleted": 0, "removed_mod_ids": []}
 		deleted_count, removed_mod_ids, source_paths = delete_local_downloads(conn, id_values)
+		if deleted_count:
+			_voice_subtitles_changed("mods deleted")
 		downloads_root = _downloads_root_from_env().resolve()
 		removed_files: List[str] = []
 		missing_files: List[str] = []
@@ -8728,6 +8802,8 @@ def delete_local_downloads_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict
 
 
 DISABLED_MODS_FOLDER_NAME = "RivalNxt disabled mods"
+# The combined subtitle file written into ~mods (see core/voice_subtitles/subtitles.py).
+VOICE_SUBTITLES_PAK_PREFIX = "zzz_rivalnxt_subtitles"
 
 
 def _holding_dir_for_unmanaged_mods(mods_dir: Path) -> Path:
@@ -8776,7 +8852,9 @@ def disable_all_mods() -> Dict[str, Any]:
 					# which this app could not put back if it took it away.
 					if not p.is_file() or p.suffix.lower() not in BUNDLE_EXTS:
 						continue
-					(ours if p.stem.lower() in known else strangers).append(p)
+					# The voice-subtitle file is generated; it is rebuilt, not kept.
+					is_generated = p.name.lower().startswith(VOICE_SUBTITLES_PAK_PREFIX)
+					(ours if is_generated or p.stem.lower() in known else strangers).append(p)
 
 				outcome = remove_mod_files(ours)
 				removed = [p.name for p in outcome.removed]
@@ -8844,6 +8922,7 @@ def disable_all_mods() -> Dict[str, Any]:
 			notes.append(in_use_message(response["still_on"], doing="they are still in the mods folder"))
 		if notes:
 			response["warning"] = " ".join(notes)
+		_voice_subtitles_changed("all mods disabled")
 		_log_activity(
 			"deactivated",
 			"Disabled all mods",
@@ -10171,6 +10250,9 @@ def _set_active_paks_locked(download_id: int, payload: Dict[str, Any]) -> Dict[s
 				f"+{len(copied)} / -{len(removed)}",
 			)
 
+	if copied or removed:
+		_voice_subtitles_changed("mods switched on or off")
+
 	if blocked:
 		raise HTTPException(
 			status_code=423,
@@ -10366,6 +10448,8 @@ def deactivate_by_name(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 			conn.close()
 		except Exception:
 			pass
+	if removed:
+		_voice_subtitles_changed("mods switched off")
 	if blocked:
 		raise HTTPException(
 			status_code=423,
@@ -10386,6 +10470,7 @@ def scan_active_endpoint() -> Dict[str, Any]:
 		scan_active_main(_get_scan_active_args())
 	except Exception as e:
 		raise HTTPException(status_code=500, detail=f"scan failed: {e}")
+	_voice_subtitles_changed("mods folder rescanned")
 	return {"ok": True}
 
 

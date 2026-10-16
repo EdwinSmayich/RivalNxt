@@ -32,6 +32,7 @@ const NexusBrowseView = lazy(() =>
 const CollectionsPage = lazy(() =>
   import("./components/CollectionsPage").then((m) => ({ default: m.CollectionsPage })),
 );
+const VoiceSubtitlesPage = lazy(() => import("./components/VoiceSubtitlesPage"));
 
 /**
  * Placeholder while a page chunk resolves. Deliberately empty rather than a
@@ -211,7 +212,7 @@ export default function App() {
   // State management
   const [mods, setMods] = useState<any[]>([]);
   const [activeTab, setActiveTab] = useState<
-    "downloads" | "active" | "collections" | "nexus"
+    "downloads" | "active" | "collections" | "nexus" | "subtitles"
   >("downloads");
   // Which filterable tab to come back to when a sidebar filter is used from a
   // tab that ignores filters.
@@ -2620,6 +2621,8 @@ export default function App() {
                   />
                 ) : activeTab === "nexus" ? (
                   <NexusBrowseView />
+                ) : activeTab === "subtitles" ? (
+                  <VoiceSubtitlesPage />
                 ) : (
                   <CollectionsPage
                     installedMods={mods}

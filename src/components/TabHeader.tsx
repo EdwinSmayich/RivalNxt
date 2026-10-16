@@ -1,6 +1,6 @@
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
-import { Settings, RefreshCw, Rocket, Play, Archive, PowerOff, ShieldAlert, RotateCcw, Bookmark, Globe, History } from "lucide-react";
+import { Settings, RefreshCw, Rocket, Play, Archive, PowerOff, ShieldAlert, RotateCcw, Bookmark, Globe, History, Captions } from "lucide-react";
 import { open } from "@tauri-apps/plugin-shell";
 import {
   AlertDialog,
@@ -15,8 +15,8 @@ import {
 } from "./ui/alert-dialog";
 
 interface TabHeaderProps {
-  activeTab: "downloads" | "active" | "collections" | "nexus";
-  onTabChange: (tab: "downloads" | "active" | "collections" | "nexus") => void;
+  activeTab: "downloads" | "active" | "collections" | "nexus" | "subtitles";
+  onTabChange: (tab: "downloads" | "active" | "collections" | "nexus" | "subtitles") => void;
   downloadsCount: number;
   activeCount: number;
   collectionsCount?: number;
@@ -110,6 +110,15 @@ export function TabHeader({
           >
             <Globe className="w-4 h-4 shrink-0" />
             Browse Nexus
+          </Button>
+
+          <Button
+            variant={activeTab === "subtitles" ? "secondary" : "ghost"}
+            onClick={() => onTabChange("subtitles")}
+            className="gap-2"
+          >
+            <Captions className="w-4 h-4 shrink-0" />
+            Voice Subtitles
           </Button>
         </div>
 

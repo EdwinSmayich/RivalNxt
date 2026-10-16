@@ -24,13 +24,15 @@ import {
   Link,
   AlertCircle,
   Pencil,
-  Check
+  Check,
+  Captions
 } from "lucide-react";
 import type { Mod } from "./ModCard";
 import { computeTagDisplay } from "../lib/tagDisplay";
 import TagList from "./TagList";
 import { useNsfwFilter } from "./NSFWFilterProvider";
 import { AuthorPopover } from "./AuthorPopover";
+import { isSubtitleModArchive } from "../lib/subtitleMods";
 
 interface InstalledModCardProps {
   mod: Mod;
@@ -70,6 +72,8 @@ function InstalledModCardInner({
   // NSFW blur filter
   const { nsfwBlurEnabled } = useNsfwFilter();
   const shouldBlur = mod.containsAdultContent && nsfwBlurEnabled;
+  // A subtitle mod made here has no Nexus page: no mod id or author to ask for.
+  const madeByApp = (mod.sourcePaths ?? []).some(isSubtitleModArchive);
 
   const debugCards =
     typeof window !== "undefined" &&
@@ -331,7 +335,7 @@ function InstalledModCardInner({
                   </Button>
                 </div>
               </div>
-              {(mod.needsManualModId || mod.backendModId == null) && (
+              {!madeByApp && (mod.needsManualModId || mod.backendModId == null) && (
                 <div className="mt-2">
                   <Button
                     variant="outline"
@@ -522,7 +526,12 @@ function InstalledModCardInner({
                   </Button>
                 </div>
 
-                {(!mod.backendModId || mod.backendModId <= 0 || mod.needsManualModId) ? (
+                {madeByApp ? (
+                  <div className="flex items-center gap-2 mb-2 p-1 -ml-1 text-xs text-muted-foreground">
+                    <Captions className="w-4 h-4 shrink-0" />
+                    <span className="truncate">Made by Voice Subtitles</span>
+                  </div>
+                ) : (!mod.backendModId || mod.backendModId <= 0 || mod.needsManualModId) ? (
                   <AuthorPopover 
                     modKey={mod.modKey!} 
                     currentAuthorName={mod.customAuthorName} 
@@ -657,7 +666,19 @@ function InstalledModCardInner({
                     }`}
                   />
                 </Button>
-                {(mod.needsManualModId || mod.backendModId == null) ? (
+                {madeByApp ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1 gap-2 pointer-events-none"
+                    asChild
+                  >
+                    <div>
+                      <Captions className="w-3 h-3" />
+                      Voice subtitles
+                    </div>
+                  </Button>
+                ) : (mod.needsManualModId || mod.backendModId == null) ? (
                   <Button
                     variant="outline"
                     size="sm"

@@ -186,6 +186,31 @@ if not exist "%DLL_PATH%" (
 )
 copy "%DLL_PATH%" "extracted_wheel\rust_ue_tools\" >nul
 
+REM rivalnxt_pak writes the subtitle mods' .pak files. It is the app's own
+REM small module, built from the same repak as rust_ue_tools; it lives outside
+REM the rust-ue-tools submodule, which is upstream's.
+echo Building rivalnxt_pak...
+cd src-tauri\src\rivalnxt-pak
+maturin build --release
+if %ERRORLEVEL% NEQ 0 (
+    echo ❌ Maturin build of rivalnxt_pak failed
+    cd ..\..\..
+    exit /b 1
+)
+set PAK_WHEEL=
+for /f "delims=" %%i in ('dir /b /s target\wheels\rivalnxt_pak-*.whl 2^>nul') do set PAK_WHEEL=%%i
+cd ..\..\..
+if not defined PAK_WHEEL (
+    echo ❌ No rivalnxt_pak wheel found!
+    exit /b 1
+)
+"%PYTHON%" -m pip install "%PAK_WHEEL%" --force-reinstall
+if %ERRORLEVEL% NEQ 0 (
+    echo ❌ Failed to install rivalnxt_pak
+    exit /b 1
+)
+powershell -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('%PAK_WHEEL%', 'extracted_wheel')"
+
 echo ✅ Wheel extracted successfully to extracted_wheel\
 dir extracted_wheel
 dir extracted_wheel\rust_ue_tools.
@@ -202,7 +227,7 @@ REM Fail here rather than shipping a bundle without them. Pillow is the one
 REM that actually went missing; every import below is used at runtime and is
 REM reached only from inside a function, so nothing else would notice.
 echo Checking build dependencies...
-"%PYTHON%" -c "import PIL, fastapi, uvicorn, requests, rust_ue_tools"
+"%PYTHON%" -c "import PIL, fastapi, uvicorn, requests, rust_ue_tools, rivalnxt_pak"
 if %ERRORLEVEL% NEQ 0 (
     echo ERROR: the virtualenv is missing a runtime dependency.
     echo     "%PYTHON%" -m pip install -r requirements.txt

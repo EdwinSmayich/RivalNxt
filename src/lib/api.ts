@@ -2234,3 +2234,169 @@ export async function checkCollectionUpdates(
   }
   return (await res.json()) as ApiCollectionUpdateCheck;
 }
+
+// ---------------------------------------------------------------------------
+// Voice subtitles: what a voice mod says, heard and translated on this computer
+// ---------------------------------------------------------------------------
+
+export type VoiceSubtitleState = {
+  state: "none" | "partial" | "ready";
+  counts: { subtitled: number; silenced: number; kept: number; missing: number } | null;
+  /** The translation models that made its lines (none for English). */
+  models: string[];
+  archive: string;
+  pak: string;
+  active: boolean;
+  download_id: number | null;
+};
+
+export type VoiceMod = {
+  key: string;
+  name: string;
+  bank: string;
+  bank_id: string;
+  hero: string;
+  hero_name: string;
+  installed: string[];
+  library: { download_id: number | null; download: string; member: string | null }[];
+  skipped: string | null;
+  subtitles: Record<string, VoiceSubtitleState>;
+};
+
+export type VoiceJob = {
+  id: string;
+  kind: "make" | "install";
+  title: string;
+  target: string;
+  language: string | null;
+  state: "queued" | "running" | "waiting" | "done" | "failed" | "cancelled";
+  stage: string;
+  done: number;
+  total: number;
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+  seconds_left: number | null;
+};
+
+export type VoiceModelChoice = {
+  id: string;
+  title: string;
+  quality: string;
+  blurb: string;
+  size: number;
+  fit: "gpu" | "split" | "slow" | "no";
+  installed: boolean;
+  recommended: boolean;
+};
+
+export type VoiceSubtitlesStatus = {
+  folder: string;
+  free_bytes: number | null;
+  game_found: boolean;
+  game_running: boolean;
+  downloads_folder: string;
+  mods_folder: string;
+  game_language: string;
+  language: string;
+  language_set: boolean;
+  languages: { code: string; name: string }[];
+  hardware: {
+    gpus: { name: string; vendor: string; vram_mb: number; cuda: number | null }[];
+    ram_mb: number;
+    threads: number;
+  };
+  recognition: {
+    installed: boolean;
+    size: number;
+    gpu: { available: boolean; installed: boolean; on: boolean; size: number };
+  };
+  translation: {
+    model: string | null;
+    ready: boolean;
+    engine: string;
+    recommended: string;
+    models: VoiceModelChoice[];
+  };
+  voice_mods: VoiceMod[];
+  scanning: boolean;
+  scan_note: string;
+  jobs: VoiceJob[];
+  combined: {
+    mods?: number;
+    subtitled?: number;
+    silenced?: number;
+    languages?: string[];
+    waiting?: boolean;
+    error?: string | null;
+  };
+};
+
+export type VoiceLine = {
+  key: string;
+  status: "changed" | "silent";
+  game: string | null;
+  game_en: string | null;
+  heard: string | null;
+  subtitle: string | null;
+  edited: boolean;
+  left_as_in_game: boolean;
+};
+
+export function getVoiceSubtitles(): Promise<VoiceSubtitlesStatus> {
+  return getJson<VoiceSubtitlesStatus>("/api/voice-subtitles");
+}
+
+export function setVoiceSubtitlesSettings(changes: {
+  folder?: string;
+  model?: string | null;
+  language?: string | null;
+  gpu_recognition?: boolean;
+}): Promise<VoiceSubtitlesStatus> {
+  return putJson<typeof changes, VoiceSubtitlesStatus>("/api/voice-subtitles/settings", changes);
+}
+
+export function installVoiceComponent(what: string): Promise<VoiceJob> {
+  return postJson<{ what: string }, VoiceJob>("/api/voice-subtitles/install", { what });
+}
+
+export function removeVoiceComponent(what: string): Promise<VoiceSubtitlesStatus> {
+  return postJson<{ what: string }, VoiceSubtitlesStatus>("/api/voice-subtitles/remove", { what });
+}
+
+export function rescanVoiceMods(): Promise<{ ok: boolean }> {
+  return postJson<Record<string, never>, { ok: boolean }>("/api/voice-subtitles/rescan", {});
+}
+
+export function makeVoiceSubtitles(key: string, language?: string): Promise<VoiceJob> {
+  return postJson<{ key: string; language?: string }, VoiceJob>("/api/voice-subtitles/make", { key, language });
+}
+
+export function makeAllVoiceSubtitles(language?: string): Promise<{ jobs: VoiceJob[] }> {
+  return postJson<{ language?: string }, { jobs: VoiceJob[] }>("/api/voice-subtitles/make-all", { language });
+}
+
+export function cancelVoiceJob(jobId: string): Promise<{ ok: boolean }> {
+  return postJson<Record<string, never>, { ok: boolean }>(
+    `/api/voice-subtitles/jobs/${encodeURIComponent(jobId)}/cancel`,
+    {},
+  );
+}
+
+export function getVoiceLines(key: string, language: string): Promise<{ lines: VoiceLine[] }> {
+  return getJson<{ lines: VoiceLine[] }>(
+    `/api/voice-subtitles/voice-mods/${encodeURIComponent(key)}/lines?language=${encodeURIComponent(language)}`,
+  );
+}
+
+export function editVoiceLine(
+  key: string,
+  language: string,
+  line: string,
+  text: string | null,
+): Promise<{ counts: VoiceSubtitleState["counts"] }> {
+  return putJson<{ language: string; line: string; text: string | null }, { counts: VoiceSubtitleState["counts"] }>(
+    `/api/voice-subtitles/voice-mods/${encodeURIComponent(key)}/lines`,
+    { language, line, text },
+  );
+}

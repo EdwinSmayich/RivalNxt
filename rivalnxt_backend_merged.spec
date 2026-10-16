@@ -30,6 +30,9 @@ if scripts_dir.exists():
 extracted_wheel_dir = Path('extracted_wheel/rust_ue_tools')
 if extracted_wheel_dir.exists():
     datas.append((str(extracted_wheel_dir), 'rust_ue_tools'))
+extracted_pak_dir = Path('extracted_wheel/rivalnxt_pak')
+if extracted_pak_dir.exists():
+    datas.append((str(extracted_pak_dir), 'rivalnxt_pak'))
 
 # Add root-level Python files as data
 root_py_files = ['field_prefs.py', 'build_rust_pyo3.py']
@@ -60,6 +63,7 @@ _hiddenimports.extend([
     'pydantic',
     'psutil',
     'rust_ue_tools',
+    'rivalnxt_pak',
     'pylocres'
 ])
 

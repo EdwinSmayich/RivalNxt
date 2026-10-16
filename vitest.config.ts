@@ -5,9 +5,13 @@ import path from "path";
 export default defineConfig({
   plugins: [react()],
   resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "./src"),
-    },
+    alias: [
+      { find: "@", replacement: path.resolve(__dirname, "./src") },
+      // The UI kit imports packages with their version in the name
+      // ("@radix-ui/react-select@2.1.6"); vite.config.mts maps each to the
+      // installed package, and the same rule lets tests render those components.
+      { find: /^(@[^/@]+\/[^/@]+|[^/@][^/@]*)@\d+\.\d+\.\d+$/, replacement: "$1" },
+    ],
   },
   test: {
     environment: "jsdom",

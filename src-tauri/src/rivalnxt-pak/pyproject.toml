@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rivalnxt-pak"
+version = "0.1.0"
+description = "Writing and reading the small .pak files RivalNxt makes (subtitle mods)"
+requires-python = ">=3.8"
+
+[tool.maturin]
+module-name = "rivalnxt_pak"
+manifest-path = "Cargo.toml"

@@ -284,6 +284,12 @@ class TestDeactivateByName:
 
         assert tree(library["mods_dir"]) == [f"hela/{STEM}.sig"]
 
+    def test_switching_off_asks_for_the_subtitles_to_be_rebuilt(self, library, monkeypatch):
+        reasons = []
+        monkeypatch.setattr(server, "_voice_subtitles_changed", reasons.append)
+        server.deactivate_by_name({"name": "The Mod"})
+        assert reasons == ["mods switched off"]
+
     def test_a_stuck_container_is_reported(self, library, monkeypatch):
         self.refuse_unlink(monkeypatch, lambda p: p.suffix == ".ucas")
         result = server.deactivate_by_name({"name": "The Mod"})
@@ -371,6 +377,22 @@ class TestDisableAll:
 
         assert ours.read_bytes() == b"signature" and theirs.read_bytes() == b"signature"
         assert result["moved_out"] == ["Handmade_P.pak"]
+
+    def test_the_generated_subtitle_file_is_deleted_not_set_aside(self, library):
+        """It is rebuilt from the voice mods; a copy in the holding folder is clutter."""
+        generated = library["mods_dir"] / "zzz_RivalNxt_Subtitles_9999999_P.pak"
+        generated.write_bytes(b"subtitles")
+
+        result = server.disable_all_mods()
+
+        assert not generated.exists()
+        assert "zzz_RivalNxt_Subtitles_9999999_P.pak" not in result["moved_out"]
+
+    def test_it_asks_for_the_subtitles_to_be_rebuilt(self, library, monkeypatch):
+        reasons = []
+        monkeypatch.setattr(server, "_voice_subtitles_changed", reasons.append)
+        server.disable_all_mods()
+        assert reasons == ["all mods disabled"]
 
     def test_every_download_is_recorded_as_off(self, library):
         server.disable_all_mods()

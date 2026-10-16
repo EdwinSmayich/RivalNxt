@@ -22,7 +22,7 @@ from pathlib import Path
 # their absence and no test covers the frozen bundle. pylocres is on the list
 # because character names are read from the game's .locres files through it,
 # and losing them renames every hero to "Character <id>".
-REQUIRED = ("PIL", "fastapi", "uvicorn", "requests", "rust_ue_tools", "pylocres")
+REQUIRED = ("PIL", "fastapi", "uvicorn", "requests", "rust_ue_tools", "rivalnxt_pak", "pylocres")
 
 
 def _collect(node: object, out: set[str]) -> None:
